@@ -99,6 +99,7 @@ def generate_launch_description():
             'max_linear_speed': 0.6,
             'max_angular_speed': 0.8,
             'manual_command_timeout': 0.5,
+            'perception_initial_mode': 'fusion',
         }],
     )
 

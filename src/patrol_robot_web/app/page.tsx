@@ -13,10 +13,19 @@ type CameraStatus = {
   stream_fps: number; pan_deg: number; tilt_deg: number; pan_target_deg: number;
   tilt_target_deg: number; gimbal_ok: boolean;
 };
+type PerceptionMode = "lidar" | "camera" | "fusion";
+type PerceptionStatus = {
+  mode: PerceptionMode; lidar_enabled: boolean; camera_enabled: boolean;
+  lidar_ok: boolean; camera_ok: boolean; transitioning: boolean;
+  gimbal_locked: boolean; safety_ok: boolean; camera_points: number;
+  active_sources: string[]; last_camera_cloud_age: number | null;
+  error?: string | null;
+};
 type Telemetry = {
   speed: number; x: number; y: number; yaw: number; lidar_ok: boolean;
   patrol: { state: string; current_index: number; current_waypoint: string; waypoint_count: number };
   camera: CameraStatus;
+  perception: PerceptionStatus;
 };
 
 const initialWaypoints: Waypoint[] = [
@@ -28,6 +37,11 @@ const initialWaypoints: Waypoint[] = [
 ];
 
 const CAMERA_LIMITS = { pan: 90, tiltUp: 25, tiltDown: 35 };
+const PERCEPTION_MODES: Array<{ id: PerceptionMode; name: string; description: string; icon: string }> = [
+  { id: "lidar", name: "雷达模式", description: "仅激光雷达参与避障", icon: "⌁" },
+  { id: "camera", name: "视觉模式", description: "仅 RGB-D 点云参与避障", icon: "◉" },
+  { id: "fusion", name: "融合模式", description: "雷达与视觉同时工作", icon: "◎" },
+];
 
 export default function Home() {
   const [speed, setSpeed] = useState(0.6);
@@ -47,6 +61,12 @@ export default function Home() {
       enabled: false, ok: false, frames: 0, width: 0, height: 0, fps: 0,
       stream_fps: 12, last_frame_age: null, topic: "/camera/color/image_raw",
       pan_deg: 0, tilt_deg: 0, pan_target_deg: 0, tilt_target_deg: 0, gimbal_ok: false,
+    },
+    perception: {
+      mode: "fusion", lidar_enabled: true, camera_enabled: true,
+      lidar_ok: false, camera_ok: false, transitioning: false,
+      gimbal_locked: false, safety_ok: true, camera_points: 0,
+      active_sources: [], last_camera_cloud_age: null,
     },
   });
   const [apiBase] = useState(() => {
@@ -69,6 +89,7 @@ export default function Home() {
   const [cameraStreamVersion, setCameraStreamVersion] = useState(0);
   const [gimbalPan, setGimbalPan] = useState(0);
   const [gimbalTilt, setGimbalTilt] = useState(0);
+  const [perceptionBusy, setPerceptionBusy] = useState(false);
   const manualTimer = useRef<number | null>(null);
   const gimbalTimer = useRef<number | null>(null);
   const gimbalTarget = useRef({ pan: 0, tilt: 0 });
@@ -108,7 +129,14 @@ export default function Home() {
           stream_fps: 12, last_frame_age: null, topic: "/camera/color/image_raw",
           pan_deg: 0, tilt_deg: 0, pan_target_deg: 0, tilt_target_deg: 0, gimbal_ok: false,
         };
+        const perception = status.perception ?? {
+          mode: "fusion", lidar_enabled: true, camera_enabled: true,
+          lidar_ok: Boolean(status.lidar_ok), camera_ok: false,
+          transitioning: false, gimbal_locked: false, safety_ok: true,
+          camera_points: 0, active_sources: [], last_camera_cloud_age: null,
+        };
         setCameraEnabled(Boolean(camera.enabled));
+        setPerceptionBusy(Boolean(perception.transitioning));
         if (!gimbalAdjusting.current) {
           const panTarget = Number(camera.pan_target_deg ?? camera.pan_deg ?? 0);
           const tiltTarget = Number(camera.tilt_target_deg ?? camera.tilt_deg ?? 0);
@@ -121,6 +149,7 @@ export default function Home() {
           lidar_ok: Boolean(status.lidar_ok),
           patrol: status.patrol ?? { state: "UNKNOWN", current_index: 0, current_waypoint: "等待任务", waypoint_count: 0 },
           camera,
+          perception,
         });
         setRunning(Boolean(status.patrol?.running));
       } catch {
@@ -193,6 +222,37 @@ export default function Home() {
     }
   }
 
+  async function changePerceptionMode(mode: PerceptionMode) {
+    if (perceptionBusy || (mode === telemetry.perception.mode && !telemetry.perception.error)) return;
+    setPerceptionBusy(true);
+    if (running) {
+      await send("/api/patrol/stop");
+      setRunning(false);
+    }
+    if (await send("/api/perception/mode", { mode })) {
+      setTelemetry((current) => ({
+        ...current,
+        perception: {
+          ...current.perception,
+          mode,
+          lidar_enabled: mode !== "camera",
+          camera_enabled: mode !== "lidar",
+          gimbal_locked: mode === "camera",
+          transitioning: true,
+          error: null,
+        },
+      }));
+      if (mode === "camera") {
+        setGimbalPan(0);
+        setGimbalTilt(0);
+        gimbalTarget.current = { pan: 0, tilt: 0 };
+      }
+      notify(mode === "lidar" ? "正在切换为雷达感知" : mode === "camera" ? "正在切换为视觉感知" : "正在开启雷达与视觉融合");
+    } else {
+      setPerceptionBusy(false);
+    }
+  }
+
   async function saveWaypoints(next = waypoints) {
     if (await send("/api/navigation/waypoints", { frame_id: "map", waypoints: next.map(({name,x,y,dwell}) => ({name,x,y,yaw:0,dwell})) })) {
       notify("巡检路线已同步到 ROS 2");
@@ -237,6 +297,7 @@ export default function Home() {
   }
 
   function commandGimbal(panValue: number, tiltValue: number, immediate = false) {
+    if (telemetry.perception.gimbal_locked) return;
     const pan = Math.max(-CAMERA_LIMITS.pan, Math.min(panValue, CAMERA_LIMITS.pan));
     const tilt = Math.max(-CAMERA_LIMITS.tiltDown, Math.min(tiltValue, CAMERA_LIMITS.tiltUp));
     setGimbalPan(pan);
@@ -340,10 +401,10 @@ export default function Home() {
                       <div className="gimbal-control" aria-label="云台控制器">
                         <div className="gimbal-heading">
                           <span><i className={telemetry.camera.gimbal_ok ? "online" : ""}></i>两轴云台</span>
-                          <strong>水平 {gimbalPan.toFixed(0)}°　俯仰 {gimbalTilt.toFixed(0)}°</strong>
+                          <strong>{telemetry.perception.gimbal_locked ? "视觉导航 · 正前方锁定" : `水平 ${gimbalPan.toFixed(0)}°　俯仰 ${gimbalTilt.toFixed(0)}°`}</strong>
                         </div>
                         <div className="gimbal-row">
-                          <button onClick={() => nudgeGimbal(-10, 0)} disabled={!connected} aria-label="摄像头向左转动">‹</button>
+                          <button onClick={() => nudgeGimbal(-10, 0)} disabled={!connected || telemetry.perception.gimbal_locked} aria-label="摄像头向左转动">‹</button>
                           <input
                             aria-label="摄像头水平角度"
                             type="range"
@@ -351,6 +412,7 @@ export default function Home() {
                             max={CAMERA_LIMITS.pan}
                             step="1"
                             value={gimbalPan}
+                            disabled={!connected || telemetry.perception.gimbal_locked}
                             onPointerDown={() => { gimbalAdjusting.current = true; }}
                             onKeyDown={() => { gimbalAdjusting.current = true; }}
                             onChange={(event) => commandGimbal(Number(event.target.value), gimbalTilt)}
@@ -359,10 +421,10 @@ export default function Home() {
                             onKeyUp={finishGimbalAdjustment}
                             onBlur={finishGimbalAdjustment}
                           />
-                          <button onClick={() => nudgeGimbal(10, 0)} disabled={!connected} aria-label="摄像头向右转动">›</button>
+                          <button onClick={() => nudgeGimbal(10, 0)} disabled={!connected || telemetry.perception.gimbal_locked} aria-label="摄像头向右转动">›</button>
                         </div>
                         <div className="gimbal-row">
-                          <button onClick={() => nudgeGimbal(0, -5)} disabled={!connected} aria-label="摄像头向下转动">⌄</button>
+                          <button onClick={() => nudgeGimbal(0, -5)} disabled={!connected || telemetry.perception.gimbal_locked} aria-label="摄像头向下转动">⌄</button>
                           <input
                             aria-label="摄像头俯仰角度"
                             type="range"
@@ -370,6 +432,7 @@ export default function Home() {
                             max={CAMERA_LIMITS.tiltUp}
                             step="1"
                             value={gimbalTilt}
+                            disabled={!connected || telemetry.perception.gimbal_locked}
                             onPointerDown={() => { gimbalAdjusting.current = true; }}
                             onKeyDown={() => { gimbalAdjusting.current = true; }}
                             onChange={(event) => commandGimbal(gimbalPan, Number(event.target.value))}
@@ -378,9 +441,9 @@ export default function Home() {
                             onKeyUp={finishGimbalAdjustment}
                             onBlur={finishGimbalAdjustment}
                           />
-                          <button onClick={() => nudgeGimbal(0, 5)} disabled={!connected} aria-label="摄像头向上转动">⌃</button>
+                          <button onClick={() => nudgeGimbal(0, 5)} disabled={!connected || telemetry.perception.gimbal_locked} aria-label="摄像头向上转动">⌃</button>
                         </div>
-                        <button className="gimbal-center" onClick={() => commandGimbal(0, 0, true)} disabled={!connected}>回到正前方</button>
+                        <button className="gimbal-center" onClick={() => commandGimbal(0, 0, true)} disabled={!connected || telemetry.perception.gimbal_locked}>{telemetry.perception.gimbal_locked ? "视觉导航正在使用正前方视角" : "回到正前方"}</button>
                       </div>
                       <div className="camera-caption"><strong>CAM-01</strong><span>RGB-D 云台视角</span><em>已接收 {telemetry.camera.frames} 帧</em></div>
                     </>
@@ -417,7 +480,7 @@ export default function Home() {
               <p className="drive-state"><i></i>{running ? `前往：${telemetry.patrol.current_waypoint}` : "车辆已就绪"}</p>
               <div className="stat-grid">
                 <div><small>电池电量</small><strong>86<span>%</span></strong><progress value="86" max="100" /></div>
-                <div><small>激光雷达</small><strong>{telemetry.lidar_ok ? "正常" : "无数据"}</strong><span className="signal">▂▄▆█</span></div>
+                <div><small>激光雷达</small><strong>{telemetry.perception.lidar_enabled ? telemetry.lidar_ok ? "正常" : "无数据" : "未参与"}</strong><span className="signal">▂▄▆█</span></div>
                 <div><small>当前巡检点</small><strong>{telemetry.patrol.current_index + 1}<span> / {telemetry.patrol.waypoint_count || waypoints.length}</span></strong></div>
                 <div><small>地图坐标</small><strong>{telemetry.x.toFixed(1)}<span>, {telemetry.y.toFixed(1)} m</span></strong></div>
               </div>
@@ -429,6 +492,40 @@ export default function Home() {
           </section>
 
           <section className="lower-grid">
+            <div className="panel perception-panel">
+              <div className="panel-heading">
+                <div><span className="heading-icon perception-icon">◈</span><div><h2>导航感知模式</h2><p>切换雷达与 RGB-D 相机参与避障的方式</p></div></div>
+                <span className={`perception-state ${connected && telemetry.perception.safety_ok ? "healthy" : "fault"}`}>{!connected ? "等待车辆" : telemetry.perception.transitioning ? "切换中" : telemetry.perception.safety_ok ? "感知正常" : "已安全停车"}</span>
+              </div>
+              <div className="perception-layout">
+                <div className="perception-modes" role="group" aria-label="导航感知模式">
+                  {PERCEPTION_MODES.map((mode) => (
+                    <button
+                      key={mode.id}
+                      className={telemetry.perception.mode === mode.id ? "active" : ""}
+                      onClick={() => changePerceptionMode(mode.id)}
+                      disabled={!connected || perceptionBusy}
+                    >
+                      <i>{mode.icon}</i><span><strong>{mode.name}</strong><small>{mode.description}</small></span>
+                    </button>
+                  ))}
+                </div>
+                <div className="perception-sensors">
+                  <div className={`${telemetry.perception.lidar_enabled ? "enabled" : ""} ${telemetry.perception.lidar_ok ? "online" : ""}`}>
+                    <span className="sensor-symbol lidar-symbol"><i></i></span>
+                    <p><strong>激光雷达</strong><small>{telemetry.perception.lidar_enabled ? telemetry.perception.lidar_ok ? "导航数据正常" : "等待扫描数据" : "未参与导航"}</small></p>
+                    <em>{telemetry.perception.lidar_enabled ? telemetry.perception.lidar_ok ? "ON" : "WAIT" : "OFF"}</em>
+                  </div>
+                  <div className={`${telemetry.perception.camera_enabled ? "enabled" : ""} ${telemetry.perception.camera_ok ? "online" : ""}`}>
+                    <span className="sensor-symbol camera-symbol"><i></i></span>
+                    <p><strong>RGB-D 相机</strong><small>{telemetry.perception.camera_enabled ? telemetry.perception.camera_ok ? `${telemetry.perception.camera_points.toLocaleString()} 点 · 正常` : "等待深度点云" : "未参与导航"}</small></p>
+                    <em>{telemetry.perception.camera_enabled ? telemetry.perception.camera_ok ? "ON" : "WAIT" : "OFF"}</em>
+                  </div>
+                </div>
+              </div>
+              <p className={`perception-note ${telemetry.perception.error ? "error" : ""}`}>{telemetry.perception.error || (telemetry.perception.mode === "camera" ? "视觉模式会锁定云台正前方；如果深度点云中断，车辆将自动停车。" : telemetry.perception.mode === "fusion" ? "推荐生产模式：任一传感器短暂失效时，另一传感器仍可维持避障。" : "雷达模式不使用相机点云参与导航，网页视频仍可单独开启。")}</p>
+            </div>
+
             <div className="panel speed-panel">
               <div className="panel-heading"><div><span className="heading-icon">⇄</span><div><h2>行驶参数</h2><p>调节车辆运行速度</p></div></div><span className="saved">✓ 自动保存</span></div>
               <div className="speed-control">

@@ -34,17 +34,22 @@ test("server-renders the patrol robot control console", async () => {
   assert.match(html, /2D 地图/);
   assert.match(html, /3D 场景/);
   assert.match(html, /摄像画面/);
+  assert.match(html, /导航感知模式/);
+  assert.match(html, /雷达模式/);
+  assert.match(html, /视觉模式/);
+  assert.match(html, /融合模式/);
   assert.match(html, /人工控制/);
   assert.match(html, /前进/);
   assert.match(html, /后退/);
 });
 
 test("includes live ROS controls and both map implementations", async () => {
-  const [page, map2d, map3d, bridge] = await Promise.all([
+  const [page, map2d, map3d, bridge, nav2] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/Industrial2DMap.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/Industrial3DMap.tsx", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_web_bridge/patrol_robot_web_bridge/bridge_node.py", import.meta.url), "utf8"),
+    readFile(new URL("../../patrol_robot_navigation/config/nav2_params.yaml", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /\/api\/status/);
@@ -53,6 +58,7 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(page, /\/api\/camera\/enable/);
   assert.match(page, /\/api\/camera\/stream/);
   assert.match(page, /\/api\/camera\/gimbal/);
+  assert.match(page, /\/api\/perception\/mode/);
   assert.match(page, /开启摄像头/);
   assert.match(page, /回到正前方/);
   assert.match(page, /<Industrial2DMap/);
@@ -64,6 +70,12 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(bridge, /\/api\/camera\/enable/);
   assert.match(bridge, /\/api\/camera\/stream/);
   assert.match(bridge, /\/api\/camera\/gimbal/);
+  assert.match(bridge, /\/api\/perception\/mode/);
+  assert.match(bridge, /lidar_obstacle_layer\.enabled/);
+  assert.match(bridge, /camera_voxel_layer\.enabled/);
   assert.match(bridge, /camera_stream_fps', 12\.0/);
   assert.match(bridge, /manual_command_timeout/);
+  assert.match(nav2, /plugins: \[lidar_obstacle_layer, camera_voxel_layer, inflation_layer\]/);
+  assert.match(nav2, /plugin: nav2_costmap_2d::VoxelLayer/);
+  assert.match(nav2, /topic: \/camera\/points\/filtered/);
 });

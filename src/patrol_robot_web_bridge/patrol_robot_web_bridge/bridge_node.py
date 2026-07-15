@@ -15,12 +15,13 @@ from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from nav2_msgs.msg import SpeedLimit
+from nav2_msgs.srv import ClearEntireCostmap
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
-from sensor_msgs.msg import Image, JointState, LaserScan
+from sensor_msgs.msg import Image, JointState, LaserScan, PointCloud2
 from std_msgs.msg import Float64, String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
@@ -45,6 +46,7 @@ class RobotWebBridge(Node):
         self.declare_parameter('camera_pan_limit_degrees', 90.0)
         self.declare_parameter('camera_tilt_up_limit_degrees', 25.0)
         self.declare_parameter('camera_tilt_down_limit_degrees', 35.0)
+        self.declare_parameter('perception_initial_mode', 'fusion')
 
         self._max_linear = float(self.get_parameter('max_linear_speed').value)
         self._max_angular = float(self.get_parameter('max_angular_speed').value)
@@ -74,6 +76,14 @@ class RobotWebBridge(Node):
             5.0,
             min(float(self.get_parameter('camera_tilt_down_limit_degrees').value), 90.0),
         )
+        initial_mode = str(self.get_parameter('perception_initial_mode').value)
+        self._perception_mode = (
+            initial_mode if initial_mode in ('lidar', 'camera', 'fusion') else 'fusion'
+        )
+        self._perception_generation = 0
+        self._perception_pending = 0
+        self._perception_fault_active = False
+        self._perception_started_at = time.monotonic()
         self._commands = queue.Queue()
         self._lock = threading.Condition()
         self._last_manual_command = 0.0
@@ -99,6 +109,16 @@ class RobotWebBridge(Node):
             'speed': 0.0, 'angular_speed': 0.0, 'x': 0.0, 'y': 0.0,
             'battery': None, 'lidar_ok': False, 'last_scan_age': None,
             'max_linear_speed': self._max_linear,
+            'perception': {
+                'mode': self._perception_mode,
+                'lidar_enabled': self._perception_mode in ('lidar', 'fusion'),
+                'camera_enabled': self._perception_mode in ('camera', 'fusion'),
+                'transitioning': False,
+                'gimbal_locked': self._perception_mode == 'camera',
+                'safety_ok': True,
+                'camera_points': 0,
+                'error': None,
+            },
             'camera': {
                 'enabled': False,
                 'ok': False,
@@ -127,6 +147,12 @@ class RobotWebBridge(Node):
             LaserScan,
             '/scan',
             self._on_scan,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            PointCloud2,
+            '/camera/points/filtered',
+            self._on_camera_cloud,
             qos_profile_sensor_data,
         )
         self.create_subscription(
@@ -168,9 +194,20 @@ class RobotWebBridge(Node):
             SetParameters,
             '/global_costmap/global_costmap/set_parameters',
         )
+        self._costmap_clear_clients = (
+            self.create_client(
+                ClearEntireCostmap,
+                '/local_costmap/clear_entirely_local_costmap',
+            ),
+            self.create_client(
+                ClearEntireCostmap,
+                '/global_costmap/clear_entirely_global_costmap',
+            ),
+        )
         self.create_timer(0.05, self._process_commands)
         self.create_timer(0.1, self._manual_watchdog)
         self.create_timer(1.0, self._publish_speed_limit)
+        self.create_timer(0.5, self._perception_watchdog)
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
         self.create_timer(0.2, self._update_map_pose)
@@ -300,8 +337,10 @@ class RobotWebBridge(Node):
             status = dict(self._status)
             last_scan = status.pop('_last_scan', None)
             camera = dict(status.get('camera', {}))
+            perception = dict(status.get('perception', {}))
             last_frame = camera.pop('_last_frame', None)
             last_gimbal_state = camera.pop('_last_gimbal_state', None)
+            last_camera_cloud = perception.pop('_last_camera_cloud', None)
             frame_times = tuple(self._camera_frame_times)
         status['last_scan_age'] = (
             None if last_scan is None else round(time.monotonic() - last_scan, 2)
@@ -332,7 +371,36 @@ class RobotWebBridge(Node):
             if len(frame_times) > 1 and frame_times[-1] > frame_times[0]
             else 0.0
         )
+        perception['last_camera_cloud_age'] = (
+            None
+            if last_camera_cloud is None
+            else round(time.monotonic() - last_camera_cloud, 2)
+        )
+        perception['lidar_ok'] = status['lidar_ok']
+        perception['camera_ok'] = bool(
+            perception['last_camera_cloud_age'] is not None
+            and perception['last_camera_cloud_age'] < 1.5
+        )
+        perception['active_sources'] = [
+            source
+            for source, enabled, healthy in (
+                ('lidar', perception.get('lidar_enabled'), perception['lidar_ok']),
+                ('camera', perception.get('camera_enabled'), perception['camera_ok']),
+            )
+            if enabled and healthy
+        ]
+        if perception.get('mode') == 'lidar':
+            perception['safety_ok'] = perception['lidar_ok']
+        elif perception.get('mode') == 'camera':
+            perception['safety_ok'] = perception['camera_ok']
+        else:
+            perception['safety_ok'] = (
+                perception['lidar_ok'] or perception['camera_ok']
+            )
+        if perception.get('error'):
+            perception['safety_ok'] = False
         status['camera'] = camera
+        status['perception'] = perception
         return status
 
     def camera_enabled(self):
@@ -380,6 +448,12 @@ class RobotWebBridge(Node):
     def _on_scan(self, _message):
         with self._lock:
             self._status['_last_scan'] = time.monotonic()
+
+    def _on_camera_cloud(self, message):
+        with self._lock:
+            perception = self._status['perception']
+            perception['_last_camera_cloud'] = time.monotonic()
+            perception['camera_points'] = int(message.width * message.height)
 
     def _on_patrol_status(self, message):
         try:
@@ -442,10 +516,148 @@ class RobotWebBridge(Node):
                     float(payload.get('pan', 0.0)),
                     float(payload.get('tilt', 0.0)),
                 )
+            elif path == '/api/perception/mode':
+                self._set_perception_mode(str(payload.get('mode', 'fusion')))
             elif path == '/api/config/hardware':
                 self._set_hardware_config(payload)
 
+    @staticmethod
+    def _boolean_parameter(name, value):
+        return Parameter(
+            name=name,
+            value=ParameterValue(
+                type=ParameterType.PARAMETER_BOOL,
+                bool_value=bool(value),
+            ),
+        )
+
+    def _set_perception_mode(self, mode):
+        if mode not in ('lidar', 'camera', 'fusion'):
+            with self._lock:
+                self._status['perception']['error'] = f'不支持的感知模式：{mode}'
+            return
+
+        lidar_enabled = mode in ('lidar', 'fusion')
+        camera_enabled = mode in ('camera', 'fusion')
+        self._publish_manual(0.0, 0.0)
+        stop_client = self._patrol_clients['stop']
+        if stop_client.service_is_ready():
+            stop_client.call_async(Trigger.Request())
+
+        self._perception_generation += 1
+        generation = self._perception_generation
+        with self._lock:
+            self._perception_mode = mode
+            self._status['perception'].update({
+                'mode': mode,
+                'lidar_enabled': lidar_enabled,
+                'camera_enabled': camera_enabled,
+                'transitioning': True,
+                'gimbal_locked': mode == 'camera',
+                'error': None,
+            })
+
+        if mode == 'camera':
+            self._set_camera_gimbal(0.0, 0.0)
+
+        clients = (self._local_costmap_params, self._global_costmap_params)
+        if not all(client.service_is_ready() for client in clients):
+            with self._lock:
+                self._status['perception'].update({
+                    'transitioning': False,
+                    'safety_ok': False,
+                    'error': 'Nav2 本地或全局代价地图尚未就绪，车辆保持停车',
+                })
+            return
+
+        futures = []
+        for client in clients:
+            request = SetParameters.Request()
+            request.parameters = [
+                self._boolean_parameter(
+                    'lidar_obstacle_layer.enabled',
+                    lidar_enabled,
+                ),
+                self._boolean_parameter(
+                    'camera_voxel_layer.enabled',
+                    camera_enabled,
+                ),
+            ]
+            futures.append(client.call_async(request))
+
+        self._perception_pending = len(futures)
+        for future in futures:
+            future.add_done_callback(
+                lambda completed, current=generation: (
+                    self._on_perception_parameters_done(completed, current)
+                )
+            )
+        self.get_logger().warning(
+            f'感知模式切换为 {mode}：雷达={lidar_enabled}，相机={camera_enabled}'
+        )
+
+    def _on_perception_parameters_done(self, future, generation):
+        if generation != self._perception_generation:
+            return
+        error = None
+        try:
+            response = future.result()
+            failures = [
+                result.reason or '参数更新失败'
+                for result in response.results
+                if not result.successful
+            ]
+            if failures:
+                error = '；'.join(failures)
+        except Exception as exception:  # rclpy future transports service errors.
+            error = str(exception)
+
+        self._perception_pending = max(0, self._perception_pending - 1)
+        with self._lock:
+            perception = self._status['perception']
+            if error:
+                perception['error'] = error
+            if self._perception_pending == 0:
+                perception['transitioning'] = False
+        if self._perception_pending == 0:
+            self._clear_costmaps()
+
+    def _clear_costmaps(self):
+        for client in self._costmap_clear_clients:
+            if client.service_is_ready():
+                client.call_async(ClearEntireCostmap.Request())
+
+    def _perception_watchdog(self):
+        if time.monotonic() - self._perception_started_at < 5.0:
+            return
+        snapshot = self.status_snapshot()
+        perception = snapshot['perception']
+        if perception.get('transitioning'):
+            return
+        safe = bool(perception.get('safety_ok'))
+        with self._lock:
+            self._status['perception']['safety_ok'] = safe
+        if not safe and not self._perception_fault_active:
+            self._perception_fault_active = True
+            self._publish_manual(0.0, 0.0)
+            stop_client = self._patrol_clients['stop']
+            if stop_client.service_is_ready():
+                stop_client.call_async(Trigger.Request())
+            self.get_logger().error(
+                f'感知模式 {perception.get("mode")} 无可用数据，已安全停车'
+            )
+        elif safe and self._perception_fault_active:
+            self._perception_fault_active = False
+            self.get_logger().info('感知数据已恢复，车辆保持停车等待人工恢复巡检')
+
     def _set_camera_gimbal(self, pan_degrees, tilt_degrees):
+        with self._lock:
+            gimbal_locked = bool(
+                self._status['perception'].get('gimbal_locked')
+            )
+        if gimbal_locked:
+            pan_degrees = 0.0
+            tilt_degrees = 0.0
         pan = max(-self._camera_pan_limit, min(pan_degrees, self._camera_pan_limit))
         tilt = max(
             -self._camera_tilt_down_limit,

@@ -147,8 +147,8 @@ local_costmap:
       height: 6
       resolution: 0.05
       footprint: "[[0.29, 0.23], [0.29, -0.23], [-0.29, -0.23], [-0.29, 0.23]]"
-      plugins: [obstacle_layer, inflation_layer]
-      obstacle_layer:
+      plugins: [lidar_obstacle_layer, camera_voxel_layer, inflation_layer]
+      lidar_obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
         observation_sources: scan
@@ -167,6 +167,32 @@ local_costmap:
           raytrace_min_range: 0.08
           obstacle_max_range: 6.0
           obstacle_min_range: 0.08
+      camera_voxel_layer:
+        plugin: nav2_costmap_2d::VoxelLayer
+        enabled: true
+        footprint_clearing_enabled: true
+        publish_voxel_map: false
+        origin_z: 0.0
+        z_resolution: 0.10
+        z_voxels: 16
+        unknown_threshold: 15
+        mark_threshold: 1
+        combination_method: 1
+        observation_sources: camera_cloud
+        camera_cloud:
+          topic: /camera/points/filtered
+          data_type: PointCloud2
+          transport_type: raw
+          min_obstacle_height: 0.05
+          max_obstacle_height: 1.5
+          clearing: true
+          marking: true
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          raytrace_max_range: 7.0
+          raytrace_min_range: 0.25
+          obstacle_max_range: 6.0
+          obstacle_min_range: 0.25
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 3.2
@@ -184,11 +210,11 @@ global_costmap:
       resolution: 0.05
       footprint: "[[0.29, 0.23], [0.29, -0.23], [-0.29, -0.23], [-0.29, 0.23]]"
       track_unknown_space: true
-      plugins: [static_layer, obstacle_layer, inflation_layer]
+      plugins: [static_layer, lidar_obstacle_layer, camera_voxel_layer, inflation_layer]
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
         map_subscribe_transient_local: true
-      obstacle_layer:
+      lidar_obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
         observation_sources: scan
@@ -205,6 +231,32 @@ global_costmap:
           raytrace_min_range: 0.08
           obstacle_max_range: 6.0
           obstacle_min_range: 0.08
+      camera_voxel_layer:
+        plugin: nav2_costmap_2d::VoxelLayer
+        enabled: true
+        footprint_clearing_enabled: true
+        publish_voxel_map: false
+        origin_z: 0.0
+        z_resolution: 0.10
+        z_voxels: 16
+        unknown_threshold: 15
+        mark_threshold: 1
+        combination_method: 1
+        observation_sources: camera_cloud
+        camera_cloud:
+          topic: /camera/points/filtered
+          data_type: PointCloud2
+          transport_type: raw
+          min_obstacle_height: 0.05
+          max_obstacle_height: 1.5
+          clearing: true
+          marking: true
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
+          raytrace_max_range: 7.0
+          raytrace_min_range: 0.25
+          obstacle_max_range: 6.0
+          obstacle_min_range: 0.25
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 3.2

@@ -1,4 +1,11 @@
-# vinext-starter
+# 巡检机器人网页控制台
+
+该控制台通过 ROS 2 Web 网关显示车辆状态、2D/3D 地图和可转动的 RGB-D 摄像头，
+并提供雷达、视觉与融合三种导航感知模式。模式切换接口为
+`POST /api/perception/mode`，请求体中的 `mode` 可取 `lidar`、`camera` 或 `fusion`。
+
+视觉模式使用 `/camera/points/filtered` 深度点云参与 Nav2 体素避障，并把云台锁定
+在正前方。当前 AMCL 定位仍依赖激光 `/scan`，纯视觉定位属于下一阶段。
 
 A clean full-stack starter running on
 [vinext](https://github.com/cloudflare/vinext), with optional Cloudflare D1 and
