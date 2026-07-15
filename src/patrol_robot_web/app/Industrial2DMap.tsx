@@ -1,21 +1,21 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { decodeOccupancy, type PatrolMap } from "./mapTypes";
 
-type Point = { id: number; name: string; x: number; y: number };
 type Props = {
+  map: PatrolMap;
   robotX: number;
   robotY: number;
   robotYaw: number;
   zoom: number;
-  waypoints: Point[];
   selected: number;
   onSelect: (id: number) => void;
 };
 
 type XY = { x: number; y: number };
 
-export function Industrial2DMap({ robotX, robotY, robotYaw, zoom, waypoints, selected, onSelect }: Props) {
+export function Industrial2DMap({ map, robotX, robotY, robotYaw, zoom, selected, onSelect }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -25,10 +25,12 @@ export function Industrial2DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
     if (!context) return;
     let width = 0;
     let height = 0;
+    const maxX = map.bounds.minX + map.bounds.width;
+    const maxY = map.bounds.minY + map.bounds.height;
 
     const project = (x: number, y: number): XY => ({
-      x: width * (0.055 + ((x + 8) / 16) * 0.89),
-      y: height * (0.075 + ((6 - y) / 12) * 0.84),
+      x: width * (0.055 + ((x - map.bounds.minX) / map.bounds.width) * 0.89),
+      y: height * (0.075 + ((maxY - y) / map.bounds.height) * 0.84),
     });
     const line = (points: XY[], close = false) => {
       context.beginPath();
@@ -39,6 +41,30 @@ export function Industrial2DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
       project(x - w / 2, y - d / 2), project(x + w / 2, y - d / 2),
       project(x + w / 2, y + d / 2), project(x - w / 2, y + d / 2),
     ];
+
+    const drawOccupancy = () => {
+      if (!map.occupancy) return;
+      const cells = decodeOccupancy(map.occupancy);
+      const bitmap = document.createElement("canvas");
+      bitmap.width = map.occupancy.width;
+      bitmap.height = map.occupancy.height;
+      const bitmapContext = bitmap.getContext("2d");
+      if (!bitmapContext) return;
+      const pixels = bitmapContext.createImageData(bitmap.width, bitmap.height);
+      for (let index = 0; index < cells.length; index += 1) {
+        const offset = index * 4;
+        pixels.data[offset] = cells[index] ? 73 : 246;
+        pixels.data[offset + 1] = cells[index] ? 86 : 248;
+        pixels.data[offset + 2] = cells[index] ? 92 : 247;
+        pixels.data[offset + 3] = cells[index] ? 225 : 190;
+      }
+      bitmapContext.putImageData(pixels, 0, 0);
+      context.imageSmoothingEnabled = false;
+      const topLeft = project(map.occupancy.originX, map.occupancy.originY + map.occupancy.height * map.occupancy.resolution);
+      const bottomRight = project(map.occupancy.originX + map.occupancy.width * map.occupancy.resolution, map.occupancy.originY);
+      context.drawImage(bitmap, topLeft.x, topLeft.y, bottomRight.x - topLeft.x, bottomRight.y - topLeft.y);
+      context.imageSmoothingEnabled = true;
+    };
 
     const draw = () => {
       const rect = canvas.getBoundingClientRect();
@@ -56,103 +82,75 @@ export function Industrial2DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
       context.scale(zoom, zoom);
       context.translate(-width / 2, -height / 2);
 
-      // Fine engineering grid.
       context.strokeStyle = "#dfe4e2";
       context.lineWidth = 0.7;
-      for (let x = -8; x <= 8; x += 0.5) {
-        line([project(x, -6), project(x, 6)]);
+      const gridSize = map.bounds.width > 60 ? 5 : map.bounds.width > 30 ? 2 : 0.5;
+      for (let x = Math.ceil(map.bounds.minX / gridSize) * gridSize; x <= maxX; x += gridSize) {
+        line([project(x, map.bounds.minY), project(x, maxY)]);
         context.stroke();
       }
-      for (let y = -6; y <= 6; y += 0.5) {
-        line([project(-8, y), project(8, y)]);
+      for (let y = Math.ceil(map.bounds.minY / gridSize) * gridSize; y <= maxY; y += gridSize) {
+        line([project(map.bounds.minX, y), project(maxX, y)]);
         context.stroke();
       }
 
-      // Site boundary and muted service lanes.
-      line(rectPath(0, 0, 15.5, 11.5), true);
-    context.fillStyle = "rgba(238, 240, 238, 0.72)";
+      line([
+        project(map.bounds.minX, map.bounds.minY), project(maxX, map.bounds.minY),
+        project(maxX, maxY), project(map.bounds.minX, maxY),
+      ], true);
+      context.fillStyle = "rgba(238, 240, 238, 0.72)";
       context.fill();
       context.strokeStyle = "#8c9997";
       context.lineWidth = 2;
       context.stroke();
-      const roads = [
-        [[-7, -4.6], [6.8, -4.6], [6.8, 4.6], [-7, 4.6], [-7, -4.6]],
-        [[-6.6, 0], [6.3, 0]],
-        [[-0.4, -4.5], [-0.4, 4.5]],
-      ];
-      context.lineCap = "round";
-      context.lineJoin = "round";
-      roads.forEach((road) => {
-        line(road.map(([x, y]) => project(x, y)));
-        context.strokeStyle = "#c7cdcb";
-        context.lineWidth = 24;
-        context.stroke();
-        context.strokeStyle = "#e9ecea";
-        context.lineWidth = 18;
-        context.stroke();
-        context.setLineDash([7, 8]);
-        context.strokeStyle = "#b3bcb9";
-        context.lineWidth = 1;
-        context.stroke();
-        context.setLineDash([]);
-      });
+      drawOccupancy();
 
-      const drawEquipment = (name: string, x: number, y: number, w: number, d: number, kind: "rack" | "cabinet" | "room") => {
-        const shape = rectPath(x, y, w, d);
+      if (!map.occupancy) {
+        const insetX = map.bounds.width * 0.09;
+        const insetY = map.bounds.height * 0.12;
+        const roads = [
+          [[map.bounds.minX + insetX, map.bounds.minY + insetY], [maxX - insetX, map.bounds.minY + insetY], [maxX - insetX, maxY - insetY], [map.bounds.minX + insetX, maxY - insetY], [map.bounds.minX + insetX, map.bounds.minY + insetY]],
+          [[map.bounds.minX + insetX, map.bounds.minY + map.bounds.height / 2], [maxX - insetX, map.bounds.minY + map.bounds.height / 2]],
+        ];
+        context.lineCap = "round";
+        context.lineJoin = "round";
+        roads.forEach((road) => {
+          line(road.map(([x, y]) => project(x, y)));
+          context.strokeStyle = "#c7cdcb";
+          context.lineWidth = 24;
+          context.stroke();
+          context.strokeStyle = "#e9ecea";
+          context.lineWidth = 18;
+          context.stroke();
+          context.setLineDash([7, 8]);
+          context.strokeStyle = "#b3bcb9";
+          context.lineWidth = 1;
+          context.stroke();
+          context.setLineDash([]);
+        });
+      }
+
+      map.objects.forEach((object) => {
+        const shape = rectPath(object.x, object.y, object.width, object.depth);
         line(shape, true);
-        context.fillStyle = kind === "room" ? "#e3e6e5" : "#d8dddc";
+        context.fillStyle = object.type === "obstacle" ? "#d98268" : "#d8dddc";
         context.fill();
-        context.strokeStyle = "#60706e";
+        context.strokeStyle = object.type === "obstacle" ? "#a84d38" : "#60706e";
         context.lineWidth = 1.5;
         context.stroke();
-        const left = Math.min(...shape.map((point) => point.x));
-        const right = Math.max(...shape.map((point) => point.x));
-        const top = Math.min(...shape.map((point) => point.y));
-        const bottom = Math.max(...shape.map((point) => point.y));
-        context.strokeStyle = "#899694";
-        context.lineWidth = 0.8;
-        if (kind === "rack") {
-          for (let index = 1; index < 5; index++) {
-            const yLine = top + ((bottom - top) * index) / 5;
-            line([{ x: left + 3, y: yLine }, { x: right - 3, y: yLine }]);
-            context.stroke();
-          }
-          for (let index = 1; index < 3; index++) {
-            const xLine = left + ((right - left) * index) / 3;
-            line([{ x: xLine, y: top + 3 }, { x: xLine, y: bottom - 3 }]);
-            context.stroke();
-          }
-        } else {
-          context.strokeRect(left + 5, top + 5, Math.max(4, right - left - 10), Math.max(4, bottom - top - 10));
-        }
-        context.font = "500 10px Arial, sans-serif";
+        const center = project(object.x, object.y);
+        context.font = "500 9px Arial, sans-serif";
         context.textAlign = "center";
         context.textBaseline = "middle";
+        context.lineWidth = 3;
+        context.strokeStyle = "#ffffffd9";
+        context.strokeText(object.name, center.x, center.y);
         context.fillStyle = "#465653";
-        context.fillText(name, (left + right) / 2, (top + bottom) / 2);
-      };
-      drawEquipment("A区管道架", -2.75, 1.5, 1.0, 4.0, "rack");
-      drawEquipment("B区管道架", 2.25, -2.0, 1.0, 4.0, "rack");
-      drawEquipment("控制柜", 0.25, 1.0, 1.5, 1.0, "cabinet");
-      drawEquipment("北侧设备区", 4.7, 3.7, 2.3, 1.0, "rack");
-      drawEquipment("维护间", -5.4, 0.2, 1.7, 1.3, "room");
-
-      // Restrained process lines provide plan detail without a large legend.
-      const processLines = [
-        { color: "#6f9c9a", points: [[-6.8, 4.9], [6.4, 4.9], [6.4, 1.2], [1.0, 1.2]] },
-        { color: "#a58b57", points: [[-3.2, 3.5], [-3.2, -4.2], [2.7, -4.2], [2.7, -0.2]] },
-        { color: "#7d8e9a", points: [[-5.8, -0.8], [5.9, -0.8], [5.9, 3.2]] },
-      ];
-      processLines.forEach((process) => {
-        line(process.points.map(([x, y]) => project(x, y)));
-        context.strokeStyle = process.color;
-        context.lineWidth = 1.5;
-        context.stroke();
+        context.fillText(object.name, center.x, center.y);
       });
 
-      // Patrol route.
-      if (waypoints.length > 1) {
-        line(waypoints.map((point) => project(point.x, point.y)));
+      if (map.waypoints.length > 1) {
+        line(map.waypoints.map((point) => project(point.x, point.y)));
         context.strokeStyle = "#ffffff";
         context.lineWidth = 7;
         context.stroke();
@@ -160,7 +158,7 @@ export function Industrial2DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
         context.lineWidth = 4;
         context.stroke();
       }
-      waypoints.forEach((waypoint, index) => {
+      map.waypoints.forEach((waypoint, index) => {
         const point = project(waypoint.x, waypoint.y);
         context.beginPath();
         context.arc(point.x, point.y, waypoint.id === selected ? 12 : 10, 0, Math.PI * 2);
@@ -203,8 +201,7 @@ export function Industrial2DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
       context.fillStyle = "#294f67";
       context.fillText(`巡检车 · 01  (${robotX.toFixed(2)}, ${robotY.toFixed(2)})`, robot.x + 23, robot.y);
 
-      // Compact north arrow inside the map, no side annotation panel.
-      const north = project(6.9, 5.0);
+      const north = project(maxX - map.bounds.width * 0.07, maxY - map.bounds.height * 0.08);
       context.beginPath();
       context.moveTo(north.x, north.y - 14);
       context.lineTo(north.x - 5, north.y + 5);
@@ -221,16 +218,14 @@ export function Industrial2DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
 
     const handleClick = (event: MouseEvent) => {
       const rect = canvas.getBoundingClientRect();
-      const rawX = event.clientX - rect.left;
-      const rawY = event.clientY - rect.top;
-      const x = (rawX - width / 2) / zoom + width / 2;
-      const y = (rawY - height / 2) / zoom + height / 2;
+      const x = (event.clientX - rect.left - width / 2) / zoom + width / 2;
+      const y = (event.clientY - rect.top - height / 2) / zoom + height / 2;
       let best: { id: number; distance: number } | null = null;
-      waypoints.forEach((point) => {
+      for (const point of map.waypoints) {
         const target = project(point.x, point.y);
         const distance = Math.hypot(target.x - x, target.y - y);
         if (distance < 18 && (!best || distance < best.distance)) best = { id: point.id, distance };
-      });
+      }
       if (best) onSelect(best.id);
     };
 
@@ -242,7 +237,7 @@ export function Industrial2DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
       observer.disconnect();
       canvas.removeEventListener("click", handleClick);
     };
-  }, [robotX, robotY, robotYaw, selected, waypoints, zoom, onSelect]);
+  }, [map, robotX, robotY, robotYaw, selected, zoom, onSelect]);
 
-  return <canvas ref={canvasRef} className="industrial-2d-map" role="img" aria-label="工厂巡检工程平面图，显示设备、管廊、道路、巡检路线和车辆实时位置" />;
+  return <canvas ref={canvasRef} className="industrial-2d-map" role="img" aria-label={`${map.name} 巡检工程平面图，显示设备、障碍物、巡检路线和车辆实时位置`} />;
 }

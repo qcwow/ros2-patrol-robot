@@ -1,3 +1,5 @@
+import base64
+import json
 import math
 import time
 from pathlib import Path
@@ -11,6 +13,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import Imu, JointState, LaserScan
+from std_msgs.msg import String
 from tf2_ros import TransformBroadcaster
 
 
@@ -81,6 +84,88 @@ class OccupancyMap:
 
         image_row = self.height - 1 - grid_y
         return self._occupied[image_row * self.width + grid_x]
+
+    @classmethod
+    def from_scenario(cls, payload: dict):
+        bounds = payload.get('bounds') or {}
+        origin_x = float(bounds.get('minX', -8.0))
+        origin_y = float(bounds.get('minY', -6.0))
+        world_width = max(2.0, min(float(bounds.get('width', 16.0)), 500.0))
+        world_height = max(2.0, min(float(bounds.get('height', 12.0)), 500.0))
+        requested_resolution = max(
+            0.02,
+            min(float(payload.get('resolution', 0.25)), 5.0),
+        )
+        occupancy = payload.get('occupancy')
+        if isinstance(occupancy, dict) and occupancy.get('data'):
+            width = max(1, min(int(occupancy.get('width', 0)), 2000))
+            height = max(1, min(int(occupancy.get('height', 0)), 2000))
+            resolution = max(
+                0.001,
+                min(float(occupancy.get('resolution', requested_resolution)), 5.0),
+            )
+            origin_x = float(occupancy.get('originX', origin_x))
+            origin_y = float(occupancy.get('originY', origin_y))
+            packed = base64.b64decode(str(occupancy['data']), validate=True)
+            if len(packed) * 8 < width * height:
+                raise ValueError('占用栅格数据不完整')
+            occupied = [
+                bool((packed[index >> 3] >> (index & 7)) & 1)
+                for index in range(width * height)
+            ]
+        else:
+            resolution = max(
+                requested_resolution,
+                world_width / 800.0,
+                world_height / 800.0,
+            )
+            width = max(2, int(math.ceil(world_width / resolution)))
+            height = max(2, int(math.ceil(world_height / resolution)))
+            occupied = [False] * (width * height)
+            for row in range(height):
+                for column in range(width):
+                    if row in (0, height - 1) or column in (0, width - 1):
+                        occupied[row * width + column] = True
+
+        objects = payload.get('objects') or []
+        if not isinstance(objects, list) or len(objects) > 500:
+            raise ValueError('场景元素格式无效或数量超过 500')
+        for item in objects:
+            if not isinstance(item, dict):
+                continue
+            center_x = float(item.get('x', 0.0))
+            center_y = float(item.get('y', 0.0))
+            object_width = max(0.1, min(float(item.get('width', 1.0)), 50.0))
+            object_depth = max(0.1, min(float(item.get('depth', 1.0)), 50.0))
+            min_column = max(0, int(math.floor(
+                (center_x - object_width / 2.0 - origin_x) / resolution
+            )))
+            max_column = min(width - 1, int(math.floor(
+                (center_x + object_width / 2.0 - origin_x) / resolution
+            )))
+            min_grid_y = max(0, int(math.floor(
+                (center_y - object_depth / 2.0 - origin_y) / resolution
+            )))
+            max_grid_y = min(height - 1, int(math.floor(
+                (center_y + object_depth / 2.0 - origin_y) / resolution
+            )))
+            for grid_y in range(min_grid_y, max_grid_y + 1):
+                row = height - 1 - grid_y
+                for column in range(min_column, max_column + 1):
+                    occupied[row * width + column] = True
+
+        instance = cls.__new__(cls)
+        instance.yaml_path = Path('<web-scenario>')
+        instance.resolution = resolution
+        instance.origin_x = origin_x
+        instance.origin_y = origin_y
+        instance.origin_yaw = 0.0
+        instance.negate = False
+        instance.occupied_threshold = 0.65
+        instance.width = width
+        instance.height = height
+        instance._occupied = occupied
+        return instance
 
 
 class LightweightSimulator(Node):
@@ -155,6 +240,12 @@ class LightweightSimulator(Node):
         )
         self._tf_broadcaster = TransformBroadcaster(self)
         self.create_subscription(Twist, '/cmd_vel', self._on_command, 10)
+        self.create_subscription(
+            String,
+            '/patrol/map_scenario',
+            self._on_map_scenario,
+            10,
+        )
 
         angle_increment = 2.0 * math.pi / (self._scan_samples - 1)
         self._scan_angles = [
@@ -181,6 +272,22 @@ class LightweightSimulator(Node):
             min(self._angular_limit, float(message.angular.z)),
         )
         self._last_command = time.monotonic()
+
+    def _on_map_scenario(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+            next_map = OccupancyMap.from_scenario(payload)
+            if not next_map.is_occupied(*self._map_pose()[:2]):
+                self._map = next_map
+                self._ray_step = min(0.10, self._map.resolution / 2.0)
+                self.get_logger().warning(
+                    f'仿真场景已切换：{payload.get("name", "未命名地图")}，'
+                    f'{next_map.width}x{next_map.height} 栅格'
+                )
+            else:
+                self.get_logger().error('新地图中车辆当前位置被占用，拒绝切换仿真场景')
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            self.get_logger().error(f'地图场景数据无效：{error}')
 
     @staticmethod
     def _stamp(simulation_time: float) -> TimeMessage:

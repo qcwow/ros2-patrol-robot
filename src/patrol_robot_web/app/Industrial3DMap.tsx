@@ -1,28 +1,33 @@
 "use client";
 
 import { useEffect, useRef } from "react";
+import { decodeOccupancy, type PatrolMap } from "./mapTypes";
 
-type Point = { id: number; name: string; x: number; y: number };
+export type MapEditorTool = "select" | "obstacle" | "device" | "waypoint";
+
 type Props = {
+  map: PatrolMap;
   robotX: number;
   robotY: number;
   robotYaw: number;
   zoom: number;
-  waypoints: Point[];
   selected: number;
+  onSelect?: (id: number) => void;
+  editing?: boolean;
+  tool?: MapEditorTool;
+  selectedEntity?: string | null;
+  onSelectEntity?: (selection: string | null) => void;
+  onPlace?: (tool: Exclude<MapEditorTool, "select">, x: number, y: number) => void;
+  onMoveEntity?: (selection: string, x: number, y: number) => void;
 };
 
 type XY = { x: number; y: number };
 
-const buildings = [
-  { name: "A区管道架", x: -2.75, y: 1.5, w: 1.0, d: 4.0, h: 1.2 },
-  { name: "B区管道架", x: 2.25, y: -2.0, w: 1.0, d: 4.0, h: 1.2 },
-  { name: "控制柜", x: 0.25, y: 1.0, w: 1.5, d: 1.0, h: 1.4 },
-  { name: "北侧设备区", x: 4.7, y: 3.7, w: 2.3, d: 1.0, h: 0.8 },
-  { name: "维护间", x: -5.4, y: 0.2, w: 1.7, d: 1.3, h: 0.9 },
-];
-
-export function Industrial3DMap({ robotX, robotY, robotYaw, zoom, waypoints, selected }: Props) {
+export function Industrial3DMap({
+  map, robotX, robotY, robotYaw, zoom, selected, onSelect,
+  editing = false, tool = "select", selectedEntity = null,
+  onSelectEntity, onPlace, onMoveEntity,
+}: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -30,6 +35,73 @@ export function Industrial3DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
     if (!canvas) return;
     const context = canvas.getContext("2d");
     if (!context) return;
+    let width = 0;
+    let height = 0;
+    let dragSelection: string | null = null;
+    const maxX = map.bounds.minX + map.bounds.width;
+    const maxY = map.bounds.minY + map.bounds.height;
+
+    const project = (x: number, y: number): XY => ({
+      x: width * (0.08 + ((x - map.bounds.minX) / map.bounds.width) * 0.84),
+      y: height * (0.1 + ((maxY - y) / map.bounds.height) * 0.78),
+    });
+    const unproject = (screenX: number, screenY: number) => ({
+      x: map.bounds.minX + ((screenX / width - 0.08) / 0.84) * map.bounds.width,
+      y: maxY - ((screenY / height - 0.1) / 0.78) * map.bounds.height,
+    });
+    const path = (points: XY[], close = false) => {
+      context.beginPath();
+      points.forEach((point, index) => index === 0 ? context.moveTo(point.x, point.y) : context.lineTo(point.x, point.y));
+      if (close) context.closePath();
+    };
+    const eventPoint = (event: PointerEvent) => {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: (event.clientX - rect.left - width / 2) / zoom + width / 2,
+        y: (event.clientY - rect.top - height / 2) / zoom + height / 2,
+      };
+    };
+    const hitTest = (screen: XY) => {
+      for (let index = map.waypoints.length - 1; index >= 0; index -= 1) {
+        const point = project(map.waypoints[index].x, map.waypoints[index].y);
+        if (Math.hypot(point.x - screen.x, point.y - screen.y) <= 15) return `waypoint:${map.waypoints[index].id}`;
+      }
+      for (let index = map.objects.length - 1; index >= 0; index -= 1) {
+        const object = map.objects[index];
+        const a = project(object.x - object.width / 2, object.y - object.depth / 2);
+        const b = project(object.x + object.width / 2, object.y + object.depth / 2);
+        const left = Math.min(a.x, b.x) - 10;
+        const right = Math.max(a.x, b.x) + 10;
+        const top = Math.min(a.y, b.y) - 20 * object.height;
+        const bottom = Math.max(a.y, b.y) + 6;
+        if (screen.x >= left && screen.x <= right && screen.y >= top && screen.y <= bottom) return `object:${object.id}`;
+      }
+      return null;
+    };
+
+    const drawOccupancy = () => {
+      if (!map.occupancy) return;
+      const cells = decodeOccupancy(map.occupancy);
+      const bitmap = document.createElement("canvas");
+      bitmap.width = map.occupancy.width;
+      bitmap.height = map.occupancy.height;
+      const bitmapContext = bitmap.getContext("2d");
+      if (!bitmapContext) return;
+      const pixels = bitmapContext.createImageData(bitmap.width, bitmap.height);
+      for (let index = 0; index < cells.length; index += 1) {
+        const offset = index * 4;
+        pixels.data[offset] = cells[index] ? 87 : 235;
+        pixels.data[offset + 1] = cells[index] ? 99 : 237;
+        pixels.data[offset + 2] = cells[index] ? 105 : 233;
+        pixels.data[offset + 3] = cells[index] ? 225 : 150;
+      }
+      bitmapContext.putImageData(pixels, 0, 0);
+      const topLeft = project(map.occupancy.originX, map.occupancy.originY + map.occupancy.height * map.occupancy.resolution);
+      const bottomRight = project(map.occupancy.originX + map.occupancy.width * map.occupancy.resolution, map.occupancy.originY);
+      context.imageSmoothingEnabled = false;
+      context.drawImage(bitmap, topLeft.x, topLeft.y, bottomRight.x - topLeft.x, bottomRight.y - topLeft.y);
+      context.imageSmoothingEnabled = true;
+    };
 
     const draw = () => {
       const rect = canvas.getBoundingClientRect();
@@ -37,8 +109,8 @@ export function Industrial3DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
       canvas.width = Math.max(1, Math.round(rect.width * ratio));
       canvas.height = Math.max(1, Math.round(rect.height * ratio));
       context.setTransform(ratio, 0, 0, ratio, 0, 0);
-      const width = rect.width;
-      const height = rect.height;
+      width = rect.width;
+      height = rect.height;
       context.clearRect(0, 0, width, height);
       context.fillStyle = "#f3f0e8";
       context.fillRect(0, 0, width, height);
@@ -48,73 +120,76 @@ export function Industrial3DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
       context.scale(zoom, zoom);
       context.translate(-width / 2, -height / 2);
 
-      const project = (x: number, y: number): XY => ({
-        x: width * (0.08 + ((x + 8) / 16) * 0.84),
-        y: height * (0.1 + ((6 - y) / 12) * 0.78),
-      });
-
-      const path = (points: XY[], close = false) => {
-        context.beginPath();
-        points.forEach((point, index) => index === 0 ? context.moveTo(point.x, point.y) : context.lineTo(point.x, point.y));
-        if (close) context.closePath();
-      };
-
-      // Apple-style pale service roads with a soft neutral curb.
-      const roads = [
-        [[-7, -4.8], [6.8, -4.8], [6.8, 4.7], [-7, 4.7], [-7, -4.8]],
-        [[-6.5, 0], [6.2, 0]],
-        [[-0.4, -4.8], [-0.4, 4.7]],
-        [[-5.5, 3.1], [4.9, 3.1]],
+      const boundary = [
+        project(map.bounds.minX, map.bounds.minY), project(maxX, map.bounds.minY),
+        project(maxX, maxY), project(map.bounds.minX, maxY),
       ];
-      context.lineCap = "round";
-      context.lineJoin = "round";
-      roads.forEach((road) => {
-        const points = road.map(([x, y]) => project(x, y));
-        path(points);
-        context.strokeStyle = "#cbd0cf";
-        context.lineWidth = 20;
-        context.stroke();
-        context.strokeStyle = "#faf8f2";
-        context.lineWidth = 14;
-        context.stroke();
-      });
+      path(boundary, true);
+      context.fillStyle = "#e7e6df";
+      context.fill();
+      context.strokeStyle = "#aeb7b3";
+      context.lineWidth = 2;
+      context.stroke();
+      drawOccupancy();
 
-      const drawBuilding = (building: typeof buildings[number]) => {
-        const base = [
-          project(building.x - building.w / 2, building.y - building.d / 2),
-          project(building.x + building.w / 2, building.y - building.d / 2),
-          project(building.x + building.w / 2, building.y + building.d / 2),
-          project(building.x - building.w / 2, building.y + building.d / 2),
+      if (!map.occupancy) {
+        const insetX = map.bounds.width * 0.08;
+        const insetY = map.bounds.height * 0.1;
+        const roads = [
+          [[map.bounds.minX + insetX, map.bounds.minY + insetY], [maxX - insetX, map.bounds.minY + insetY], [maxX - insetX, maxY - insetY], [map.bounds.minX + insetX, maxY - insetY], [map.bounds.minX + insetX, map.bounds.minY + insetY]],
+          [[map.bounds.minX + insetX, map.bounds.minY + map.bounds.height / 2], [maxX - insetX, map.bounds.minY + map.bounds.height / 2]],
         ];
-        const lift = { x: -7 * building.h, y: -15 * building.h };
+        context.lineCap = "round";
+        context.lineJoin = "round";
+        roads.forEach((road) => {
+          const points = road.map(([x, y]) => project(x, y));
+          path(points);
+          context.strokeStyle = "#cbd0cf";
+          context.lineWidth = 20;
+          context.stroke();
+          context.strokeStyle = "#faf8f2";
+          context.lineWidth = 14;
+          context.stroke();
+        });
+      }
+
+      const drawObject = (object: PatrolMap["objects"][number]) => {
+        const base = [
+          project(object.x - object.width / 2, object.y - object.depth / 2),
+          project(object.x + object.width / 2, object.y - object.depth / 2),
+          project(object.x + object.width / 2, object.y + object.depth / 2),
+          project(object.x - object.width / 2, object.y + object.depth / 2),
+        ];
+        const lift = { x: -7 * object.height, y: -15 * object.height };
         const top = base.map((point) => ({ x: point.x + lift.x, y: point.y + lift.y }));
+        const active = selectedEntity === `object:${object.id}`;
 
         path([base[0], base[1], top[1], top[0]], true);
-        context.fillStyle = "#b6b8ba";
+        context.fillStyle = object.type === "obstacle" ? "#a95d49" : "#9daeb5";
         context.fill();
         path([base[1], base[2], top[2], top[1]], true);
-        context.fillStyle = "#c6c7c8";
+        context.fillStyle = object.type === "obstacle" ? "#bf745e" : "#b4c1c5";
         context.fill();
         path(top, true);
-        context.fillStyle = "#e1dfdd";
+        context.fillStyle = active ? "#ffb45c" : object.type === "obstacle" ? "#dd8b72" : "#d9e0e1";
         context.fill();
-        context.strokeStyle = "#d0cfcd";
-        context.lineWidth = 1;
+        context.strokeStyle = active ? "#ef7d14" : object.type === "obstacle" ? "#a34d37" : "#9da9aa";
+        context.lineWidth = active ? 3 : 1;
         context.stroke();
 
         const label = top.reduce((sum, point) => ({ x: sum.x + point.x / 4, y: sum.y + point.y / 4 }), { x: 0, y: 0 });
-        context.font = "500 11px Arial, sans-serif";
+        context.font = "600 10px Arial, sans-serif";
         context.textAlign = "center";
         context.lineWidth = 4;
         context.strokeStyle = "#ffffffdd";
-        context.strokeText(building.name, label.x, label.y + 4);
-        context.fillStyle = "#627078";
-        context.fillText(building.name, label.x, label.y + 4);
+        context.strokeText(object.name, label.x, label.y + 4);
+        context.fillStyle = object.type === "obstacle" ? "#8b4636" : "#52666f";
+        context.fillText(object.name, label.x, label.y + 4);
       };
-      buildings.slice().sort((a, b) => b.y - a.y).forEach(drawBuilding);
+      map.objects.slice().sort((a, b) => b.y - a.y).forEach(drawObject);
 
-      if (waypoints.length > 1) {
-        path(waypoints.map((point) => project(point.x, point.y)));
+      if (map.waypoints.length > 1) {
+        path(map.waypoints.map((point) => project(point.x, point.y)));
         context.strokeStyle = "#ffffff";
         context.lineWidth = 7;
         context.stroke();
@@ -123,17 +198,18 @@ export function Industrial3DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
         context.stroke();
       }
 
-      waypoints.forEach((waypoint, index) => {
+      map.waypoints.forEach((waypoint, index) => {
         const point = project(waypoint.x, waypoint.y);
+        const active = selectedEntity === `waypoint:${waypoint.id}` || (!editing && waypoint.id === selected);
         context.beginPath();
-        context.arc(point.x, point.y, waypoint.id === selected ? 12 : 10, 0, Math.PI * 2);
-        context.fillStyle = waypoint.id === selected ? "#ff8a24" : "#71899b";
+        context.arc(point.x, point.y, active ? 12 : 10, 0, Math.PI * 2);
+        context.fillStyle = active ? "#ff8a24" : "#71899b";
         context.fill();
         context.strokeStyle = "#ffffff";
         context.lineWidth = 3;
         context.stroke();
         context.fillStyle = "#ffffff";
-        context.font = "500 10px Arial";
+        context.font = "600 10px Arial";
         context.textAlign = "center";
         context.textBaseline = "middle";
         context.fillText(String(index + 1), point.x, point.y + 0.5);
@@ -142,6 +218,7 @@ export function Industrial3DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
       const robot = project(robotX, robotY);
       const robotFront = project(robotX + Math.cos(robotYaw), robotY + Math.sin(robotYaw));
       const heading = Math.atan2(robotFront.y - robot.y, robotFront.x - robot.x);
+      context.globalAlpha = editing ? 0.65 : 1;
       context.beginPath();
       context.arc(robot.x, robot.y, 18, 0, Math.PI * 2);
       context.fillStyle = "#1777e8";
@@ -160,23 +237,64 @@ export function Industrial3DMap({ robotX, robotY, robotYaw, zoom, waypoints, sel
       context.fillStyle = "#ffffff";
       context.fill();
       context.restore();
+      context.globalAlpha = 1;
       context.font = "500 11px Arial, sans-serif";
       context.textAlign = "left";
       context.textBaseline = "alphabetic";
       context.lineWidth = 4;
       context.strokeStyle = "#ffffff";
-      context.strokeText("巡检车 · 01", robot.x + 24, robot.y + 4);
+      context.strokeText(editing ? "车辆当前位置" : "巡检车 · 01", robot.x + 24, robot.y + 4);
       context.fillStyle = "#245477";
-      context.fillText("巡检车 · 01", robot.x + 24, robot.y + 4);
-
+      context.fillText(editing ? "车辆当前位置" : "巡检车 · 01", robot.x + 24, robot.y + 4);
       context.restore();
     };
 
+    const handlePointerDown = (event: PointerEvent) => {
+      const screen = eventPoint(event);
+      if (!editing) {
+        const hit = hitTest(screen);
+        if (hit?.startsWith("waypoint:")) onSelect?.(Number(hit.split(":")[1]));
+        return;
+      }
+      const world = unproject(screen.x, screen.y);
+      const boundedX = Math.max(map.bounds.minX, Math.min(maxX, world.x));
+      const boundedY = Math.max(map.bounds.minY, Math.min(maxY, world.y));
+      if (tool !== "select") {
+        onPlace?.(tool, Number(boundedX.toFixed(2)), Number(boundedY.toFixed(2)));
+        return;
+      }
+      dragSelection = hitTest(screen);
+      onSelectEntity?.(dragSelection);
+      if (dragSelection) canvas.setPointerCapture(event.pointerId);
+    };
+    const handlePointerMove = (event: PointerEvent) => {
+      if (!dragSelection || !editing || tool !== "select") return;
+      const screen = eventPoint(event);
+      const world = unproject(screen.x, screen.y);
+      onMoveEntity?.(
+        dragSelection,
+        Number(Math.max(map.bounds.minX, Math.min(maxX, world.x)).toFixed(2)),
+        Number(Math.max(map.bounds.minY, Math.min(maxY, world.y)).toFixed(2)),
+      );
+    };
+    const endDrag = () => { dragSelection = null; };
+
+    canvas.style.cursor = editing ? tool === "select" ? "grab" : "crosshair" : "default";
     const observer = new ResizeObserver(draw);
     observer.observe(canvas);
+    canvas.addEventListener("pointerdown", handlePointerDown);
+    canvas.addEventListener("pointermove", handlePointerMove);
+    canvas.addEventListener("pointerup", endDrag);
+    canvas.addEventListener("pointercancel", endDrag);
     draw();
-    return () => observer.disconnect();
-  }, [robotX, robotY, robotYaw, selected, waypoints, zoom]);
+    return () => {
+      observer.disconnect();
+      canvas.removeEventListener("pointerdown", handlePointerDown);
+      canvas.removeEventListener("pointermove", handlePointerMove);
+      canvas.removeEventListener("pointerup", endDrag);
+      canvas.removeEventListener("pointercancel", endDrag);
+    };
+  }, [editing, map, onMoveEntity, onPlace, onSelect, onSelectEntity, robotX, robotY, robotYaw, selected, selectedEntity, tool, zoom]);
 
-  return <canvas ref={canvasRef} className="industrial-3d-map" role="img" aria-label="工厂巡检场景三维地图，显示建筑、道路、巡检路线和车辆实时位置" />;
+  return <canvas ref={canvasRef} className="industrial-3d-map" role="img" aria-label={`${map.name} 三维地图，显示设备、障碍物、巡检点和车辆位置`} />;
 }

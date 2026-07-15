@@ -5,8 +5,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Industrial3DMap } from "./Industrial3DMap";
 import { Industrial2DMap } from "./Industrial2DMap";
+import { MapManagement } from "./MapManagement";
+import { DEFAULT_MAPS, mapToRobotPayload, type PatrolMap, type Waypoint } from "./mapTypes";
 
-type Waypoint = { id: number; name: string; x: number; y: number; dwell: number };
 type CameraStatus = {
   enabled: boolean; ok: boolean; frames: number; width: number; height: number;
   last_frame_age: number | null; topic: string; error?: string | null; fps: number;
@@ -21,20 +22,16 @@ type PerceptionStatus = {
   active_sources: string[]; last_camera_cloud_age: number | null;
   error?: string | null;
 };
+type MapRuntimeStatus = {
+  active_id: string; active_name: string; transitioning: boolean; error?: string | null;
+};
 type Telemetry = {
   speed: number; x: number; y: number; yaw: number; lidar_ok: boolean;
   patrol: { state: string; current_index: number; current_waypoint: string; waypoint_count: number };
   camera: CameraStatus;
   perception: PerceptionStatus;
+  map: MapRuntimeStatus;
 };
-
-const initialWaypoints: Waypoint[] = [
-  { id: 1, name: "起点东侧", x: -4.8, y: -3.8, dwell: 2 },
-  { id: 2, name: "A区管道北侧", x: -4.6, y: 3.8, dwell: 3 },
-  { id: 3, name: "控制柜检查点", x: 0.2, y: 3.2, dwell: 3 },
-  { id: 4, name: "B区管道东侧", x: 4.6, y: -1.0, dwell: 3 },
-  { id: 5, name: "返回区", x: -5.8, y: -4.0, dwell: 2 },
-];
 
 const CAMERA_LIMITS = { pan: 90, tiltUp: 25, tiltDown: 35 };
 const PERCEPTION_MODES: Array<{ id: PerceptionMode; name: string; description: string; icon: string }> = [
@@ -50,7 +47,12 @@ export default function Home() {
   const [width, setWidth] = useState(42);
   const [lidars, setLidars] = useState(1);
   const [running, setRunning] = useState(false);
-  const [waypoints, setWaypoints] = useState(initialWaypoints);
+  const [maps, setMaps] = useState<PatrolMap[]>(DEFAULT_MAPS);
+  const [activeMapId, setActiveMapId] = useState(DEFAULT_MAPS[0].id);
+  const [mapStorageReady, setMapStorageReady] = useState(false);
+  const [activeSection, setActiveSection] = useState<"control" | "maps">("control");
+  const activeMap = useMemo(() => maps.find((map) => map.id === activeMapId) ?? maps[0] ?? DEFAULT_MAPS[0], [activeMapId, maps]);
+  const waypoints = activeMap.waypoints;
   const [selected, setSelected] = useState(3);
   const [toast, setToast] = useState("所有系统运行正常");
   const [connected, setConnected] = useState(false);
@@ -68,6 +70,7 @@ export default function Home() {
       gimbal_locked: false, safety_ok: true, camera_points: 0,
       active_sources: [], last_camera_cloud_age: null,
     },
+    map: { active_id: "pipeline-demo", active_name: "管廊综合测试区", transitioning: false, error: null },
   });
   const [apiBase] = useState(() => {
     if (typeof window === "undefined") return "";
@@ -109,6 +112,34 @@ export default function Home() {
     return () => window.clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    const timer = window.setTimeout(() => {
+      try {
+        const storedMaps = window.localStorage.getItem("patrol_robot_maps_v1");
+        const storedActiveId = window.localStorage.getItem("patrol_robot_active_map_v1");
+        if (storedMaps) {
+          const parsed = JSON.parse(storedMaps) as PatrolMap[];
+          if (Array.isArray(parsed) && parsed.length && parsed.every((map) => map?.id && map?.bounds && Array.isArray(map.objects) && Array.isArray(map.waypoints))) {
+            const nextActive = parsed.find((map) => map.id === storedActiveId) ?? parsed[0];
+            setMaps(parsed);
+            setActiveMapId(nextActive.id);
+            setSelected(nextActive.waypoints[0]?.id ?? 0);
+          }
+        }
+      } catch {
+        window.localStorage.removeItem("patrol_robot_maps_v1");
+      }
+      setMapStorageReady(true);
+    }, 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+
+  useEffect(() => {
+    if (!mapStorageReady) return;
+    window.localStorage.setItem("patrol_robot_maps_v1", JSON.stringify(maps));
+    window.localStorage.setItem("patrol_robot_active_map_v1", activeMapId);
+  }, [activeMapId, mapStorageReady, maps]);
+
   useEffect(() => () => {
     clearManualTimer();
     if (gimbalTimer.current !== null) window.clearTimeout(gimbalTimer.current);
@@ -135,6 +166,9 @@ export default function Home() {
           transitioning: false, gimbal_locked: false, safety_ok: true,
           camera_points: 0, active_sources: [], last_camera_cloud_age: null,
         };
+        const mapStatus = status.map ?? {
+          active_id: "pipeline-demo", active_name: "管廊综合测试区", transitioning: false, error: null,
+        };
         setCameraEnabled(Boolean(camera.enabled));
         setPerceptionBusy(Boolean(perception.transitioning));
         if (!gimbalAdjusting.current) {
@@ -150,6 +184,7 @@ export default function Home() {
           patrol: status.patrol ?? { state: "UNKNOWN", current_index: 0, current_waypoint: "等待任务", waypoint_count: 0 },
           camera,
           perception,
+          map: mapStatus,
         });
         setRunning(Boolean(status.patrol?.running));
       } catch {
@@ -259,10 +294,65 @@ export default function Home() {
     }
   }
 
+  function updateMap(next: PatrolMap) {
+    setMaps((current) => current.map((map) => map.id === next.id ? next : map));
+  }
+
+  function updateWaypoints(next: Waypoint[]) {
+    updateMap({ ...activeMap, waypoints: next, updatedAt: new Date().toISOString() });
+  }
+
+  async function activateMap(next: PatrolMap) {
+    if (running) {
+      await send("/api/patrol/stop");
+      setRunning(false);
+    }
+    setActiveMapId(next.id);
+    setSelected(next.waypoints[0]?.id ?? 0);
+    setMapMode("3d");
+    if (connected) {
+      const applied = await send("/api/maps/activate", mapToRobotPayload(next));
+      if (applied) await saveWaypoints(next.waypoints);
+    } else {
+      notify(`已在本机切换到“${next.name}”，连接车辆后可应用到 ROS 2`);
+    }
+  }
+
+  function addMaps(nextMaps: PatrolMap[]) {
+    if (!nextMaps.length) return;
+    setMaps((current) => [...current, ...nextMaps]);
+    void activateMap(nextMaps[nextMaps.length - 1]);
+  }
+
+  function duplicateMap(source: PatrolMap) {
+    const timestamp = new Date().toISOString();
+    const unique = timestamp.replace(/\D/g, "");
+    const duplicate: PatrolMap = {
+      ...source,
+      id: `${source.id}-copy-${unique}`,
+      name: `${source.name} · 副本`,
+      source: source.source === "preset" ? "generated" : source.source,
+      objects: source.objects.map((object, index) => ({ ...object, id: `${object.id}-${unique}-${index}` })),
+      waypoints: source.waypoints.map((waypoint) => ({ ...waypoint })),
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+    addMaps([duplicate]);
+    notify("已复制当前地图");
+  }
+
+  function deleteMap(id: string) {
+    if (maps.length <= 1) return;
+    const nextMaps = maps.filter((map) => map.id !== id);
+    setMaps(nextMaps);
+    if (id === activeMapId) void activateMap(nextMaps[0]);
+    notify("地图已从场景库删除");
+  }
+
   function addWaypoint() {
     const id = Math.max(...waypoints.map((item) => item.id), 0) + 1;
-    const point = { id, name: `新巡检点 ${id}`, x: 1.5, y: 1.2, dwell: 3 };
-    setWaypoints([...waypoints, point]);
+    const point = { id, name: `新巡检点 ${id}`, x: activeMap.bounds.minX + activeMap.bounds.width / 2, y: activeMap.bounds.minY + activeMap.bounds.height / 2, dwell: 3 };
+    updateWaypoints([...waypoints, point]);
     setSelected(id);
     saveWaypoints([...waypoints, point]);
   }
@@ -270,7 +360,7 @@ export default function Home() {
   function removeWaypoint(id: number) {
     if (waypoints.length <= 1) return;
     const next = waypoints.filter((item) => item.id !== id);
-    setWaypoints(next);
+    updateWaypoints(next);
     if (selected === id) setSelected(next[0].id);
     saveWaypoints(next);
   }
@@ -343,10 +433,10 @@ export default function Home() {
         </div>
 
         <nav aria-label="主导航">
-          <button className={`nav-item ${mapMode !== "camera" ? "active" : ""}`} onClick={() => setMapMode("2d")}><i>⌁</i> 车辆控制</button>
+          <button className={`nav-item ${activeSection === "control" && mapMode !== "camera" ? "active" : ""}`} onClick={() => { setActiveSection("control"); setMapMode("2d"); }}><i>⌁</i> 车辆控制</button>
           <button className="nav-item"><i>⌖</i> 巡检任务 <b>{waypoints.length}</b></button>
-          <button className="nav-item"><i>◫</i> 地图管理</button>
-          <button className={`nav-item ${mapMode === "camera" ? "active" : ""}`} onClick={() => setMapMode("camera")}><i>◉</i> 设备监控</button>
+          <button className={`nav-item ${activeSection === "maps" ? "active" : ""}`} onClick={() => setActiveSection("maps")}><i>◫</i> 地图管理 <b>{maps.length}</b></button>
+          <button className={`nav-item ${activeSection === "control" && mapMode === "camera" ? "active" : ""}`} onClick={() => { setActiveSection("control"); setMapMode("camera"); }}><i>◉</i> 设备监控</button>
           <button className="nav-item"><i>⚙</i> 系统设置</button>
         </nav>
 
@@ -359,7 +449,7 @@ export default function Home() {
 
       <section className="workspace">
         <header className="topbar">
-          <div><p>车辆控制台</p><small>实时控制与任务配置</small></div>
+          <div><p>{activeSection === "maps" ? "地图场景工作台" : "车辆控制台"}</p><small>{activeSection === "maps" ? `当前地图 · ${activeMap.name}` : "实时控制与任务配置"}</small></div>
           <div className="status-cluster">
             <span className={`status-pill ${connected ? "" : "offline"}`} title={apiBase}><i></i>{connected ? toast : "车辆网关未连接"}</span>
             <span className="clock">{timeText} <small>{dateText}</small></span>
@@ -368,7 +458,24 @@ export default function Home() {
           </div>
         </header>
 
-        <div className="content">
+        <div className={`content ${activeSection === "maps" ? "map-content" : ""}`}>
+          {activeSection === "maps" ? (
+            <MapManagement
+              maps={maps}
+              activeMapId={activeMapId}
+              robotX={telemetry.x}
+              robotY={telemetry.y}
+              robotYaw={telemetry.yaw}
+              onActivate={(map) => void activateMap(map)}
+              onChange={updateMap}
+              onAdd={addMaps}
+              onDuplicate={duplicateMap}
+              onDelete={deleteMap}
+              onNotice={notify}
+              connected={connected}
+              runtimeMap={telemetry.map}
+            />
+          ) : (<>
           <section className="hero-panel">
             <div className={`map-area view-${mapMode}`} onWheel={(event) => { event.preventDefault(); changeMapZoom(event.deltaY < 0 ? 0.1 : -0.1); }}>
               <div className="map-mode-switch" role="group" aria-label="地图显示模式">
@@ -458,8 +565,8 @@ export default function Home() {
                   )}
                 </div>
               ) : mapMode === "3d" ? (
-                <Industrial3DMap robotX={telemetry.x} robotY={telemetry.y} robotYaw={telemetry.yaw} zoom={mapZoom} waypoints={waypoints} selected={selected} />
-              ) : <Industrial2DMap robotX={telemetry.x} robotY={telemetry.y} robotYaw={telemetry.yaw} zoom={mapZoom} waypoints={waypoints} selected={selected} onSelect={setSelected} />}
+                <Industrial3DMap map={activeMap} robotX={telemetry.x} robotY={telemetry.y} robotYaw={telemetry.yaw} zoom={mapZoom} selected={selected} onSelect={setSelected} />
+              ) : <Industrial2DMap map={activeMap} robotX={telemetry.x} robotY={telemetry.y} robotYaw={telemetry.yaw} zoom={mapZoom} selected={selected} onSelect={setSelected} />}
               {mapMode !== "camera" && (
                 <>
                   <div className="map-tools">
@@ -578,6 +685,7 @@ export default function Home() {
               </div>
             </div>
           </section>
+          </>)}
         </div>
       </section>
     </main>

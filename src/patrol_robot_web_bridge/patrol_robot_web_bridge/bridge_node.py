@@ -1,6 +1,9 @@
+import base64
+import binascii
 import json
 import math
 import queue
+import re
 import socket
 import threading
 import time
@@ -15,7 +18,7 @@ from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from nav2_msgs.msg import SpeedLimit
-from nav2_msgs.srv import ClearEntireCostmap
+from nav2_msgs.srv import ClearEntireCostmap, LoadMap
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
 from rclpy.node import Node
@@ -38,6 +41,7 @@ class RobotWebBridge(Node):
         self.declare_parameter('max_angular_speed', 0.8)
         self.declare_parameter('manual_command_timeout', 0.5)
         self.declare_parameter('hardware_config_file', '~/.ros/patrol_robot/hardware.json')
+        self.declare_parameter('map_storage_dir', '~/.ros/patrol_robot/maps')
         self.declare_parameter('camera_topic', '/camera/color/image_raw')
         self.declare_parameter('camera_stream_fps', 12.0)
         self.declare_parameter('camera_jpeg_quality', 65)
@@ -51,6 +55,9 @@ class RobotWebBridge(Node):
         self._max_linear = float(self.get_parameter('max_linear_speed').value)
         self._max_angular = float(self.get_parameter('max_angular_speed').value)
         self._command_timeout = float(self.get_parameter('manual_command_timeout').value)
+        self._map_storage_dir = Path(
+            str(self.get_parameter('map_storage_dir').value)
+        ).expanduser()
         self._camera_topic = str(self.get_parameter('camera_topic').value)
         self._camera_stream_fps = max(
             1.0,
@@ -109,6 +116,12 @@ class RobotWebBridge(Node):
             'speed': 0.0, 'angular_speed': 0.0, 'x': 0.0, 'y': 0.0,
             'battery': None, 'lidar_ok': False, 'last_scan_age': None,
             'max_linear_speed': self._max_linear,
+            'map': {
+                'active_id': 'pipeline-demo',
+                'active_name': '管廊综合测试区',
+                'transitioning': False,
+                'error': None,
+            },
             'perception': {
                 'mode': self._perception_mode,
                 'lidar_enabled': self._perception_mode in ('lidar', 'fusion'),
@@ -140,6 +153,11 @@ class RobotWebBridge(Node):
         self._waypoint_publisher = self.create_publisher(
             String,
             '/patrol_manager/set_waypoints',
+            10,
+        )
+        self._map_scenario_publisher = self.create_publisher(
+            String,
+            '/patrol/map_scenario',
             10,
         )
         self.create_subscription(Odometry, '/odom', self._on_odom, 10)
@@ -203,6 +221,10 @@ class RobotWebBridge(Node):
                 ClearEntireCostmap,
                 '/global_costmap/clear_entirely_global_costmap',
             ),
+        )
+        self._map_load_client = self.create_client(
+            LoadMap,
+            '/map_server/load_map',
         )
         self.create_timer(0.05, self._process_commands)
         self.create_timer(0.1, self._manual_watchdog)
@@ -338,6 +360,7 @@ class RobotWebBridge(Node):
             last_scan = status.pop('_last_scan', None)
             camera = dict(status.get('camera', {}))
             perception = dict(status.get('perception', {}))
+            map_status = dict(status.get('map', {}))
             last_frame = camera.pop('_last_frame', None)
             last_gimbal_state = camera.pop('_last_gimbal_state', None)
             last_camera_cloud = perception.pop('_last_camera_cloud', None)
@@ -401,6 +424,7 @@ class RobotWebBridge(Node):
             perception['safety_ok'] = False
         status['camera'] = camera
         status['perception'] = perception
+        status['map'] = map_status
         return status
 
     def camera_enabled(self):
@@ -494,6 +518,8 @@ class RobotWebBridge(Node):
                 message = String()
                 message.data = json.dumps(payload, ensure_ascii=False)
                 self._waypoint_publisher.publish(message)
+            elif path == '/api/maps/activate':
+                self._activate_map(payload)
             elif path == '/api/config/speed':
                 self._set_speed_limit(
                     float(payload.get('linear', self._max_linear)),
@@ -520,6 +546,186 @@ class RobotWebBridge(Node):
                 self._set_perception_mode(str(payload.get('mode', 'fusion')))
             elif path == '/api/config/hardware':
                 self._set_hardware_config(payload)
+
+    @staticmethod
+    def _scenario_grid(payload):
+        bounds = payload.get('bounds') or {}
+        origin_x = float(bounds.get('minX', -8.0))
+        origin_y = float(bounds.get('minY', -6.0))
+        world_width = max(2.0, min(float(bounds.get('width', 16.0)), 500.0))
+        world_height = max(2.0, min(float(bounds.get('height', 12.0)), 500.0))
+        requested_resolution = max(
+            0.02,
+            min(float(payload.get('resolution', 0.25)), 5.0),
+        )
+        occupancy = payload.get('occupancy')
+
+        if isinstance(occupancy, dict) and occupancy.get('data'):
+            width = max(1, min(int(occupancy.get('width', 0)), 2000))
+            height = max(1, min(int(occupancy.get('height', 0)), 2000))
+            resolution = max(
+                0.001,
+                min(float(occupancy.get('resolution', requested_resolution)), 5.0),
+            )
+            origin_x = float(occupancy.get('originX', origin_x))
+            origin_y = float(occupancy.get('originY', origin_y))
+            packed = base64.b64decode(str(occupancy['data']), validate=True)
+            if len(packed) * 8 < width * height:
+                raise ValueError('导入地图的占用栅格数据不完整')
+            occupied = [
+                bool((packed[index >> 3] >> (index & 7)) & 1)
+                for index in range(width * height)
+            ]
+        else:
+            resolution = max(
+                requested_resolution,
+                world_width / 800.0,
+                world_height / 800.0,
+            )
+            width = max(2, int(math.ceil(world_width / resolution)))
+            height = max(2, int(math.ceil(world_height / resolution)))
+            occupied = [False] * (width * height)
+            for row in range(height):
+                for column in range(width):
+                    if row in (0, height - 1) or column in (0, width - 1):
+                        occupied[row * width + column] = True
+
+        objects = payload.get('objects') or []
+        if not isinstance(objects, list) or len(objects) > 500:
+            raise ValueError('地图场景元素格式无效或数量超过 500')
+        for item in objects:
+            if not isinstance(item, dict):
+                continue
+            center_x = float(item.get('x', 0.0))
+            center_y = float(item.get('y', 0.0))
+            object_width = max(0.1, min(float(item.get('width', 1.0)), 50.0))
+            object_depth = max(0.1, min(float(item.get('depth', 1.0)), 50.0))
+            min_column = max(0, int(math.floor(
+                (center_x - object_width / 2.0 - origin_x) / resolution
+            )))
+            max_column = min(width - 1, int(math.floor(
+                (center_x + object_width / 2.0 - origin_x) / resolution
+            )))
+            min_grid_y = max(0, int(math.floor(
+                (center_y - object_depth / 2.0 - origin_y) / resolution
+            )))
+            max_grid_y = min(height - 1, int(math.floor(
+                (center_y + object_depth / 2.0 - origin_y) / resolution
+            )))
+            for grid_y in range(min_grid_y, max_grid_y + 1):
+                row = height - 1 - grid_y
+                for column in range(min_column, max_column + 1):
+                    occupied[row * width + column] = True
+
+        return origin_x, origin_y, resolution, width, height, occupied
+
+    def _write_scenario_map(self, payload):
+        (
+            origin_x, origin_y, resolution, width, height, occupied,
+        ) = self._scenario_grid(payload)
+        self._map_storage_dir.mkdir(parents=True, exist_ok=True)
+        safe_id = re.sub(
+            r'[^A-Za-z0-9_.-]+',
+            '-',
+            str(payload.get('id', 'scenario-map')),
+        ).strip('-') or 'scenario-map'
+        pgm_path = self._map_storage_dir / f'{safe_id}.pgm'
+        yaml_path = self._map_storage_dir / f'{safe_id}.yaml'
+        rows = []
+        for row in range(height):
+            start = row * width
+            rows.append(' '.join(
+                '0' if value else '254'
+                for value in occupied[start:start + width]
+            ))
+        pgm_path.write_text(
+            'P2\n'
+            '# Generated by patrol_robot_web_bridge map management\n'
+            f'{width} {height}\n255\n' + '\n'.join(rows) + '\n',
+            encoding='ascii',
+        )
+        yaml_path.write_text(
+            f'image: {pgm_path.name}\n'
+            'mode: trinary\n'
+            f'resolution: {resolution:.6f}\n'
+            f'origin: [{origin_x:.6f}, {origin_y:.6f}, 0.0]\n'
+            'negate: 0\n'
+            'occupied_thresh: 0.65\n'
+            'free_thresh: 0.25\n',
+            encoding='utf-8',
+        )
+        return yaml_path
+
+    def _activate_map(self, payload):
+        map_id = str(payload.get('id', '')).strip()
+        map_name = str(payload.get('name', '')).strip()
+        if not map_id or not map_name:
+            with self._lock:
+                self._status['map'].update({
+                    'transitioning': False,
+                    'error': '地图 ID 或名称不能为空',
+                })
+            return
+
+        self._publish_manual(0.0, 0.0)
+        stop_client = self._patrol_clients['stop']
+        if stop_client.service_is_ready():
+            stop_client.call_async(Trigger.Request())
+        with self._lock:
+            self._status['map'].update({
+                'active_id': map_id,
+                'active_name': map_name,
+                'transitioning': True,
+                'error': None,
+            })
+
+        try:
+            yaml_path = self._write_scenario_map(payload)
+            scenario_message = String()
+            scenario_message.data = json.dumps(payload, ensure_ascii=False)
+            self._map_scenario_publisher.publish(scenario_message)
+        except (ValueError, TypeError, OSError, binascii.Error) as error:
+            with self._lock:
+                self._status['map'].update({
+                    'transitioning': False,
+                    'error': f'地图数据无效：{error}',
+                })
+            return
+
+        if not self._map_load_client.service_is_ready():
+            with self._lock:
+                self._status['map'].update({
+                    'transitioning': False,
+                    'error': '地图已保存，但 Nav2 地图服务尚未就绪',
+                })
+            return
+
+        request = LoadMap.Request()
+        request.map_url = str(yaml_path)
+        future = self._map_load_client.call_async(request)
+        future.add_done_callback(self._on_map_loaded)
+        self.get_logger().warning(
+            f'正在切换导航地图：{map_name} ({yaml_path})'
+        )
+
+    def _on_map_loaded(self, future):
+        error = None
+        try:
+            response = future.result()
+            if int(response.result) != 0:
+                error = f'Nav2 返回错误码 {response.result}'
+        except Exception as exception:
+            error = str(exception)
+        with self._lock:
+            self._status['map'].update({
+                'transitioning': False,
+                'error': error,
+            })
+        if error:
+            self.get_logger().error(f'地图切换失败：{error}')
+        else:
+            self._clear_costmaps()
+            self.get_logger().info('地图切换完成，已清除导航代价地图')
 
     @staticmethod
     def _boolean_parameter(name, value):

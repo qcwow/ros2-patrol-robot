@@ -41,14 +41,18 @@ test("server-renders the patrol robot control console", async () => {
   assert.match(html, /人工控制/);
   assert.match(html, /前进/);
   assert.match(html, /后退/);
+  assert.match(html, /地图管理/);
 });
 
 test("includes live ROS controls and both map implementations", async () => {
-  const [page, map2d, map3d, bridge, nav2] = await Promise.all([
+  const [page, map2d, map3d, mapManagement, mapTypes, bridge, simulator, nav2] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/Industrial2DMap.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/Industrial3DMap.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/MapManagement.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/mapTypes.ts", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_web_bridge/patrol_robot_web_bridge/bridge_node.py", import.meta.url), "utf8"),
+    readFile(new URL("../../patrol_robot_simulator/patrol_robot_simulator/simulator_node.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_navigation/config/nav2_params.yaml", import.meta.url), "utf8"),
   ]);
 
@@ -59,6 +63,7 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(page, /\/api\/camera\/stream/);
   assert.match(page, /\/api\/camera\/gimbal/);
   assert.match(page, /\/api\/perception\/mode/);
+  assert.match(page, /\/api\/maps\/activate/);
   assert.match(page, /开启摄像头/);
   assert.match(page, /回到正前方/);
   assert.match(page, /<Industrial2DMap/);
@@ -66,15 +71,28 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(map2d, /industrial-2d-map/);
   assert.match(map2d, /巡检工程平面图/);
   assert.match(map3d, /industrial-3d-map/);
+  assert.match(map3d, /onMoveEntity/);
+  assert.match(mapManagement, /导入地图/);
+  assert.match(mapManagement, /随机地图种子/);
+  assert.match(mapManagement, /障碍物/);
+  assert.match(mapManagement, /设备/);
+  assert.match(mapManagement, /巡检点/);
+  assert.match(mapTypes, /generatePatrolMap/);
+  assert.match(mapTypes, /parsePgm/);
   assert.match(bridge, /\/api\/control\/manual/);
   assert.match(bridge, /\/api\/camera\/enable/);
   assert.match(bridge, /\/api\/camera\/stream/);
   assert.match(bridge, /\/api\/camera\/gimbal/);
   assert.match(bridge, /\/api\/perception\/mode/);
+  assert.match(bridge, /\/api\/maps\/activate/);
+  assert.match(bridge, /LoadMap/);
+  assert.match(bridge, /\/patrol\/map_scenario/);
   assert.match(bridge, /lidar_obstacle_layer\.enabled/);
   assert.match(bridge, /camera_voxel_layer\.enabled/);
   assert.match(bridge, /camera_stream_fps', 12\.0/);
   assert.match(bridge, /manual_command_timeout/);
+  assert.match(simulator, /OccupancyMap\.from_scenario/);
+  assert.match(simulator, /\/patrol\/map_scenario/);
   assert.match(nav2, /plugins: \[lidar_obstacle_layer, camera_voxel_layer, inflation_layer\]/);
   assert.match(nav2, /plugin: nav2_costmap_2d::VoxelLayer/);
   assert.match(nav2, /topic: \/camera\/points\/filtered/);
