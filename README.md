@@ -2,12 +2,14 @@
 
 这是一个面向 **Ubuntu 24.04 + ROS 2 Jazzy + Nav2** 的差速巡检机器人项目。源代码保存在 Mac，所有 ROS 2 编译、仿真和导航运行都在 Ubuntu 虚拟机中完成。默认使用不依赖 OpenGL 的轻量二维仿真器；同时提供 Gazebo Harmonic 3D 巡检模式，用于展示机器人模型、管廊设备、激光感知和未知障碍物绕行。
 
-当前版本只实现自动巡航，不包含漏液、漏气等业务检测。
+当前版本实现自动巡航和第一阶段 RGB-D 相机处理，不包含漏液、漏气等业务检测。
 
 ## 已包含的功能
 
 - 两轮差速巡检机器人 Xacro 模型
 - 2D 激光雷达、IMU、里程计和 TF 仿真
+- 前向 RGB-D 相机仿真、彩色/深度帧同步和校准投影
+- 深度范围过滤、像素抽样、体素降采样和 XYZRGB 点云发布
 - 无 OpenGL依赖的二维运动与激光仿真
 - 简化管廊 Gazebo 场景
 - Gazebo 3D 自动循环巡检与激光雷达避障
@@ -22,6 +24,7 @@
 ```text
 src/
 ├── patrol_robot_description/   # 机器人尺寸、URDF/Xacro、传感器
+├── patrol_robot_camera/        # RGB-D 同步、深度处理和彩色点云
 ├── patrol_robot_gazebo/        # Gazebo 场景和 ROS/Gazebo 话题桥接
 ├── patrol_robot_simulator/     # 默认二维轻量仿真器，不依赖虚拟显卡
 ├── patrol_robot_navigation/    # 地图、SLAM、AMCL 和 Nav2 参数
@@ -174,6 +177,7 @@ http://控制台地址/?robot=http://192.168.1.50:8765
 
 - 调用 `/patrol_manager/start`、`stop` 和 `reset`。
 - 实时读取 `/odom`、`/scan` 与巡检任务状态。
+- 在“设备监控”或主视图“摄像画面”中开启、关闭实时画面，并控制两轴云台。
 - 运行中替换巡检路线，无需重新编译或重启巡检管理器。
 - 动态修改 Nav2 控制器和速度平滑器的最大速度。
 - 发送急停命令，并通过 0.5 秒看门狗自动清除失联的手动速度。
@@ -193,6 +197,24 @@ sudo ufw allow from 192.168.1.0/24 to any port 8765 proto tcp
 
 网页的“硬件配置”会把配置提交给网关，但车体尺寸、雷达驱动和 TF 必须在
 车辆停止后由工程师更新并重启相关节点；它们不会像速度参数一样即时生效。
+
+网页摄像头默认关闭。点击“开启摄像头”后，Web 网关订阅
+`/camera/color/image_raw`，以默认 12 FPS、640 像素宽的低延迟 JPEG 视频流
+发送给浏览器。编码在独立线程中进行，队列只保留最新一帧，避免视频积压
+拖慢导航；关闭后会释放网页视频订阅。摄像头画面与车辆控制共用 `8765`
+端口，无需额外开放端口。
+
+画面内的云台控制支持水平 `-90°~90°`、向上 `25°`、向下 `35°`，可滑动、
+按键微调或一键回中。Web 网关发布以下弧度制位置命令：
+
+```text
+/camera/gimbal/pan/command       水平旋转目标
+/camera/gimbal/tilt/command      俯仰旋转目标
+```
+
+Gazebo 通过关节位置控制器驱动这两个话题；真机只需让舵机驱动订阅同名话题，
+或在启动文件中重映射到实际驱动接口。网页开关只控制实时画面，不会停止后台
+RGB-D 点云处理，也不会自动把相机接入 Nav2。
 
 ## 6.1 运行 3D 自动巡检与避障
 
@@ -215,9 +237,45 @@ cd ~/robot_patrol_ws
 激光雷达感知 → AMCL 定位 → Nav2 路径规划/局部避障 → 多点循环巡检
 ```
 
+RGB-D 相机会同时发布：
+
+```text
+/camera/color/image_raw          彩色图
+/camera/depth/image_rect_raw     已对齐深度图
+/camera/depth/camera_info        深度相机内参
+/camera/points/filtered          经过滤的 XYZRGB 点云
+/camera/gimbal/pan/command       云台水平目标（弧度）
+/camera/gimbal/tilt/command      云台俯仰目标（弧度）
+```
+
+可以在 RViz 中添加 `PointCloud2` 显示，话题选择
+`/camera/points/filtered`，Fixed Frame 保持 `map` 或 `odom`。当前阶段已经完成
+相机数据同步、深度解析、三维反投影与点云过滤；体素地图累积和将相机障碍接入
+Nav2 属于下一阶段。
+
 机器人运行时通过 `/scan` 感知周围设备，Nav2 障碍层将障碍加入代价
 地图并规划安全路径；若局部路径无法通行，行为树会触发等待、后退/旋转
 和重新规划。
+
+## 6.2 接入真实 RGB-D 相机
+
+处理器只依赖 ROS 2 标准消息，因此不绑定具体品牌。相机驱动应提供已经完成
+深度到彩色对齐的图像，并保证三路消息时间戳接近。启动示例：
+
+```bash
+source install/setup.bash
+ros2 launch patrol_robot_camera camera_processing.launch.py \
+  use_sim_time:=false \
+  color_topic:=/你的相机/color/image_raw \
+  depth_topic:=/你的相机/aligned_depth_to_color/image_raw \
+  camera_info_topic:=/你的相机/aligned_depth_to_color/camera_info
+```
+
+如果只接深度相机，可在
+`src/patrol_robot_camera/config/rgbd_processor.yaml` 中把 `use_color` 改为
+`false`。16 位深度图默认按毫米换算为米；若设备单位不同，需要同步修改
+`depth_scale`。安装相机后必须标定 `base_link` 到相机光学坐标系的外参，否则
+后续体素地图会出现重影或障碍位置偏移。
 
 虚拟机需要启用 3D 图形加速。若 Gazebo 无法打开或帧率过低，继续使用
 `./vm/run_navigation_gui.sh` 可验证相同的导航和避障算法，但显示为 RViz

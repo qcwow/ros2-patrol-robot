@@ -1,13 +1,22 @@
 "use client";
 
+/* eslint-disable @next/next/no-img-element -- MJPEG streams require a native img element. */
+
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Industrial3DMap } from "./Industrial3DMap";
 import { Industrial2DMap } from "./Industrial2DMap";
 
 type Waypoint = { id: number; name: string; x: number; y: number; dwell: number };
+type CameraStatus = {
+  enabled: boolean; ok: boolean; frames: number; width: number; height: number;
+  last_frame_age: number | null; topic: string; error?: string | null; fps: number;
+  stream_fps: number; pan_deg: number; tilt_deg: number; pan_target_deg: number;
+  tilt_target_deg: number; gimbal_ok: boolean;
+};
 type Telemetry = {
   speed: number; x: number; y: number; yaw: number; lidar_ok: boolean;
   patrol: { state: string; current_index: number; current_waypoint: string; waypoint_count: number };
+  camera: CameraStatus;
 };
 
 const initialWaypoints: Waypoint[] = [
@@ -17,6 +26,8 @@ const initialWaypoints: Waypoint[] = [
   { id: 4, name: "B区管道东侧", x: 4.6, y: -1.0, dwell: 3 },
   { id: 5, name: "返回区", x: -5.8, y: -4.0, dwell: 2 },
 ];
+
+const CAMERA_LIMITS = { pan: 90, tiltUp: 25, tiltDown: 35 };
 
 export default function Home() {
   const [speed, setSpeed] = useState(0.6);
@@ -32,6 +43,11 @@ export default function Home() {
   const [telemetry, setTelemetry] = useState<Telemetry>({
     speed: 0, x: -6, y: -4, yaw: 0, lidar_ok: false,
     patrol: { state: "UNKNOWN", current_index: 0, current_waypoint: "等待连接", waypoint_count: 0 },
+    camera: {
+      enabled: false, ok: false, frames: 0, width: 0, height: 0, fps: 0,
+      stream_fps: 12, last_frame_age: null, topic: "/camera/color/image_raw",
+      pan_deg: 0, tilt_deg: 0, pan_target_deg: 0, tilt_target_deg: 0, gimbal_ok: false,
+    },
   });
   const [apiBase] = useState(() => {
     if (typeof window === "undefined") return "";
@@ -44,9 +60,19 @@ export default function Home() {
   });
   const [now, setNow] = useState<Date | null>(null);
   const [mapZoom, setMapZoom] = useState(1);
-  const [mapMode, setMapMode] = useState<"2d" | "3d">("2d");
+  const [mapMode, setMapMode] = useState<"2d" | "3d" | "camera">("2d");
   const [manualActive, setManualActive] = useState("未接管");
+  const [cameraEnabled, setCameraEnabled] = useState(false);
+  const [cameraReady, setCameraReady] = useState(false);
+  const [cameraError, setCameraError] = useState("");
+  const [cameraBusy, setCameraBusy] = useState(false);
+  const [cameraStreamVersion, setCameraStreamVersion] = useState(0);
+  const [gimbalPan, setGimbalPan] = useState(0);
+  const [gimbalTilt, setGimbalTilt] = useState(0);
   const manualTimer = useRef<number | null>(null);
+  const gimbalTimer = useRef<number | null>(null);
+  const gimbalTarget = useRef({ pan: 0, tilt: 0 });
+  const gimbalAdjusting = useRef(false);
 
   const clearManualTimer = useCallback(() => {
     if (manualTimer.current !== null) {
@@ -62,7 +88,10 @@ export default function Home() {
     return () => window.clearInterval(timer);
   }, []);
 
-  useEffect(() => () => clearManualTimer(), [clearManualTimer]);
+  useEffect(() => () => {
+    clearManualTimer();
+    if (gimbalTimer.current !== null) window.clearTimeout(gimbalTimer.current);
+  }, [clearManualTimer]);
 
   useEffect(() => {
     if (!apiBase) return;
@@ -74,10 +103,24 @@ export default function Home() {
         const status = await response.json();
         if (!active) return;
         setConnected(true);
+        const camera = status.camera ?? {
+          enabled: false, ok: false, frames: 0, width: 0, height: 0, fps: 0,
+          stream_fps: 12, last_frame_age: null, topic: "/camera/color/image_raw",
+          pan_deg: 0, tilt_deg: 0, pan_target_deg: 0, tilt_target_deg: 0, gimbal_ok: false,
+        };
+        setCameraEnabled(Boolean(camera.enabled));
+        if (!gimbalAdjusting.current) {
+          const panTarget = Number(camera.pan_target_deg ?? camera.pan_deg ?? 0);
+          const tiltTarget = Number(camera.tilt_target_deg ?? camera.tilt_deg ?? 0);
+          setGimbalPan(panTarget);
+          setGimbalTilt(tiltTarget);
+          gimbalTarget.current = { pan: panTarget, tilt: tiltTarget };
+        }
         setTelemetry({
           speed: status.speed ?? 0, x: status.x ?? 0, y: status.y ?? 0, yaw: status.yaw ?? 0,
           lidar_ok: Boolean(status.lidar_ok),
           patrol: status.patrol ?? { state: "UNKNOWN", current_index: 0, current_waypoint: "等待任务", waypoint_count: 0 },
+          camera,
         });
         setRunning(Boolean(status.patrol?.running));
       } catch {
@@ -172,6 +215,64 @@ export default function Home() {
     saveWaypoints(next);
   }
 
+  async function toggleCamera() {
+    if (cameraBusy) return;
+    const next = !cameraEnabled;
+    setCameraBusy(true);
+    if (await send("/api/camera/enable", { enabled: next })) {
+      setCameraEnabled(next);
+      setCameraReady(false);
+      setCameraError("");
+      setCameraStreamVersion((version) => version + 1);
+      if (next) setMapMode("camera");
+      notify(next ? "云台摄像头正在开启" : "摄像头画面已关闭");
+    }
+    setCameraBusy(false);
+  }
+
+  function retryCameraStream() {
+    setCameraReady(false);
+    setCameraError("");
+    setCameraStreamVersion((version) => version + 1);
+  }
+
+  function commandGimbal(panValue: number, tiltValue: number, immediate = false) {
+    const pan = Math.max(-CAMERA_LIMITS.pan, Math.min(panValue, CAMERA_LIMITS.pan));
+    const tilt = Math.max(-CAMERA_LIMITS.tiltDown, Math.min(tiltValue, CAMERA_LIMITS.tiltUp));
+    setGimbalPan(pan);
+    setGimbalTilt(tilt);
+    gimbalTarget.current = { pan, tilt };
+
+    const transmit = () => {
+      const target = gimbalTarget.current;
+      void send("/api/camera/gimbal", target);
+    };
+    if (immediate) {
+      if (gimbalTimer.current !== null) window.clearTimeout(gimbalTimer.current);
+      gimbalTimer.current = null;
+      transmit();
+    } else if (gimbalTimer.current === null) {
+      gimbalTimer.current = window.setTimeout(() => {
+        gimbalTimer.current = null;
+        transmit();
+      }, 80);
+    }
+  }
+
+  function finishGimbalAdjustment() {
+    gimbalAdjusting.current = false;
+    commandGimbal(gimbalTarget.current.pan, gimbalTarget.current.tilt, true);
+  }
+
+  function nudgeGimbal(panDelta: number, tiltDelta: number) {
+    commandGimbal(gimbalPan + panDelta, gimbalTilt + tiltDelta, true);
+  }
+
+  const cameraStreamUrl = `${apiBase}/api/camera/stream?v=${cameraStreamVersion}`;
+  // Some browsers keep an MJPEG request open without firing a normal image
+  // load event. The gateway heartbeat is a second confirmation that frames exist.
+  const cameraShowing = cameraReady || (telemetry.camera.ok && !cameraError);
+
   return (
     <main className="app-shell">
       <aside className="sidebar">
@@ -181,10 +282,10 @@ export default function Home() {
         </div>
 
         <nav aria-label="主导航">
-          <button className="nav-item active"><i>⌁</i> 车辆控制</button>
+          <button className={`nav-item ${mapMode !== "camera" ? "active" : ""}`} onClick={() => setMapMode("2d")}><i>⌁</i> 车辆控制</button>
           <button className="nav-item"><i>⌖</i> 巡检任务 <b>{waypoints.length}</b></button>
           <button className="nav-item"><i>◫</i> 地图管理</button>
-          <button className="nav-item"><i>◉</i> 设备监控</button>
+          <button className={`nav-item ${mapMode === "camera" ? "active" : ""}`} onClick={() => setMapMode("camera")}><i>◉</i> 设备监控</button>
           <button className="nav-item"><i>⚙</i> 系统设置</button>
         </nav>
 
@@ -212,16 +313,100 @@ export default function Home() {
               <div className="map-mode-switch" role="group" aria-label="地图显示模式">
                 <button className={mapMode === "2d" ? "active" : ""} onClick={() => setMapMode("2d")}>2D 地图</button>
                 <button className={mapMode === "3d" ? "active" : ""} onClick={() => setMapMode("3d")}>3D 场景</button>
+                <button className={mapMode === "camera" ? "active" : ""} onClick={() => setMapMode("camera")}><i className={telemetry.camera.ok ? "camera-dot online" : "camera-dot"}></i>摄像画面</button>
               </div>
-              {mapMode === "3d" ? (
+              {mapMode === "camera" ? (
+                <div className="camera-view">
+                  {cameraEnabled ? (
+                    <>
+                      <img
+                        key={cameraStreamVersion}
+                        src={cameraStreamUrl}
+                        alt="巡检车两轴云台摄像头实时画面"
+                        onLoad={() => { setCameraReady(true); setCameraError(""); }}
+                        onError={() => { setCameraReady(false); setCameraError("暂时没有收到摄像头画面"); }}
+                      />
+                      {!cameraShowing && !cameraError && (
+                        <div className="camera-loading" role="status"><span></span><strong>正在连接云台摄像头</strong><small>等待 ROS 2 图像数据</small></div>
+                      )}
+                      {cameraError && (
+                        <div className="camera-loading camera-failed"><b>!</b><strong>{cameraError}</strong><small>请确认 3D 仿真与相机话题正在运行</small><button onClick={retryCameraStream}>重新连接</button></div>
+                      )}
+                      <div className="camera-hud">
+                        <span className={telemetry.camera.ok ? "live" : "waiting"}><i></i>{telemetry.camera.ok ? "LIVE" : "等待信号"}</span>
+                        <small>{telemetry.camera.width || 640} × {telemetry.camera.height || 480}　·　{telemetry.camera.fps?.toFixed(1) || "0.0"} FPS</small>
+                        <button onClick={toggleCamera} disabled={cameraBusy}>{cameraBusy ? "处理中" : "关闭摄像头"}</button>
+                      </div>
+                      <div className="gimbal-control" aria-label="云台控制器">
+                        <div className="gimbal-heading">
+                          <span><i className={telemetry.camera.gimbal_ok ? "online" : ""}></i>两轴云台</span>
+                          <strong>水平 {gimbalPan.toFixed(0)}°　俯仰 {gimbalTilt.toFixed(0)}°</strong>
+                        </div>
+                        <div className="gimbal-row">
+                          <button onClick={() => nudgeGimbal(-10, 0)} disabled={!connected} aria-label="摄像头向左转动">‹</button>
+                          <input
+                            aria-label="摄像头水平角度"
+                            type="range"
+                            min={-CAMERA_LIMITS.pan}
+                            max={CAMERA_LIMITS.pan}
+                            step="1"
+                            value={gimbalPan}
+                            onPointerDown={() => { gimbalAdjusting.current = true; }}
+                            onKeyDown={() => { gimbalAdjusting.current = true; }}
+                            onChange={(event) => commandGimbal(Number(event.target.value), gimbalTilt)}
+                            onPointerUp={finishGimbalAdjustment}
+                            onPointerCancel={finishGimbalAdjustment}
+                            onKeyUp={finishGimbalAdjustment}
+                            onBlur={finishGimbalAdjustment}
+                          />
+                          <button onClick={() => nudgeGimbal(10, 0)} disabled={!connected} aria-label="摄像头向右转动">›</button>
+                        </div>
+                        <div className="gimbal-row">
+                          <button onClick={() => nudgeGimbal(0, -5)} disabled={!connected} aria-label="摄像头向下转动">⌄</button>
+                          <input
+                            aria-label="摄像头俯仰角度"
+                            type="range"
+                            min={-CAMERA_LIMITS.tiltDown}
+                            max={CAMERA_LIMITS.tiltUp}
+                            step="1"
+                            value={gimbalTilt}
+                            onPointerDown={() => { gimbalAdjusting.current = true; }}
+                            onKeyDown={() => { gimbalAdjusting.current = true; }}
+                            onChange={(event) => commandGimbal(gimbalPan, Number(event.target.value))}
+                            onPointerUp={finishGimbalAdjustment}
+                            onPointerCancel={finishGimbalAdjustment}
+                            onKeyUp={finishGimbalAdjustment}
+                            onBlur={finishGimbalAdjustment}
+                          />
+                          <button onClick={() => nudgeGimbal(0, 5)} disabled={!connected} aria-label="摄像头向上转动">⌃</button>
+                        </div>
+                        <button className="gimbal-center" onClick={() => commandGimbal(0, 0, true)} disabled={!connected}>回到正前方</button>
+                      </div>
+                      <div className="camera-caption"><strong>CAM-01</strong><span>RGB-D 云台视角</span><em>已接收 {telemetry.camera.frames} 帧</em></div>
+                    </>
+                  ) : (
+                    <div className="camera-offline">
+                      <div className="camera-lens"><i></i></div>
+                      <span>CAM-01 · 两轴 RGB-D 云台摄像头</span>
+                      <h2>摄像头画面未开启</h2>
+                      <p>开启后可实时查看周围环境，并在画面内控制水平与俯仰方向；关闭网页画面可减少视频编码和网络占用。</p>
+                      <button onClick={toggleCamera} disabled={!connected || cameraBusy}>{cameraBusy ? "正在开启…" : "开启摄像头"}</button>
+                    </div>
+                  )}
+                </div>
+              ) : mapMode === "3d" ? (
                 <Industrial3DMap robotX={telemetry.x} robotY={telemetry.y} robotYaw={telemetry.yaw} zoom={mapZoom} waypoints={waypoints} selected={selected} />
               ) : <Industrial2DMap robotX={telemetry.x} robotY={telemetry.y} robotYaw={telemetry.yaw} zoom={mapZoom} waypoints={waypoints} selected={selected} onSelect={setSelected} />}
-              <div className="map-tools">
-                <button onClick={() => changeMapZoom(0.25)} disabled={mapZoom >= 2} aria-label="放大地图" title="放大地图">＋</button>
-                <button onClick={() => changeMapZoom(-0.25)} disabled={mapZoom <= 0.75} aria-label="缩小地图" title="缩小地图">−</button>
-                <button onClick={() => setMapZoom(1)} aria-label="恢复默认缩放" title="恢复默认缩放">⌖</button>
-              </div>
-              <div className="map-scale"><strong>{Math.round(mapZoom * 100)}%</strong><span>{(10 / mapZoom).toFixed(mapZoom === 1 ? 0 : 1)} m</span></div>
+              {mapMode !== "camera" && (
+                <>
+                  <div className="map-tools">
+                    <button onClick={() => changeMapZoom(0.25)} disabled={mapZoom >= 2} aria-label="放大地图" title="放大地图">＋</button>
+                    <button onClick={() => changeMapZoom(-0.25)} disabled={mapZoom <= 0.75} aria-label="缩小地图" title="缩小地图">−</button>
+                    <button onClick={() => setMapZoom(1)} aria-label="恢复默认缩放" title="恢复默认缩放">⌖</button>
+                  </div>
+                  <div className="map-scale"><strong>{Math.round(mapZoom * 100)}%</strong><span>{(10 / mapZoom).toFixed(mapZoom === 1 ? 0 : 1)} m</span></div>
+                </>
+              )}
             </div>
 
             <aside className="telemetry">

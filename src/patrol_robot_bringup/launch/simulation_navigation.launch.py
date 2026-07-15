@@ -30,6 +30,18 @@ def generate_launch_description():
         }.items(),
     )
 
+    camera_processing = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution([
+                FindPackageShare('patrol_robot_camera'),
+                'launch',
+                'camera_processing.launch.py',
+            ])
+        ),
+        condition=IfCondition(use_gazebo),
+        launch_arguments={'use_sim_time': use_sim_time}.items(),
+    )
+
     lightweight_simulation = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             PathJoinSubstitution([
@@ -122,6 +134,7 @@ def generate_launch_description():
         DeclareLaunchArgument('use_gazebo', default_value='false'),
         DeclareLaunchArgument('waypoints', default_value=default_waypoints),
         gazebo_simulation,
+        camera_processing,
         lightweight_simulation,
         navigation,
         patrol_manager,

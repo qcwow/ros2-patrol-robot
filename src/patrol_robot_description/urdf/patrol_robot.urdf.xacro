@@ -173,6 +173,63 @@
     <origin xyz="0 0 0.12" rpy="0 0 0"/>
   </joint>
 
+  <!--
+    两轴 RGB-D 云台：水平关节绕 Z 轴旋转，俯仰关节绕 Y 轴旋转。
+    真机可保留相同关节和控制话题，仅替换外参及舵机驱动。
+  -->
+  <link name="camera_pan_link">
+    <visual>
+      <geometry><cylinder radius="0.035" length="0.035"/></geometry>
+      <material name="sensor_gray"/>
+    </visual>
+    <collision>
+      <geometry><cylinder radius="0.035" length="0.035"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="0.08"/>
+      <inertia ixx="0.00004" ixy="0" ixz="0" iyy="0.00004" iyz="0" izz="0.00005"/>
+    </inertial>
+  </link>
+  <joint name="camera_pan_joint" type="revolute">
+    <parent link="base_link"/>
+    <child link="camera_pan_link"/>
+    <origin xyz="0.22 0 0.255" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="${-pi / 2.0}" upper="${pi / 2.0}" effort="2.0" velocity="1.2"/>
+    <dynamics damping="0.12" friction="0.03"/>
+  </joint>
+
+  <link name="camera_link">
+    <visual>
+      <geometry><box size="0.07 0.13 0.05"/></geometry>
+      <material name="sensor_gray"/>
+    </visual>
+    <collision>
+      <geometry><box size="0.07 0.13 0.05"/></geometry>
+    </collision>
+    <inertial>
+      <mass value="0.12"/>
+      <inertia ixx="0.00019" ixy="0" ixz="0" iyy="0.00007" iyz="0" izz="0.00022"/>
+    </inertial>
+  </link>
+  <joint name="camera_tilt_joint" type="revolute">
+    <parent link="camera_pan_link"/>
+    <child link="camera_link"/>
+    <origin xyz="0.02 0 0.035" rpy="0 0 0"/>
+    <axis xyz="0 1 0"/>
+    <!-- 物理关节正方向为向下；网页接口会转换为“向上为正”。 -->
+    <limit lower="-0.436332" upper="0.610865" effort="2.0" velocity="1.0"/>
+    <dynamics damping="0.10" friction="0.03"/>
+  </joint>
+
+  <!-- ROS REP-103 光学坐标系：+Z 向前、+X 向右、+Y 向下。 -->
+  <link name="camera_depth_optical_frame"/>
+  <joint name="camera_depth_optical_joint" type="fixed">
+    <parent link="camera_link"/>
+    <child link="camera_depth_optical_frame"/>
+    <origin xyz="0.036 0 0" rpy="${-pi / 2.0} 0 ${-pi / 2.0}"/>
+  </joint>
+
   <gazebo reference="base_link">
     <material>Gazebo/Blue</material>
   </gazebo>
@@ -213,6 +270,35 @@
       <always_on>true</always_on>
     </sensor>
   </gazebo>
+  <gazebo reference="camera_pan_link">
+    <material>Gazebo/DarkGrey</material>
+  </gazebo>
+  <gazebo reference="camera_link">
+    <sensor name="rgbd_camera" type="rgbd_camera">
+      <topic>/camera</topic>
+      <gz_frame_id>camera_depth_optical_frame</gz_frame_id>
+      <update_rate>15</update_rate>
+      <always_on>true</always_on>
+      <visualize>false</visualize>
+      <camera>
+        <horizontal_fov>1.04719755</horizontal_fov>
+        <image>
+          <width>640</width>
+          <height>480</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip>
+          <near>0.20</near>
+          <far>8.0</far>
+        </clip>
+        <noise>
+          <type>gaussian</type>
+          <mean>0.0</mean>
+          <stddev>0.002</stddev>
+        </noise>
+      </camera>
+    </sensor>
+  </gazebo>
 
   <gazebo>
     <plugin filename="gz-sim-diff-drive-system" name="gz::sim::systems::DiffDrive">
@@ -248,6 +334,22 @@
       <topic>/joint_states</topic>
       <joint_name>left_wheel_joint</joint_name>
       <joint_name>right_wheel_joint</joint_name>
+      <joint_name>camera_pan_joint</joint_name>
+      <joint_name>camera_tilt_joint</joint_name>
+    </plugin>
+    <plugin filename="gz-sim-joint-position-controller-system" name="gz::sim::systems::JointPositionController">
+      <joint_name>camera_pan_joint</joint_name>
+      <topic>/camera/gimbal/pan/command</topic>
+      <initial_position>0.0</initial_position>
+      <use_velocity_commands>true</use_velocity_commands>
+      <cmd_max>1.2</cmd_max>
+    </plugin>
+    <plugin filename="gz-sim-joint-position-controller-system" name="gz::sim::systems::JointPositionController">
+      <joint_name>camera_tilt_joint</joint_name>
+      <topic>/camera/gimbal/tilt/command</topic>
+      <initial_position>0.0</initial_position>
+      <use_velocity_commands>true</use_velocity_commands>
+      <cmd_max>1.0</cmd_max>
     </plugin>
   </gazebo>
 </robot>

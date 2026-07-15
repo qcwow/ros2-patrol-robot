@@ -40,3 +40,38 @@
   gz_type_name: gz.msgs.Model
   direction: GZ_TO_ROS
 
+- ros_topic_name: /camera/color/image_raw
+  gz_topic_name: /camera/image
+  ros_type_name: sensor_msgs/msg/Image
+  gz_type_name: gz.msgs.Image
+  direction: GZ_TO_ROS
+  qos_profile: SENSOR_DATA
+  frame_id: camera_depth_optical_frame
+
+- ros_topic_name: /camera/depth/image_rect_raw
+  gz_topic_name: /camera/depth_image
+  ros_type_name: sensor_msgs/msg/Image
+  gz_type_name: gz.msgs.Image
+  direction: GZ_TO_ROS
+  qos_profile: SENSOR_DATA
+  frame_id: camera_depth_optical_frame
+
+- ros_topic_name: /camera/depth/camera_info
+  gz_topic_name: /camera/camera_info
+  ros_type_name: sensor_msgs/msg/CameraInfo
+  gz_type_name: gz.msgs.CameraInfo
+  direction: GZ_TO_ROS
+  qos_profile: SENSOR_DATA
+  frame_id: camera_depth_optical_frame
+
+- ros_topic_name: /camera/gimbal/pan/command
+  gz_topic_name: /camera/gimbal/pan/command
+  ros_type_name: std_msgs/msg/Float64
+  gz_type_name: gz.msgs.Double
+  direction: ROS_TO_GZ
+
+- ros_topic_name: /camera/gimbal/tilt/command
+  gz_topic_name: /camera/gimbal/tilt/command
+  ros_type_name: std_msgs/msg/Float64
+  gz_type_name: gz.msgs.Double
+  direction: ROS_TO_GZ

@@ -1,0 +1,21 @@
+rgbd_processor:
+  ros__parameters:
+    # 输入必须是已经对齐到深度相机坐标系的彩色图和深度图。
+    color_topic: /camera/color/image_raw
+    depth_topic: /camera/depth/image_rect_raw
+    camera_info_topic: /camera/depth/camera_info
+    point_cloud_topic: /camera/points/filtered
+    use_color: true
+
+    # 16UC1 深度图通常以毫米为单位；32FC1 按 ROS 约定已是米。
+    depth_scale: 0.001
+    min_depth: 0.25
+    max_depth: 8.0
+
+    # 先隔像素采样，再做体素降采样，控制车载计算量和网络带宽。
+    sampling_stride: 2
+    voxel_size: 0.04
+    max_points: 120000
+
+    sync_queue_size: 10
+    sync_slop_seconds: 0.08
