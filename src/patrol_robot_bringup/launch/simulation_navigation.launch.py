@@ -75,6 +75,21 @@ def generate_launch_description():
         }],
     )
 
+    web_bridge = Node(
+        package='patrol_robot_web_bridge',
+        executable='web_bridge',
+        name='patrol_robot_web_bridge',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'http_host': '0.0.0.0',
+            'http_port': 8765,
+            'max_linear_speed': 0.6,
+            'max_angular_speed': 0.8,
+            'manual_command_timeout': 0.5,
+        }],
+    )
+
     rviz = Node(
         package='rviz2',
         executable='rviz2',
@@ -110,5 +125,6 @@ def generate_launch_description():
         lightweight_simulation,
         navigation,
         patrol_manager,
+        web_bridge,
         rviz,
     ])

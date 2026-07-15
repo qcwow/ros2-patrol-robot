@@ -45,6 +45,7 @@ def generate_launch_description():
             'initial_yaw': 0.0,
             'scan_samples': 240,
             'scan_rate': 10.0,
+            'linear_speed_limit': 1.5,
         }],
     )
 

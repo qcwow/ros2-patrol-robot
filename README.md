@@ -26,6 +26,8 @@ src/
 ├── patrol_robot_simulator/     # 默认二维轻量仿真器，不依赖虚拟显卡
 ├── patrol_robot_navigation/    # 地图、SLAM、AMCL 和 Nav2 参数
 ├── patrol_robot_patrol/        # 多点巡航管理器和巡航点
+├── patrol_robot_web_bridge/    # 浏览器控制台到 ROS 2 的安全 HTTP 网关
+├── patrol_robot_web/           # 工厂巡检车辆控制台
 └── patrol_robot_bringup/       # 统一启动入口
 scripts/                        # Mac 端操作脚本
 vm/                             # 虚拟机初始化脚本
@@ -146,6 +148,51 @@ cd ~/robot_patrol_ws
 - `stop`：取消当前导航并暂停。
 - `start`：从当前巡航点继续。
 - `reset`：停止并回到第一个巡航点，随后需要执行 `start`。
+
+## 6.1 使用网页控制台
+
+导航启动文件会同时启动 Web 网关，默认监听 Ubuntu 的 `8765` 端口。先在
+Ubuntu 中确认网关正常：
+
+```bash
+curl http://127.0.0.1:8765/api/health
+```
+
+返回 `{"ok": true, ...}` 即表示网关已经运行。然后在 Ubuntu 查询 IP：
+
+```bash
+hostname -I
+```
+
+在控制电脑浏览器中打开网页，并通过 `robot` 参数指定小车地址：
+
+```text
+http://控制台地址/?robot=http://192.168.1.50:8765
+```
+
+该地址会保存在当前浏览器中，以后无需重复填写。控制台现在可以：
+
+- 调用 `/patrol_manager/start`、`stop` 和 `reset`。
+- 实时读取 `/odom`、`/scan` 与巡检任务状态。
+- 运行中替换巡检路线，无需重新编译或重启巡检管理器。
+- 动态修改 Nav2 控制器和速度平滑器的最大速度。
+- 发送急停命令，并通过 0.5 秒看门狗自动清除失联的手动速度。
+
+如果只启动真实底盘和 Nav2，没有使用本项目的统一启动文件，可单独启动网关：
+
+```bash
+source install/setup.bash
+ros2 run patrol_robot_web_bridge web_bridge
+```
+
+防火墙启用时，仅向工厂可信内网放行端口：
+
+```bash
+sudo ufw allow from 192.168.1.0/24 to any port 8765 proto tcp
+```
+
+网页的“硬件配置”会把配置提交给网关，但车体尺寸、雷达驱动和 TF 必须在
+车辆停止后由工程师更新并重启相关节点；它们不会像速度参数一样即时生效。
 
 ## 6.1 运行 3D 自动巡检与避障
 

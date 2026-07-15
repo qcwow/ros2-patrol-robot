@@ -15,10 +15,13 @@ rsync -az --delete --human-readable \
   --exclude 'build/' \
   --exclude 'install/' \
   --exclude 'log/' \
+  --exclude 'node_modules/' \
+  --exclude 'dist/' \
+  --exclude '.next/' \
+  --exclude '.wrangler/' \
   --exclude '__pycache__/' \
   -e "ssh -p ${VM_PORT}" \
   "${PROJECT_ROOT}/" \
   "${VM_TARGET}:${VM_WORKSPACE}/"
 
 echo "同步完成。"
-

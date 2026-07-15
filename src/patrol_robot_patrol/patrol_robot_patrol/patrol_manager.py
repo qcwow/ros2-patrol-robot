@@ -1,4 +1,5 @@
 import math
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -11,6 +12,7 @@ from nav2_msgs.action import NavigateToPose
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from std_srvs.srv import Trigger
+from std_msgs.msg import String
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,8 @@ class PatrolManager(Node):
         self.create_service(Trigger, '~/start', self._on_start)
         self.create_service(Trigger, '~/stop', self._on_stop)
         self.create_service(Trigger, '~/reset', self._on_reset)
+        self.create_subscription(String, '~/set_waypoints', self._on_set_waypoints, 10)
+        self._status_publisher = self.create_publisher(String, '~/status', 10)
 
         self._index = 0
         self._retry_count = 0
@@ -113,6 +117,7 @@ class PatrolManager(Node):
         self._last_feedback_log = 0.0
 
         self.create_timer(0.25, self._tick)
+        self.create_timer(0.5, self._publish_status)
         self.get_logger().info(
             f'已加载 {len(self._waypoints)} 个巡航点，坐标系={self._frame_id}，'
             f'自动启动={self._autostart}，循环={self._loop}'
@@ -120,6 +125,44 @@ class PatrolManager(Node):
 
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds / 1_000_000_000.0
+
+    def _on_set_waypoints(self, message: String) -> None:
+        """Replace the active route from a JSON message without restarting."""
+        try:
+            document = json.loads(message.data)
+            raw_waypoints = document.get('waypoints', [])
+            if not isinstance(raw_waypoints, list) or not raw_waypoints:
+                raise ValueError('waypoints 必须为非空数组')
+            waypoints = []
+            for index, item in enumerate(raw_waypoints):
+                waypoints.append(Waypoint(
+                    name=str(item.get('name', f'waypoint_{index + 1}')),
+                    x=float(item['x']),
+                    y=float(item['y']),
+                    yaw=float(item.get('yaw', 0.0)),
+                    dwell=max(0.0, float(item.get('dwell', self._default_dwell))),
+                ))
+            self._request_cancel('reset')
+            self._frame_id = str(document.get('frame_id', 'map'))
+            self._waypoints = waypoints
+            self._index = 0
+            self._retry_count = 0
+            self._state = 'PAUSED'
+            self.get_logger().info(f'网页已更新巡检路线，共 {len(waypoints)} 个点')
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+            self.get_logger().error(f'网页巡检点配置无效: {error}')
+
+    def _publish_status(self) -> None:
+        message = String()
+        current = self._waypoints[self._index] if self._waypoints else None
+        message.data = json.dumps({
+            'state': self._state,
+            'running': self._state not in ('PAUSED', 'COMPLETE'),
+            'current_index': self._index,
+            'current_waypoint': current.name if current else None,
+            'waypoint_count': len(self._waypoints),
+        }, ensure_ascii=False)
+        self._status_publisher.publish(message)
 
     def _tick(self) -> None:
         now = self._now()

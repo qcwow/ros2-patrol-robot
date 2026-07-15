@@ -12,6 +12,7 @@
   <exec_depend>patrol_robot_navigation</exec_depend>
   <exec_depend>patrol_robot_patrol</exec_depend>
   <exec_depend>patrol_robot_simulator</exec_depend>
+  <exec_depend>patrol_robot_web_bridge</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>slam_toolbox</exec_depend>
 
