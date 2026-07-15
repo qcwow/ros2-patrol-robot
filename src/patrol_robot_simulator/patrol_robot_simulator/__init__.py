@@ -1,0 +1,2 @@
+"""Lightweight patrol robot simulator."""
+

@@ -1,0 +1,30 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "ROS2: 同步到虚拟机",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/sync_to_vm.sh",
+      "problemMatcher": []
+    },
+    {
+      "label": "ROS2: 同步并编译",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/build_vm.sh",
+      "problemMatcher": [],
+      "group": {"kind": "build", "isDefault": true}
+    },
+    {
+      "label": "ROS2: 启动自动巡航",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/run_navigation_vm.sh",
+      "problemMatcher": []
+    },
+    {
+      "label": "ROS2: 启动建图",
+      "type": "shell",
+      "command": "${workspaceFolder}/scripts/run_mapping_vm.sh",
+      "problemMatcher": []
+    }
+  ]
+}
