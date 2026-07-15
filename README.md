@@ -1,23 +1,66 @@
-# ROS 2 管道巡检机器人：自动巡航仿真
+# ROS 2 化工管廊智能巡检机器人
 
-这是一个面向 **Ubuntu 24.04 + ROS 2 Jazzy + Nav2** 的差速巡检机器人项目。源代码保存在 Mac，所有 ROS 2 编译、仿真和导航运行都在 Ubuntu 虚拟机中完成。默认使用不依赖 OpenGL 的轻量二维仿真器；同时提供 Gazebo Harmonic 3D 巡检模式，用于展示机器人模型、管廊设备、激光感知和未知障碍物绕行。
+这是一个面向 **Ubuntu 24.04 + ROS 2 Jazzy + Nav2** 的差速巡检机器人项目。
+源代码保存在 Mac，ROS 2 编译、仿真和导航运行在 Ubuntu 虚拟机中完成。项目同时
+提供不依赖 OpenGL 的轻量二维仿真，以及包含 RGB-D 相机、两轴云台、激光雷达、
+未知障碍物和网页控制台的 Gazebo Harmonic 3D 巡检模式。
 
-当前版本实现自动巡航和第一阶段 RGB-D 相机处理，不包含漏液、漏气等业务检测。
+当前版本已经完成多点自动巡航、网页人工控制、实时摄像画面、RGB-D 点云处理，
+以及激光雷达、纯视觉点云和二者融合三种避障感知模式。当前“纯视觉”指不使用
+激光障碍层、只使用 RGB-D 深度点云进行避障；AMCL 定位仍依赖激光 `/scan`。
+漏液、漏气、仪表读数等业务识别，以及完全无激光的视觉定位仍属于后续阶段。
 
 ## 已包含的功能
 
 - 两轮差速巡检机器人 Xacro 模型
 - 2D 激光雷达、IMU、里程计和 TF 仿真
-- 前向 RGB-D 相机仿真、彩色/深度帧同步和校准投影
+- 可水平、俯仰转动的 RGB-D 云台相机仿真
+- RGB 与深度帧同步、相机内参解析和校准投影
 - 深度范围过滤、像素抽样、体素降采样和 XYZRGB 点云发布
-- 无 OpenGL依赖的二维运动与激光仿真
+- 无 OpenGL 依赖的二维运动与激光仿真
 - 简化管廊 Gazebo 场景
 - Gazebo 3D 自动循环巡检，以及雷达、RGB-D 视觉或二者融合避障
+- Nav2 独立激光 `ObstacleLayer` 与 RGB-D `VoxelLayer`
+- 感知模式切换时自动停车、更新本地/全局代价地图并清除旧障碍
+- 雷达和深度点云健康监控，所选感知源失效时自动停车
 - SLAM Toolbox 建图入口
 - 预制地图、AMCL 定位和 Nav2 导航
 - 基于 YAML 的多点巡航
 - 到点停留、循环巡航、导航超时、自动重试和失败跳过
+- Web 控制台中的 2D 工程图、3D 场景、实时状态和路线配置
+- 浏览器人工前进、后退、转向、急停和速度限制
+- 默认 12 FPS、640 像素宽、只保留最新帧的低延迟 JPEG 视频流
+- 网页控制云台水平 `-90°～90°`、向上 `25°`、向下 `35°`
+- 雷达、视觉、融合三模式切换和传感器状态显示
 - Mac 到虚拟机的一键同步、安装、编译和运行脚本
+
+## 当前系统链路
+
+```text
+激光雷达 /scan ───────────────→ Nav2 激光障碍层 ─┐
+                                                   ├→ 本地/全局代价地图 → 路径规划与避障
+RGB-D 彩色图 + 深度图 → 点云过滤 → 相机体素层 ───┘
+
+里程计 + /scan → AMCL 定位 → map/odom/base_footprint TF
+
+浏览器控制台 ←HTTP 8765→ ROS 2 Web 网关
+    ├→ 巡检启停、急停、人工驾驶和速度限制
+    ├→ 摄像视频流和两轴云台控制
+    └→ 雷达 / 视觉 / 融合感知模式切换
+```
+
+### 已完成与后续阶段
+
+| 范围 | 当前状态 |
+| --- | --- |
+| RGB-D 数据处理 | 已完成同步、深度解析、三维反投影、过滤和 XYZRGB 点云发布 |
+| 视觉避障 | 已完成 RGB-D 点云接入 Nav2 `VoxelLayer` |
+| 感知切换 | 已完成雷达、视觉、融合三种模式和失效停车保护 |
+| 摄像监控 | 已完成网页低延迟画面、开关和两轴云台控制 |
+| 视觉定位 | 未完成；当前 AMCL 仍使用激光 `/scan` |
+| 长期 3D 地图 | 未完成；当前体素层用于实时导航避障，不是持久化三维重建 |
+| Depth Anything | 当前未使用；现阶段优先使用真实 RGB-D 深度，降低车载推理算力需求 |
+| 化工业务识别 | 漏液、漏气、烟雾、仪表读数和设备异常识别待后续实现 |
 
 ## 项目结构
 
@@ -44,8 +87,9 @@ vm/                             # 虚拟机初始化脚本
 - Intel Mac：Ubuntu 24.04 x86-64
 - CPU：6～8 核
 - 内存：8～12 GB
-- 硬盘：60 GB以上
-- 3D 图形加速不是必需项；只有启用可选 Gazebo模式时才需要
+- 硬盘：60 GB 以上
+- 前端开发：Node.js `22.13.0` 或更高版本
+- 3D 图形加速不是必需项；只有启用可选 Gazebo 模式时才需要
 
 Ubuntu 中安装并启动 SSH：
 
@@ -96,7 +140,9 @@ ssh-copy-id 用户名@虚拟机IP
 ./scripts/setup_vm.sh
 ```
 
-该脚本会在 Ubuntu 24.04 中安装 ROS 2 Jazzy、Nav2、Gazebo、SLAM Toolbox、键盘控制工具和编译依赖。默认巡航不依赖 Gazebo或 OpenGL。运行时会要求输入 Ubuntu 的 `sudo` 密码。
+该脚本会在 Ubuntu 24.04 中安装 ROS 2 Jazzy、Nav2、Gazebo、SLAM Toolbox、
+键盘控制工具和编译依赖。默认巡航不依赖 Gazebo 或 OpenGL。运行时会要求输入
+Ubuntu 的 `sudo` 密码。
 
 ## 4. 同步并编译
 
@@ -111,9 +157,9 @@ ssh-copy-id 用户名@虚拟机IP
 3. `build/`、`install/`、`log/` 只保存在虚拟机内部。
 4. 虚拟机执行依赖安装和 `colcon build --symlink-install`。
 
-以后每次修改 C++、Python包结构、Xacro或构建文件后，重新执行此命令。
+以后每次修改 C++、Python 包结构、Xacro 或构建文件后，重新执行此命令。
 
-## 5. 直接运行自动巡航
+## 5. 运行轻量 2D 自动巡航
 
 从 Mac 运行的是无界面模式，适合检查日志和后台巡航：
 
@@ -127,9 +173,10 @@ ssh-copy-id 用户名@虚拟机IP
 二维仿真器 → /scan + /odom + TF → AMCL → Nav2 → 巡航管理器
 ```
 
-机器人生成在 `(-6, -4)`，AMCL 使用相同的初始位置。系统等待约10秒后开始自动巡航。
+机器人生成在 `(-6, -4)`，AMCL 使用相同的初始位置。系统等待约 10 秒后开始自动巡航。
 
-SSH 会话没有虚拟机桌面的图形授权，因此这个命令不会打开图形窗口。如需 RViz导航界面，请在 **Ubuntu 虚拟机桌面** 中打开终端，执行：
+SSH 会话没有虚拟机桌面的图形授权，因此这个命令不会打开图形窗口。如需 RViz
+导航界面，请在 **Ubuntu 虚拟机桌面** 中打开终端，执行：
 
 ```bash
 cd ~/robot_patrol_ws
@@ -138,7 +185,10 @@ cd ~/robot_patrol_ws
 
 该脚本只打开 RViz，底盘、里程计和激光雷达由轻量二维仿真器生成，因此适合没有 OpenGL 3.3支持的 ARM VMware环境。
 
-## 6. 控制巡航
+轻量二维模式不会生成 RGB-D 图像和深度点云，因此适合验证巡检、地图、AMCL、
+Nav2 和激光避障。如果要测试摄像画面、云台或视觉模式，请使用第 7 节的 3D 入口。
+
+## 6. 控制巡航与网页前端
 
 从 Mac 执行：
 
@@ -152,7 +202,7 @@ cd ~/robot_patrol_ws
 - `start`：从当前巡航点继续。
 - `reset`：停止并回到第一个巡航点，随后需要执行 `start`。
 
-## 6.1 使用网页控制台
+### 6.1 使用网页控制台
 
 导航启动文件会同时启动 Web 网关，默认监听 Ubuntu 的 `8765` 端口。先在
 Ubuntu 中确认网关正常：
@@ -167,10 +217,31 @@ curl http://127.0.0.1:8765/api/health
 hostname -I
 ```
 
-在控制电脑浏览器中打开网页，并通过 `robot` 参数指定小车地址：
+首次使用前，在 Ubuntu 中安装前端依赖：
+
+```bash
+cd ~/robot_patrol_ws/src/patrol_robot_web
+npm install
+```
+
+日常启动前端：
+
+```bash
+source ~/.bashrc
+cd ~/robot_patrol_ws/src/patrol_robot_web
+npm run dev
+```
+
+保持这个终端运行。在控制电脑浏览器中打开网页，并通过 `robot` 参数指定小车地址：
 
 ```text
-http://控制台地址/?robot=http://192.168.1.50:8765
+http://虚拟机IP:3000/?robot=http://虚拟机IP:8765
+```
+
+例如虚拟机地址是 `172.16.194.128`：
+
+```text
+http://172.16.194.128:3000/?robot=http://172.16.194.128:8765
 ```
 
 该地址会保存在当前浏览器中，以后无需重复填写。控制台现在可以：
@@ -217,7 +288,7 @@ Gazebo 通过关节位置控制器驱动这两个话题；真机只需让舵机�
 或在启动文件中重映射到实际驱动接口。网页的画面开关只控制视频传输；后台
 RGB-D 点云处理和 Nav2 是否使用该点云，由下面的导航感知模式单独控制。
 
-## 6.1.1 切换雷达、视觉和融合避障
+### 6.2 切换雷达、视觉和融合避障
 
 控制台提供三种感知模式：
 
@@ -242,7 +313,7 @@ curl -X POST http://127.0.0.1:8765/api/perception/mode \
 > 真机完全关闭激光雷达后，还不能保证长时间自主巡检。下一阶段需要加入视觉里程计
 > 和 RGB-D/视觉定位，再将定位源也切换到纯视觉链路。
 
-## 6.1 运行 3D 自动巡检与避障
+## 7. 运行 3D 自动巡检、摄像监控与融合避障
 
 先在 Mac 项目目录同步并编译：
 
@@ -283,7 +354,10 @@ RGB-D 相机会同时发布：
 Nav2 障碍层将障碍加入代价地图并规划安全路径；若局部路径无法通行，行为树会
 触发等待、后退/旋转和重新规划。
 
-## 6.2 接入真实 RGB-D 相机
+3D 导航启动后，另开一个 Ubuntu 终端按照第 6.1 节执行 `npm run dev`，即可在
+前端查看摄像画面、控制云台，并切换雷达、视觉和融合模式。
+
+## 8. 接入真实 RGB-D 相机
 
 处理器只依赖 ROS 2 标准消息，因此不绑定具体品牌。相机驱动应提供已经完成
 深度到彩色对齐的图像，并保证三路消息时间戳接近。启动示例：
@@ -307,7 +381,7 @@ ros2 launch patrol_robot_camera camera_processing.launch.py \
 `./vm/run_navigation_gui.sh` 可验证相同的导航和避障算法，但显示为 RViz
 二维地图。
 
-## 7. 修改巡航点
+## 9. 修改巡航点
 
 编辑：
 
@@ -338,7 +412,7 @@ waypoints:
 ./scripts/run_navigation_vm.sh
 ```
 
-## 8. 自己建图
+## 10. 自己建图
 
 从 Mac 无界面启动建图：
 
@@ -346,7 +420,7 @@ waypoints:
 ./scripts/run_mapping_vm.sh
 ```
 
-或者在 Ubuntu虚拟机桌面终端中启动带 RViz窗口的建图：
+或者在 Ubuntu 虚拟机桌面终端中启动带 RViz 窗口的建图：
 
 ```bash
 cd ~/robot_patrol_ws
@@ -381,7 +455,7 @@ ros2 launch patrol_robot_bringup simulation_navigation.launch.py \
 
 `map` 参数会由统一启动文件传递给 Nav2，因此无需修改源代码即可切换地图。
 
-## 9. 后续适配真实机器人
+## 11. 后续适配真实机器人
 
 当前机器人尺寸集中在：
 
@@ -394,8 +468,10 @@ src/patrol_robot_description/urdf/patrol_robot.urdf.xacro
 - 车体长宽和轮径
 - 两轮中心距
 - 激光雷达安装位置
-- Gazebo差速插件替换为真实底盘驱动节点
-- `/odom`、`/scan`、`/cmd_vel` 保持相同接口
+- RGB-D 相机与云台安装位置、内参和外参
+- Gazebo 差速插件替换为真实底盘驱动节点
+- 舵机驱动订阅云台水平和俯仰控制话题
+- `/odom`、`/scan`、`/cmd_vel` 和相机话题保持相同接口或通过启动文件重映射
 
 只要上述 ROS 接口保持一致，Nav2、地图和巡航管理器可以继续使用。
 
@@ -413,6 +489,8 @@ src/patrol_robot_description/urdf/patrol_robot.urdf.xacro
 ros2 topic list
 ros2 topic echo /odom --once
 ros2 topic echo /scan --once
+ros2 topic hz /camera/color/image_raw
+ros2 topic hz /camera/points/filtered
 ros2 action list
 ros2 node list
 ros2 run tf2_ros tf2_echo odom base_footprint

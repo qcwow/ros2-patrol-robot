@@ -33,7 +33,7 @@ if ! ros2 pkg prefix ros_gz_sim >/dev/null 2>&1; then
 fi
 
 echo "启动 Gazebo 3D 场景、RGB-D 处理、Nav2、RViz 和自动循环巡检。"
-echo "相机彩色点云发布到 /camera/points/filtered；当前避障仍由激光雷达负责。"
+echo "相机彩色点云发布到 /camera/points/filtered；可在网页切换雷达、视觉或融合避障。"
 exec ros2 launch patrol_robot_bringup simulation_navigation.launch.py \
   patrol_autostart:=true loop:=true use_gazebo:=true \
   headless:=false start_rviz:=true
