@@ -29,6 +29,12 @@ export function Industrial3DMap({
   onSelectEntity, onPlace, onMoveEntity,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const dragStateRef = useRef<{
+    selection: string;
+    pointerId: number;
+    offsetX: number;
+    offsetY: number;
+  } | null>(null);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -37,7 +43,6 @@ export function Industrial3DMap({
     if (!context) return;
     let width = 0;
     let height = 0;
-    let dragSelection: string | null = null;
     const maxX = map.bounds.minX + map.bounds.width;
     const maxY = map.bounds.minY + map.bounds.height;
 
@@ -77,6 +82,15 @@ export function Industrial3DMap({
         if (screen.x >= left && screen.x <= right && screen.y >= top && screen.y <= bottom) return `object:${object.id}`;
       }
       return null;
+    };
+    const entityPosition = (selection: string) => {
+      const [kind, id] = selection.split(":");
+      if (kind === "object") {
+        const object = map.objects.find((item) => item.id === id);
+        return object ? { x: object.x, y: object.y } : null;
+      }
+      const waypoint = map.waypoints.find((item) => item.id === Number(id));
+      return waypoint ? { x: waypoint.x, y: waypoint.y } : null;
     };
 
     const drawOccupancy = () => {
@@ -263,29 +277,47 @@ export function Industrial3DMap({
         onPlace?.(tool, Number(boundedX.toFixed(2)), Number(boundedY.toFixed(2)));
         return;
       }
-      dragSelection = hitTest(screen);
+      const dragSelection = hitTest(screen);
       onSelectEntity?.(dragSelection);
-      if (dragSelection) canvas.setPointerCapture(event.pointerId);
+      if (dragSelection) {
+        const position = entityPosition(dragSelection);
+        dragStateRef.current = {
+          selection: dragSelection,
+          pointerId: event.pointerId,
+          offsetX: position ? position.x - world.x : 0,
+          offsetY: position ? position.y - world.y : 0,
+        };
+        canvas.setPointerCapture(event.pointerId);
+        canvas.style.cursor = "grabbing";
+      } else {
+        dragStateRef.current = null;
+      }
     };
     const handlePointerMove = (event: PointerEvent) => {
-      if (!dragSelection || !editing || tool !== "select") return;
+      const drag = dragStateRef.current;
+      if (!drag || drag.pointerId !== event.pointerId || !editing || tool !== "select") return;
       const screen = eventPoint(event);
       const world = unproject(screen.x, screen.y);
       onMoveEntity?.(
-        dragSelection,
-        Number(Math.max(map.bounds.minX, Math.min(maxX, world.x)).toFixed(2)),
-        Number(Math.max(map.bounds.minY, Math.min(maxY, world.y)).toFixed(2)),
+        drag.selection,
+        Number(Math.max(map.bounds.minX, Math.min(maxX, world.x + drag.offsetX)).toFixed(2)),
+        Number(Math.max(map.bounds.minY, Math.min(maxY, world.y + drag.offsetY)).toFixed(2)),
       );
     };
-    const endDrag = () => { dragSelection = null; };
+    const endDrag = (event: PointerEvent) => {
+      if (dragStateRef.current?.pointerId !== event.pointerId) return;
+      dragStateRef.current = null;
+      canvas.style.cursor = editing && tool === "select" ? "grab" : "crosshair";
+    };
 
-    canvas.style.cursor = editing ? tool === "select" ? "grab" : "crosshair" : "default";
+    canvas.style.cursor = dragStateRef.current ? "grabbing" : editing ? tool === "select" ? "grab" : "crosshair" : "default";
     const observer = new ResizeObserver(draw);
     observer.observe(canvas);
     canvas.addEventListener("pointerdown", handlePointerDown);
     canvas.addEventListener("pointermove", handlePointerMove);
     canvas.addEventListener("pointerup", endDrag);
     canvas.addEventListener("pointercancel", endDrag);
+    canvas.addEventListener("lostpointercapture", endDrag);
     draw();
     return () => {
       observer.disconnect();
@@ -293,6 +325,7 @@ export function Industrial3DMap({
       canvas.removeEventListener("pointermove", handlePointerMove);
       canvas.removeEventListener("pointerup", endDrag);
       canvas.removeEventListener("pointercancel", endDrag);
+      canvas.removeEventListener("lostpointercapture", endDrag);
     };
   }, [editing, map, onMoveEntity, onPlace, onSelect, onSelectEntity, robotX, robotY, robotYaw, selected, selectedEntity, tool, zoom]);
 

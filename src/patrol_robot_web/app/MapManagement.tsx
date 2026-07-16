@@ -38,6 +38,7 @@ export function MapManagement({
   const [seed, setSeed] = useState("");
   const [selectedEntity, setSelectedEntity] = useState<string | null>(null);
   const [importing, setImporting] = useState(false);
+  const [moveStep, setMoveStep] = useState(0.1);
   const fileInput = useRef<HTMLInputElement>(null);
 
   const selection = useMemo(() => {
@@ -92,6 +93,20 @@ export function MapManagement({
     commit({ waypoints: activeMap.waypoints.map((waypoint) => waypoint.id === selection.value.id ? { ...waypoint, ...patch } : waypoint) });
   };
 
+  const nudgeSelection = (deltaX: number, deltaY: number) => {
+    if (!selection) return;
+    const halfWidth = selection.kind === "object" ? selection.value.width / 2 : 0;
+    const halfDepth = selection.kind === "object" ? selection.value.depth / 2 : 0;
+    const minX = activeMap.bounds.minX + halfWidth;
+    const maxX = activeMap.bounds.minX + activeMap.bounds.width - halfWidth;
+    const minY = activeMap.bounds.minY + halfDepth;
+    const maxY = activeMap.bounds.minY + activeMap.bounds.height - halfDepth;
+    const x = Number(Math.max(minX, Math.min(maxX, selection.value.x + deltaX)).toFixed(2));
+    const y = Number(Math.max(minY, Math.min(maxY, selection.value.y + deltaY)).toFixed(2));
+    if (selection.kind === "object") updateObject({ x, y });
+    else updateWaypoint({ x, y });
+  };
+
   const removeSelection = () => {
     if (!selection) return;
     if (selection.kind === "object") commit({ objects: activeMap.objects.filter((object) => object.id !== selection.value.id) });
@@ -132,6 +147,24 @@ export function MapManagement({
     URL.revokeObjectURL(url);
     onNotice("地图 JSON 已导出");
   };
+
+  const positionNudge = selection ? (
+    <div className="position-nudge">
+      <div className="position-nudge-head">
+        <div><strong>位置微调</strong><small>方向按钮精确移动</small></div>
+        <div className="nudge-steps" role="group" aria-label="每次移动距离">
+          {[0.1, 0.5, 1].map((step) => <button key={step} className={moveStep === step ? "active" : ""} onClick={() => setMoveStep(step)}>{step} m</button>)}
+        </div>
+      </div>
+      <div className="nudge-pad">
+        <button className="nudge-up" aria-label={`向上移动 ${moveStep} 米`} onClick={() => nudgeSelection(0, moveStep)}>↑</button>
+        <button className="nudge-left" aria-label={`向左移动 ${moveStep} 米`} onClick={() => nudgeSelection(-moveStep, 0)}>←</button>
+        <span>X {selection.value.x.toFixed(2)}　Y {selection.value.y.toFixed(2)}</span>
+        <button className="nudge-right" aria-label={`向右移动 ${moveStep} 米`} onClick={() => nudgeSelection(moveStep, 0)}>→</button>
+        <button className="nudge-down" aria-label={`向下移动 ${moveStep} 米`} onClick={() => nudgeSelection(0, -moveStep)}>↓</button>
+      </div>
+    </div>
+  ) : null;
 
   return (
     <section className="map-management" aria-label="地图管理工作台">
@@ -211,7 +244,8 @@ export function MapManagement({
             <div className="inspector-form">
               <label>名称<input value={selection.value.name} onChange={(event) => updateObject({ name: event.target.value })} /></label>
               <label>类型<select value={selection.value.type} onChange={(event) => updateObject({ type: event.target.value as SceneObject["type"] })}><option value="obstacle">障碍物</option><option value="device">设备</option></select></label>
-              <div className="inspector-pair"><label>X 坐标<input type="number" step="0.1" value={selection.value.x} onChange={(event) => updateObject({ x: Number(event.target.value) })} /></label><label>Y 坐标<input type="number" step="0.1" value={selection.value.y} onChange={(event) => updateObject({ y: Number(event.target.value) })} /></label></div>
+              <div className="inspector-pair"><label>X 坐标<input type="number" step={moveStep} value={selection.value.x} onChange={(event) => updateObject({ x: Number(event.target.value) })} /></label><label>Y 坐标<input type="number" step={moveStep} value={selection.value.y} onChange={(event) => updateObject({ y: Number(event.target.value) })} /></label></div>
+              {positionNudge}
               <div className="inspector-section"><span>三维尺寸</span><small>决定导航占用范围和场景高度</small></div>
               <label>宽度 <b>{selection.value.width.toFixed(1)} m</b><input type="range" min="0.2" max="6" step="0.1" value={selection.value.width} onChange={(event) => updateObject({ width: Number(event.target.value) })} /></label>
               <label>深度 <b>{selection.value.depth.toFixed(1)} m</b><input type="range" min="0.2" max="6" step="0.1" value={selection.value.depth} onChange={(event) => updateObject({ depth: Number(event.target.value) })} /></label>
@@ -220,7 +254,8 @@ export function MapManagement({
           ) : selection?.kind === "waypoint" ? (
             <div className="inspector-form">
               <label>巡检点名称<input value={selection.value.name} onChange={(event) => updateWaypoint({ name: event.target.value })} /></label>
-              <div className="inspector-pair"><label>X 坐标<input type="number" step="0.1" value={selection.value.x} onChange={(event) => updateWaypoint({ x: Number(event.target.value) })} /></label><label>Y 坐标<input type="number" step="0.1" value={selection.value.y} onChange={(event) => updateWaypoint({ y: Number(event.target.value) })} /></label></div>
+              <div className="inspector-pair"><label>X 坐标<input type="number" step={moveStep} value={selection.value.x} onChange={(event) => updateWaypoint({ x: Number(event.target.value) })} /></label><label>Y 坐标<input type="number" step={moveStep} value={selection.value.y} onChange={(event) => updateWaypoint({ y: Number(event.target.value) })} /></label></div>
+              {positionNudge}
               <label>到点停留时间<div className="dwell-input"><input type="number" min="0" max="3600" value={selection.value.dwell} onChange={(event) => updateWaypoint({ dwell: Number(event.target.value) })} /><span>秒</span></div></label>
               <div className="waypoint-callout"><i>⌖</i><p><strong>路线顺序 #{activeMap.waypoints.findIndex((point) => point.id === selection.value.id) + 1}</strong><small>应用地图后会自动同步到巡检任务。</small></p></div>
             </div>

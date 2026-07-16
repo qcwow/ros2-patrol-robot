@@ -72,11 +72,14 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(map2d, /巡检工程平面图/);
   assert.match(map3d, /industrial-3d-map/);
   assert.match(map3d, /onMoveEntity/);
+  assert.match(map3d, /dragStateRef/);
   assert.match(mapManagement, /导入地图/);
   assert.match(mapManagement, /随机地图种子/);
   assert.match(mapManagement, /障碍物/);
   assert.match(mapManagement, /设备/);
   assert.match(mapManagement, /巡检点/);
+  assert.match(mapManagement, /位置微调/);
+  assert.match(mapManagement, /向左移动/);
   assert.match(mapTypes, /generatePatrolMap/);
   assert.match(mapTypes, /parsePgm/);
   assert.match(bridge, /\/api\/control\/manual/);
