@@ -55,7 +55,7 @@ def generate_launch_description():
         launch_arguments={
             'use_sim_time': use_sim_time,
             'map': map_yaml,
-            'ground_truth_localization': use_gazebo,
+            'ground_truth_localization': 'true',
         }.items(),
     )
 
@@ -109,7 +109,7 @@ def generate_launch_description():
             'simulation_origin_y': -4.0,
             'simulation_origin_yaw': 0.0,
             'odom_pose_is_world': ParameterValue(use_gazebo, value_type=bool),
-            'ground_truth_localization': ParameterValue(use_gazebo, value_type=bool),
+            'ground_truth_localization': True,
         }],
     )
 

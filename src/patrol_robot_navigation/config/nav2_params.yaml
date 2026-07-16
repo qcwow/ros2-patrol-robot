@@ -29,7 +29,10 @@ amcl:
     robot_model_type: nav2_amcl::DifferentialMotionModel
     save_pose_rate: 0.5
     sigma_hit: 0.2
-    tf_broadcast: true
+    # Simulation publishes a deterministic map->odom transform from ground
+    # truth. AMCL remains available for particle diagnostics but must not
+    # compete for the same TF, otherwise RViz and the controller will jitter.
+    tf_broadcast: false
     transform_tolerance: 0.5
     update_min_a: 0.15
     update_min_d: 0.15

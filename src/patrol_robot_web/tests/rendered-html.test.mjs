@@ -120,5 +120,6 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(nav2, /plugins: \[lidar_obstacle_layer, camera_voxel_layer, inflation_layer\]/);
   assert.match(nav2, /plugin: nav2_costmap_2d::VoxelLayer/);
   assert.match(nav2, /topic: \/camera\/points\/filtered/);
+  assert.match(nav2, /tf_broadcast: false/);
   assert.match(bringup, /ground_truth_localization/);
 });

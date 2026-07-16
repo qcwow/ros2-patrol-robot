@@ -162,7 +162,7 @@ def generate_launch_description():
         DeclareLaunchArgument('autostart', default_value='true'),
         DeclareLaunchArgument('map', default_value=default_map),
         DeclareLaunchArgument('params_file', default_value=default_params),
-        DeclareLaunchArgument('ground_truth_localization', default_value='false'),
+        DeclareLaunchArgument('ground_truth_localization', default_value='true'),
         map_server,
         amcl,
         localization_manager,
