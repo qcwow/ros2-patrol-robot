@@ -101,6 +101,8 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(simulator, /\/patrol\/map_scenario/);
   assert.match(gazeboSync, /OWNED_PREFIX = 'patrol_scene_'/);
   assert.match(gazeboSync, /gz\.msgs\.EntityFactory/);
+  assert.match(gazeboSync, /request = f'sdf: \{json\.dumps\(sdf\)\}/);
+  assert.doesNotMatch(gazeboSync, /TemporaryDirectory/);
   assert.match(gazeboSync, /<collision name="collision">/);
   assert.match(gazeboLaunch, /executable='gazebo_scene_sync'/);
   assert.match(bringup, /DeclareLaunchArgument\('use_gazebo', default_value='true'\)/);

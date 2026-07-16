@@ -11,9 +11,7 @@ import math
 import queue
 import re
 import subprocess
-import tempfile
 import threading
-from pathlib import Path
 
 import rclpy
 from rclpy.node import Node
@@ -166,15 +164,16 @@ class GazeboSceneSync(Node):
 '''
 
     def _spawn(self, name, item):
-        with tempfile.TemporaryDirectory(prefix='patrol_scene_') as directory:
-            path = Path(directory) / f'{name}.sdf'
-            path.write_text(self._sdf(name, item), encoding='utf-8')
-            request = f'sdf_filename: "{path}", name: "{name}"'
-            created = self._gz_service(
-                f'/world/{self._world}/create',
-                'gz.msgs.EntityFactory',
-                request,
-            )
+        # Gazebo queues entity creation and may read an sdf_filename only after
+        # the service call has returned.  Send the SDF inline so there is no
+        # temporary file that can disappear before the simulation consumes it.
+        sdf = self._sdf(name, item)
+        request = f'sdf: {json.dumps(sdf)}, name: "{name}"'
+        created = self._gz_service(
+            f'/world/{self._world}/create',
+            'gz.msgs.EntityFactory',
+            request,
+        )
         if not created:
             raise RuntimeError(f'无法创建场景实体 {name}')
 
