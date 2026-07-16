@@ -88,6 +88,11 @@ def generate_launch_description():
             'retry_delay_seconds': 3.0,
             'stop_on_failure': False,
             'action_name': 'navigate_through_poses',
+            'behavior_tree': PathJoinSubstitution([
+                FindPackageShare('patrol_robot_patrol'),
+                'behavior_trees',
+                'navigate_through_poses_once.xml',
+            ]),
         }],
     )
 

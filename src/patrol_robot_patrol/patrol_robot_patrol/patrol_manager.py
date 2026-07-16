@@ -73,6 +73,7 @@ class PatrolManager(Node):
         self.declare_parameter('retry_delay_seconds', 3.0)
         self.declare_parameter('stop_on_failure', False)
         self.declare_parameter('action_name', 'navigate_through_poses')
+        self.declare_parameter('behavior_tree', '')
 
         self._loop = self.get_parameter('loop').value
         self._loop_count = max(1, int(self.get_parameter('loop_count').value))
@@ -91,6 +92,7 @@ class PatrolManager(Node):
             0.0, float(self.get_parameter('retry_delay_seconds').value)
         )
         self._stop_on_failure = self.get_parameter('stop_on_failure').value
+        self._behavior_tree = str(self.get_parameter('behavior_tree').value)
 
         waypoint_file = str(self.get_parameter('waypoint_file').value)
         if not waypoint_file:
@@ -232,6 +234,7 @@ class PatrolManager(Node):
 
         goal = NavigateThroughPoses.Goal()
         goal.poses = poses
+        goal.behavior_tree = self._behavior_tree
 
         self._goal_token += 1
         token = self._goal_token

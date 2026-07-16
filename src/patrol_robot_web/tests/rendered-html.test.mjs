@@ -45,7 +45,7 @@ test("server-renders the patrol robot control console", async () => {
 });
 
 test("includes live ROS controls and both map implementations", async () => {
-  const [page, map2d, map3d, mapManagement, mapTypes, bridge, simulator, nav2, gazeboSync, gazeboLaunch, bringup, patrolManager] = await Promise.all([
+  const [page, map2d, map3d, mapManagement, mapTypes, bridge, simulator, nav2, gazeboSync, gazeboLaunch, bringup, patrolManager, patrolTree] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/Industrial2DMap.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/Industrial3DMap.tsx", import.meta.url), "utf8"),
@@ -58,6 +58,7 @@ test("includes live ROS controls and both map implementations", async () => {
     readFile(new URL("../../patrol_robot_gazebo/launch/simulation.launch.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_bringup/launch/simulation_navigation.launch.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_patrol/patrol_robot_patrol/patrol_manager.py", import.meta.url), "utf8"),
+    readFile(new URL("../../patrol_robot_patrol/behavior_trees/navigate_through_poses_once.xml", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /\/api\/status/);
@@ -118,6 +119,7 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(patrolManager, /returning_home/);
   assert.match(patrolManager, /NavigateThroughPoses/);
   assert.match(patrolManager, /开始连续路线规划/);
+  assert.match(patrolManager, /goal\.behavior_tree/);
   assert.match(page, /巡检圈数/);
   assert.match(page, /地图定位尚未稳定/);
   assert.match(nav2, /plugins: \[lidar_obstacle_layer, camera_voxel_layer, inflation_layer\]/);
@@ -126,5 +128,9 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(nav2, /tf_broadcast: false/);
   assert.match(nav2, /nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController/);
   assert.match(nav2, /nav2_smac_planner::SmacPlanner2D/);
+  assert.match(nav2, /nav2_controller::PoseProgressChecker/);
+  assert.match(bringup, /navigate_through_poses_once\.xml/);
+  assert.match(patrolTree, /NavigateWithStablePath/);
+  assert.doesNotMatch(patrolTree, /RateController/);
   assert.match(bringup, /ground_truth_localization/);
 });

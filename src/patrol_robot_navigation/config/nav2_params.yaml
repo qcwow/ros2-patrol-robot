@@ -74,7 +74,10 @@ bt_navigator:
 controller_server:
   ros__parameters:
     use_sim_time: true
-    controller_frequency: 15.0
+    # The RGB-D simulator and Gazebo share CPU with Nav2. Ten control updates
+    # per second are sufficient for a 0.55 m/s indoor robot and remain stable
+    # on virtualized hosts.
+    controller_frequency: 10.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
@@ -85,9 +88,12 @@ controller_server:
     use_realtime_priority: false
 
     progress_checker:
-      plugin: nav2_controller::SimpleProgressChecker
-      required_movement_radius: 0.35
-      movement_time_allowance: 12.0
+      # Count in-place heading correction as real progress. The former simple
+      # checker observed translation only and aborted while RPP was rotating.
+      plugin: nav2_controller::PoseProgressChecker
+      required_movement_radius: 0.08
+      required_movement_angle: 0.12
+      movement_time_allowance: 30.0
     goal_checker:
       stateful: true
       plugin: nav2_controller::SimpleGoalChecker
@@ -222,7 +228,10 @@ global_costmap:
           obstacle_min_range: 0.08
       camera_voxel_layer:
         plugin: nav2_costmap_2d::VoxelLayer
-        enabled: true
+        # Camera points remain in the local collision map. Keeping thousands
+        # of RGB-D points in the global map caused needless full-route updates;
+        # the 360-degree lidar still marks global dynamic obstacles.
+        enabled: false
         footprint_clearing_enabled: true
         publish_voxel_map: false
         origin_z: 0.0
