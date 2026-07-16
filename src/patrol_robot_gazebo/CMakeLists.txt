@@ -7,5 +7,10 @@ install(DIRECTORY launch worlds config
   DESTINATION share/${PROJECT_NAME}
 )
 
-ament_package()
+install(PROGRAMS
+  scripts/gazebo_scene_sync.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME gazebo_scene_sync
+)
 
+ament_package()

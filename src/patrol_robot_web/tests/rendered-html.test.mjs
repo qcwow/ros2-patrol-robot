@@ -45,7 +45,7 @@ test("server-renders the patrol robot control console", async () => {
 });
 
 test("includes live ROS controls and both map implementations", async () => {
-  const [page, map2d, map3d, mapManagement, mapTypes, bridge, simulator, nav2] = await Promise.all([
+  const [page, map2d, map3d, mapManagement, mapTypes, bridge, simulator, nav2, gazeboSync, gazeboLaunch, bringup] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/Industrial2DMap.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/Industrial3DMap.tsx", import.meta.url), "utf8"),
@@ -54,6 +54,9 @@ test("includes live ROS controls and both map implementations", async () => {
     readFile(new URL("../../patrol_robot_web_bridge/patrol_robot_web_bridge/bridge_node.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_simulator/patrol_robot_simulator/simulator_node.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_navigation/config/nav2_params.yaml", import.meta.url), "utf8"),
+    readFile(new URL("../../patrol_robot_gazebo/scripts/gazebo_scene_sync.py", import.meta.url), "utf8"),
+    readFile(new URL("../../patrol_robot_gazebo/launch/simulation.launch.py", import.meta.url), "utf8"),
+    readFile(new URL("../../patrol_robot_bringup/launch/simulation_navigation.launch.py", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /\/api\/status/);
@@ -96,6 +99,11 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(bridge, /manual_command_timeout/);
   assert.match(simulator, /OccupancyMap\.from_scenario/);
   assert.match(simulator, /\/patrol\/map_scenario/);
+  assert.match(gazeboSync, /OWNED_PREFIX = 'patrol_scene_'/);
+  assert.match(gazeboSync, /gz\.msgs\.EntityFactory/);
+  assert.match(gazeboSync, /<collision name="collision">/);
+  assert.match(gazeboLaunch, /executable='gazebo_scene_sync'/);
+  assert.match(bringup, /DeclareLaunchArgument\('use_gazebo', default_value='true'\)/);
   assert.match(nav2, /plugins: \[lidar_obstacle_layer, camera_voxel_layer, inflation_layer\]/);
   assert.match(nav2, /plugin: nav2_costmap_2d::VoxelLayer/);
   assert.match(nav2, /topic: \/camera\/points\/filtered/);

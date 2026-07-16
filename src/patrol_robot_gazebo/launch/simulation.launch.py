@@ -81,6 +81,17 @@ def generate_launch_description():
         parameters=[{'config_file': bridge_config}],
     )
 
+    scene_sync = Node(
+        package='patrol_robot_gazebo',
+        executable='gazebo_scene_sync',
+        name='gazebo_scene_sync',
+        output='screen',
+        parameters=[{
+            'world_name': 'pipeline_inspection',
+            'scenario_topic': '/patrol/map_scenario',
+        }],
+    )
+
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('headless', default_value='false'),
@@ -89,4 +100,5 @@ def generate_launch_description():
         state_publisher,
         spawn_robot,
         bridge,
+        scene_sync,
     ])

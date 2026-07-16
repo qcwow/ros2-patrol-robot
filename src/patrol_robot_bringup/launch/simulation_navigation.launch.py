@@ -132,7 +132,10 @@ def generate_launch_description():
         DeclareLaunchArgument('map', default_value=default_map),
         DeclareLaunchArgument('headless', default_value='false'),
         DeclareLaunchArgument('start_rviz', default_value='true'),
-        DeclareLaunchArgument('use_gazebo', default_value='false'),
+        # The full simulator is the default because cameras and editable 3D
+        # collision entities only exist in Gazebo.  Resource-constrained runs
+        # can still opt into the lightweight simulator with use_gazebo:=false.
+        DeclareLaunchArgument('use_gazebo', default_value='true'),
         DeclareLaunchArgument('waypoints', default_value=default_waypoints),
         gazebo_simulation,
         camera_processing,
