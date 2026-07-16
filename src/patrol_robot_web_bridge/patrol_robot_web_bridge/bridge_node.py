@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 import cv2
 import rclpy
 from cv_bridge import CvBridge, CvBridgeError
-from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
+from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped, Twist
 from nav_msgs.msg import Odometry
 from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap, LoadMap
@@ -27,7 +27,7 @@ from rclpy.time import Time
 from sensor_msgs.msg import Image, JointState, LaserScan, PointCloud2
 from std_msgs.msg import Float64, String
 from std_srvs.srv import Trigger
-from tf2_ros import Buffer, TransformException, TransformListener
+from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
 
 class RobotWebBridge(Node):
@@ -55,6 +55,7 @@ class RobotWebBridge(Node):
         self.declare_parameter('simulation_origin_y', -4.0)
         self.declare_parameter('simulation_origin_yaw', 0.0)
         self.declare_parameter('odom_pose_is_world', True)
+        self.declare_parameter('ground_truth_localization', False)
 
         self._max_linear = float(self.get_parameter('max_linear_speed').value)
         self._max_angular = float(self.get_parameter('max_angular_speed').value)
@@ -66,6 +67,9 @@ class RobotWebBridge(Node):
         )
         self._odom_pose_is_world = bool(
             self.get_parameter('odom_pose_is_world').value
+        )
+        self._ground_truth_localization = bool(
+            self.get_parameter('ground_truth_localization').value
         )
         self._latest_odom_pose = None
         self._initial_pose_repeats = 0
@@ -252,8 +256,10 @@ class RobotWebBridge(Node):
         self.create_timer(0.5, self._perception_watchdog)
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
+        self._tf_broadcaster = TransformBroadcaster(self)
         self.create_timer(0.2, self._update_map_pose)
         self.create_timer(0.25, self._publish_map_initial_pose)
+        self.create_timer(0.05, self._publish_ground_truth_map_transform)
 
         host = str(self.get_parameter('http_host').value)
         port = int(self.get_parameter('http_port').value)
@@ -268,6 +274,16 @@ class RobotWebBridge(Node):
         self.get_logger().info(f'车辆 Web 网关已监听 http://{host}:{port}')
         if bool(self.get_parameter('camera_enabled_at_start').value):
             self._set_camera_enabled(True)
+
+    def _publish_ground_truth_map_transform(self):
+        if not self._ground_truth_localization:
+            return
+        transform = TransformStamped()
+        transform.header.stamp = self.get_clock().now().to_msg()
+        transform.header.frame_id = 'map'
+        transform.child_frame_id = 'odom'
+        transform.transform.rotation.w = 1.0
+        self._tf_broadcaster.sendTransform(transform)
 
     def _make_handler(self):
         bridge = self

@@ -1,18 +1,22 @@
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
 def nav2_node(package, executable, name, params_file, use_sim_time,
-              remappings=None):
+              remappings=None, extra_parameters=None):
     return Node(
         package=package,
         executable=executable,
         name=name,
         output='screen',
-        parameters=[params_file, {'use_sim_time': use_sim_time}],
+        parameters=[
+            params_file,
+            {'use_sim_time': use_sim_time, **(extra_parameters or {})},
+        ],
         remappings=remappings or [],
     )
 
@@ -22,6 +26,7 @@ def generate_launch_description():
     autostart = LaunchConfiguration('autostart')
     map_yaml = LaunchConfiguration('map')
     params_file = LaunchConfiguration('params_file')
+    ground_truth_localization = LaunchConfiguration('ground_truth_localization')
 
     navigation_share = FindPackageShare('patrol_robot_navigation')
     default_map = PathJoinSubstitution(
@@ -47,6 +52,17 @@ def generate_launch_description():
     amcl = nav2_node(
         'nav2_amcl', 'amcl', 'amcl', params_file, use_sim_time,
         tf_remappings,
+        {
+            # Gazebo already provides an exact world pose. AMCL may jump
+            # between similar dense obstacles, so it can estimate particles
+            # for diagnostics but must not override map->odom in that mode.
+            'tf_broadcast': ParameterValue(
+                PythonExpression([
+                    "'", ground_truth_localization, "' != 'true'",
+                ]),
+                value_type=bool,
+            ),
+        },
     )
 
     localization_manager = Node(
@@ -146,6 +162,7 @@ def generate_launch_description():
         DeclareLaunchArgument('autostart', default_value='true'),
         DeclareLaunchArgument('map', default_value=default_map),
         DeclareLaunchArgument('params_file', default_value=default_params),
+        DeclareLaunchArgument('ground_truth_localization', default_value='false'),
         map_server,
         amcl,
         localization_manager,

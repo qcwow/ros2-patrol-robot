@@ -97,6 +97,8 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(bridge, /PoseWithCovarianceStamped/);
   assert.match(bridge, /\/initialpose/);
   assert.match(bridge, /odom_pose_is_world/);
+  assert.match(bridge, /TransformBroadcaster/);
+  assert.match(bridge, /ground_truth_localization/);
   assert.match(bridge, /lidar_obstacle_layer\.enabled/);
   assert.match(bridge, /camera_voxel_layer\.enabled/);
   assert.match(bridge, /camera_stream_fps', 12\.0/);
@@ -118,4 +120,5 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(nav2, /plugins: \[lidar_obstacle_layer, camera_voxel_layer, inflation_layer\]/);
   assert.match(nav2, /plugin: nav2_costmap_2d::VoxelLayer/);
   assert.match(nav2, /topic: \/camera\/points\/filtered/);
+  assert.match(bringup, /ground_truth_localization/);
 });
