@@ -4,6 +4,7 @@ from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -79,6 +80,7 @@ def generate_launch_description():
             'waypoint_file': waypoints,
             'autostart': patrol_autostart,
             'loop': loop,
+            'loop_count': 1,
             'start_delay_seconds': 10.0,
             'goal_timeout_seconds': 120.0,
             'max_retries': 1,
@@ -100,6 +102,12 @@ def generate_launch_description():
             'max_angular_speed': 0.8,
             'manual_command_timeout': 0.5,
             'perception_initial_mode': 'fusion',
+            # Gazebo spawns the robot here; its /odom starts at zero. The web
+            # bridge uses this offset to reinitialize AMCL after a map switch.
+            'simulation_origin_x': -6.0,
+            'simulation_origin_y': -4.0,
+            'simulation_origin_yaw': 0.0,
+            'odom_pose_is_world': ParameterValue(use_gazebo, value_type=bool),
         }],
     )
 

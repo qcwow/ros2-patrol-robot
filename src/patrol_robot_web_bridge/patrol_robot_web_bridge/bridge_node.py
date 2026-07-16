@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 import cv2
 import rclpy
 from cv_bridge import CvBridge, CvBridgeError
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseWithCovarianceStamped, Twist
 from nav_msgs.msg import Odometry
 from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap, LoadMap
@@ -51,10 +51,24 @@ class RobotWebBridge(Node):
         self.declare_parameter('camera_tilt_up_limit_degrees', 25.0)
         self.declare_parameter('camera_tilt_down_limit_degrees', 35.0)
         self.declare_parameter('perception_initial_mode', 'fusion')
+        self.declare_parameter('simulation_origin_x', -6.0)
+        self.declare_parameter('simulation_origin_y', -4.0)
+        self.declare_parameter('simulation_origin_yaw', 0.0)
+        self.declare_parameter('odom_pose_is_world', True)
 
         self._max_linear = float(self.get_parameter('max_linear_speed').value)
         self._max_angular = float(self.get_parameter('max_angular_speed').value)
         self._command_timeout = float(self.get_parameter('manual_command_timeout').value)
+        self._simulation_origin = (
+            float(self.get_parameter('simulation_origin_x').value),
+            float(self.get_parameter('simulation_origin_y').value),
+            float(self.get_parameter('simulation_origin_yaw').value),
+        )
+        self._odom_pose_is_world = bool(
+            self.get_parameter('odom_pose_is_world').value
+        )
+        self._latest_odom_pose = None
+        self._initial_pose_repeats = 0
         self._map_storage_dir = Path(
             str(self.get_parameter('map_storage_dir').value)
         ).expanduser()
@@ -120,6 +134,7 @@ class RobotWebBridge(Node):
                 'active_id': 'pipeline-demo',
                 'active_name': '管廊综合测试区',
                 'transitioning': False,
+                'localization_ready': True,
                 'error': None,
             },
             'perception': {
@@ -158,6 +173,11 @@ class RobotWebBridge(Node):
         self._map_scenario_publisher = self.create_publisher(
             String,
             '/patrol/map_scenario',
+            10,
+        )
+        self._initial_pose_publisher = self.create_publisher(
+            PoseWithCovarianceStamped,
+            '/initialpose',
             10,
         )
         self.create_subscription(Odometry, '/odom', self._on_odom, 10)
@@ -233,6 +253,7 @@ class RobotWebBridge(Node):
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
         self.create_timer(0.2, self._update_map_pose)
+        self.create_timer(0.25, self._publish_map_initial_pose)
 
         host = str(self.get_parameter('http_host').value)
         port = int(self.get_parameter('http_port').value)
@@ -446,7 +467,17 @@ class RobotWebBridge(Node):
             return self._camera_frame, self._camera_sequence
 
     def _on_odom(self, message):
+        orientation = message.pose.pose.orientation
+        odom_yaw = math.atan2(
+            2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
+            1.0 - 2.0 * (orientation.y * orientation.y + orientation.z * orientation.z),
+        )
         with self._lock:
+            self._latest_odom_pose = (
+                float(message.pose.pose.position.x),
+                float(message.pose.pose.position.y),
+                odom_yaw,
+            )
             self._status.update({
                 'speed': round(message.twist.twist.linear.x, 3),
                 'angular_speed': round(message.twist.twist.angular.z, 3),
@@ -676,6 +707,7 @@ class RobotWebBridge(Node):
                 'active_id': map_id,
                 'active_name': map_name,
                 'transitioning': True,
+                'localization_ready': False,
                 'error': None,
             })
 
@@ -718,14 +750,67 @@ class RobotWebBridge(Node):
             error = str(exception)
         with self._lock:
             self._status['map'].update({
-                'transitioning': False,
+                'transitioning': not bool(error),
+                'localization_ready': False,
                 'error': error,
             })
         if error:
             self.get_logger().error(f'地图切换失败：{error}')
         else:
+            # AMCL keeps the old map->odom transform when map_server loads a
+            # different map. Re-seed it from Gazebo's ground-truth odometry so
+            # the robot model, laser returns and new occupancy grid agree.
+            self._initial_pose_repeats = 3
+            self.get_logger().info('地图已加载，正在用仿真真值重新初始化 AMCL')
+
+    def _publish_map_initial_pose(self):
+        if self._initial_pose_repeats <= 0:
+            return
+        with self._lock:
+            odom_pose = self._latest_odom_pose
+        if odom_pose is None:
+            return
+
+        odom_x, odom_y, odom_yaw = odom_pose
+        if self._odom_pose_is_world:
+            # Gazebo OdometryPublisher reports the model's world pose even
+            # though the message frame is named odom.
+            map_x, map_y, map_yaw = odom_x, odom_y, odom_yaw
+        else:
+            # The lightweight simulator integrates odometry from zero at its
+            # configured initial map pose.
+            origin_x, origin_y, origin_yaw = self._simulation_origin
+            cosine = math.cos(origin_yaw)
+            sine = math.sin(origin_yaw)
+            map_x = origin_x + cosine * odom_x - sine * odom_y
+            map_y = origin_y + sine * odom_x + cosine * odom_y
+            map_yaw = origin_yaw + odom_yaw
+
+        message = PoseWithCovarianceStamped()
+        message.header.frame_id = 'map'
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.pose.pose.position.x = map_x
+        message.pose.pose.position.y = map_y
+        message.pose.pose.orientation.z = math.sin(map_yaw / 2.0)
+        message.pose.pose.orientation.w = math.cos(map_yaw / 2.0)
+        message.pose.covariance[0] = 0.04
+        message.pose.covariance[7] = 0.04
+        message.pose.covariance[35] = 0.03
+        self._initial_pose_publisher.publish(message)
+        self._initial_pose_repeats -= 1
+
+        if self._initial_pose_repeats == 0:
             self._clear_costmaps()
-            self.get_logger().info('地图切换完成，已清除导航代价地图')
+            with self._lock:
+                self._status['map'].update({
+                    'transitioning': False,
+                    'localization_ready': True,
+                    'error': None,
+                })
+            self.get_logger().info(
+                f'地图定位已重置：x={map_x:.2f}, y={map_y:.2f}, '
+                f'yaw={map_yaw:.2f}，代价地图已清除'
+            )
 
     @staticmethod
     def _boolean_parameter(name, value):

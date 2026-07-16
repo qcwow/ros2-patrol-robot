@@ -23,11 +23,16 @@ type PerceptionStatus = {
   error?: string | null;
 };
 type MapRuntimeStatus = {
-  active_id: string; active_name: string; transitioning: boolean; error?: string | null;
+  active_id: string; active_name: string; transitioning: boolean;
+  localization_ready?: boolean; error?: string | null;
 };
 type Telemetry = {
   speed: number; x: number; y: number; yaw: number; lidar_ok: boolean;
-  patrol: { state: string; current_index: number; current_waypoint: string; waypoint_count: number };
+  patrol: {
+    state: string; current_index: number; current_waypoint: string;
+    waypoint_count: number; loop_count?: number; completed_loops?: number;
+    returning_home?: boolean;
+  };
   camera: CameraStatus;
   perception: PerceptionStatus;
   map: MapRuntimeStatus;
@@ -47,6 +52,7 @@ export default function Home() {
   const [width, setWidth] = useState(42);
   const [lidars, setLidars] = useState(1);
   const [running, setRunning] = useState(false);
+  const [patrolLoops, setPatrolLoops] = useState(1);
   const [maps, setMaps] = useState<PatrolMap[]>(DEFAULT_MAPS);
   const [activeMapId, setActiveMapId] = useState(DEFAULT_MAPS[0].id);
   const [mapStorageReady, setMapStorageReady] = useState(false);
@@ -70,7 +76,7 @@ export default function Home() {
       gimbal_locked: false, safety_ok: true, camera_points: 0,
       active_sources: [], last_camera_cloud_age: null,
     },
-    map: { active_id: "pipeline-demo", active_name: "管廊综合测试区", transitioning: false, error: null },
+    map: { active_id: "pipeline-demo", active_name: "管廊综合测试区", transitioning: false, localization_ready: true, error: null },
   });
   const [apiBase] = useState(() => {
     if (typeof window === "undefined") return "";
@@ -167,7 +173,7 @@ export default function Home() {
           camera_points: 0, active_sources: [], last_camera_cloud_age: null,
         };
         const mapStatus = status.map ?? {
-          active_id: "pipeline-demo", active_name: "管廊综合测试区", transitioning: false, error: null,
+          active_id: "pipeline-demo", active_name: "管廊综合测试区", transitioning: false, localization_ready: true, error: null,
         };
         setCameraEnabled(Boolean(camera.enabled));
         setPerceptionBusy(Boolean(perception.transitioning));
@@ -251,6 +257,13 @@ export default function Home() {
 
   async function togglePatrol() {
     const next = !running;
+    if (next) {
+      if (telemetry.map.transitioning || telemetry.map.localization_ready === false) {
+        notify("地图定位尚未稳定，请稍候再开始巡检");
+        return;
+      }
+      if (!(await saveWaypoints(waypoints, patrolLoops))) return;
+    }
     if (await send(`/api/patrol/${next ? "start" : "stop"}`)) {
       setRunning(next);
       notify(next ? "巡检启动命令已发送" : "巡检停止命令已发送");
@@ -288,10 +301,16 @@ export default function Home() {
     }
   }
 
-  async function saveWaypoints(next = waypoints) {
-    if (await send("/api/navigation/waypoints", { frame_id: "map", waypoints: next.map(({name,x,y,dwell}) => ({name,x,y,yaw:0,dwell})) })) {
+  async function saveWaypoints(next = waypoints, loopCount = patrolLoops) {
+    const saved = await send("/api/navigation/waypoints", {
+      frame_id: "map",
+      loop_count: Math.max(1, Math.min(1000, Math.round(loopCount))),
+      waypoints: next.map(({name,x,y,dwell}) => ({name,x,y,yaw:0,dwell})),
+    });
+    if (saved) {
       notify("巡检路线已同步到 ROS 2");
     }
+    return saved;
   }
 
   function updateMap(next: PatrolMap) {
@@ -584,14 +603,21 @@ export default function Home() {
               <div className="speed-gauge">
                 <div><strong>{connected ? telemetry.speed.toFixed(1) : "0.0"}</strong><small>m/s</small></div>
               </div>
-              <p className="drive-state"><i></i>{running ? `前往：${telemetry.patrol.current_waypoint}` : "车辆已就绪"}</p>
+              <p className="drive-state"><i></i>{running ? telemetry.patrol.returning_home ? "本圈结束 · 正在返回出发点" : `前往：${telemetry.patrol.current_waypoint}` : telemetry.map.transitioning ? "地图定位校准中" : "车辆已就绪"}</p>
               <div className="stat-grid">
                 <div><small>电池电量</small><strong>86<span>%</span></strong><progress value="86" max="100" /></div>
                 <div><small>激光雷达</small><strong>{telemetry.perception.lidar_enabled ? telemetry.lidar_ok ? "正常" : "无数据" : "未参与"}</strong><span className="signal">▂▄▆█</span></div>
                 <div><small>当前巡检点</small><strong>{telemetry.patrol.current_index + 1}<span> / {telemetry.patrol.waypoint_count || waypoints.length}</span></strong></div>
                 <div><small>地图坐标</small><strong>{telemetry.x.toFixed(1)}<span>, {telemetry.y.toFixed(1)} m</span></strong></div>
               </div>
-              <button className={`primary-action ${running ? "stop" : ""}`} onClick={togglePatrol}>
+              <label className="patrol-loop-control">
+                <span>巡检圈数</span>
+                <button type="button" onClick={() => setPatrolLoops((value) => Math.max(1, value - 1))} disabled={running || patrolLoops <= 1}>−</button>
+                <input aria-label="巡检圈数" type="number" min="1" max="1000" value={patrolLoops} disabled={running} onChange={(event) => setPatrolLoops(Math.max(1, Math.min(1000, Number(event.target.value) || 1)))} />
+                <button type="button" onClick={() => setPatrolLoops((value) => Math.min(1000, value + 1))} disabled={running || patrolLoops >= 1000}>＋</button>
+                <small>已完成 {telemetry.patrol.completed_loops ?? 0} / {telemetry.patrol.loop_count ?? patrolLoops}</small>
+              </label>
+              <button className={`primary-action ${running ? "stop" : ""}`} onClick={togglePatrol} disabled={!running && (telemetry.map.transitioning || telemetry.map.localization_ready === false)}>
                 {running ? "■  停止巡检" : "▶  开始巡检"}
               </button>
               <button className="emergency" onClick={async () => { await send("/api/control/emergency-stop"); setRunning(false); notify("车辆已紧急停止"); }}>紧急停止</button>
@@ -665,7 +691,7 @@ export default function Home() {
                 {waypoints.map((point, index) => (
                   <div key={point.id} className={`point-row ${selected === point.id ? "active" : ""}`} onClick={() => setSelected(point.id)}>
                     <span className="point-index">{index + 1}</span>
-                    <div><strong>{point.name}</strong><small>X {point.x.toFixed(1)}　Y {point.y.toFixed(1)}　· 停留 {point.dwell} 秒</small></div>
+                    <div><strong>{point.name}{index === 0 && <em className="home-point-badge">出发 / 返回</em>}</strong><small>X {point.x.toFixed(1)}　Y {point.y.toFixed(1)}　· 停留 {point.dwell} 秒</small></div>
                     <button aria-label={`删除${point.name}`} onClick={(event) => { event.stopPropagation(); removeWaypoint(point.id); }}>×</button>
                   </div>
                 ))}

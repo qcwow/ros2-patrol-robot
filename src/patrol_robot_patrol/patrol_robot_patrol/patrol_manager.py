@@ -65,6 +65,7 @@ class PatrolManager(Node):
         self.declare_parameter('waypoint_file', '')
         self.declare_parameter('autostart', True)
         self.declare_parameter('loop', True)
+        self.declare_parameter('loop_count', 1)
         self.declare_parameter('default_dwell_seconds', 2.0)
         self.declare_parameter('start_delay_seconds', 8.0)
         self.declare_parameter('goal_timeout_seconds', 120.0)
@@ -74,6 +75,7 @@ class PatrolManager(Node):
         self.declare_parameter('action_name', 'navigate_to_pose')
 
         self._loop = self.get_parameter('loop').value
+        self._loop_count = max(1, int(self.get_parameter('loop_count').value))
         self._autostart = self.get_parameter('autostart').value
         self._default_dwell = float(
             self.get_parameter('default_dwell_seconds').value
@@ -115,6 +117,8 @@ class PatrolManager(Node):
         self._active_token: Optional[int] = None
         self._cancel_reason: Optional[str] = None
         self._last_feedback_log = 0.0
+        self._completed_loops = 0
+        self._returning_home = False
 
         self.create_timer(0.25, self._tick)
         self.create_timer(0.5, self._publish_status)
@@ -145,10 +149,16 @@ class PatrolManager(Node):
             self._request_cancel('reset')
             self._frame_id = str(document.get('frame_id', 'map'))
             self._waypoints = waypoints
+            self._loop_count = max(1, min(int(document.get('loop_count', 1)), 1000))
             self._index = 0
             self._retry_count = 0
+            self._completed_loops = 0
+            self._returning_home = False
             self._state = 'PAUSED'
-            self.get_logger().info(f'网页已更新巡检路线，共 {len(waypoints)} 个点')
+            self.get_logger().info(
+                f'网页已更新巡检路线，共 {len(waypoints)} 个点，'
+                f'计划 {self._loop_count} 圈'
+            )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             self.get_logger().error(f'网页巡检点配置无效: {error}')
 
@@ -161,6 +171,9 @@ class PatrolManager(Node):
             'current_index': self._index,
             'current_waypoint': current.name if current else None,
             'waypoint_count': len(self._waypoints),
+            'loop_count': self._loop_count,
+            'completed_loops': self._completed_loops,
+            'returning_home': self._returning_home,
         }, ensure_ascii=False)
         self._status_publisher.publish(message)
 
@@ -172,7 +185,7 @@ class PatrolManager(Node):
                 self._state = 'WAITING_SERVER'
 
         if self._state == 'DWELL' and now >= self._state_deadline:
-            self._advance_waypoint()
+            self._advance_waypoint(arrived=True)
 
         if self._state == 'WAITING_SERVER':
             if self._navigation.wait_for_server(timeout_sec=0.0):
@@ -290,6 +303,8 @@ class PatrolManager(Node):
         if cancel_reason == 'reset':
             self._index = 0
             self._retry_count = 0
+            self._completed_loops = 0
+            self._returning_home = False
             self._state = 'PAUSED'
             self.get_logger().info('巡航已复位到第一个巡航点')
             return
@@ -329,6 +344,8 @@ class PatrolManager(Node):
         if reason == 'reset':
             self._index = 0
             self._retry_count = 0
+            self._completed_loops = 0
+            self._returning_home = False
         self._state = 'PAUSED'
 
     def _handle_failure(self) -> None:
@@ -349,21 +366,51 @@ class PatrolManager(Node):
             self.get_logger().error('连续导航失败，已按配置停止巡航')
         else:
             self.get_logger().warning('跳过当前巡航点')
-            self._advance_waypoint()
+            self._advance_waypoint(arrived=False)
 
-    def _advance_waypoint(self) -> None:
+    def _advance_waypoint(self, arrived: bool) -> None:
+        if self._returning_home:
+            if not arrived:
+                self._state = 'PAUSED'
+                self.get_logger().error('返回出发点失败，巡检已暂停，未计入完成圈数')
+                return
+            self._completed_loops += 1
+            self._returning_home = False
+            if self._completed_loops >= self._loop_count:
+                self._state = 'COMPLETE'
+                self.get_logger().info(
+                    f'已完成 {self._completed_loops} 圈巡检并返回出发点'
+                )
+                return
+            self._index = 1 if len(self._waypoints) > 1 else 0
+            self._state = 'WAITING_SERVER'
+            self.get_logger().info(
+                f'第 {self._completed_loops} 圈完成，开始第 '
+                f'{self._completed_loops + 1} 圈'
+            )
+            return
+
+        if len(self._waypoints) == 1:
+            self._completed_loops += 1
+            if self._completed_loops >= self._loop_count:
+                self._state = 'COMPLETE'
+                self.get_logger().info(
+                    f'已完成 {self._completed_loops} 圈巡检并停在出发点'
+                )
+            else:
+                self._state = 'WAITING_SERVER'
+            return
+
         if self._index + 1 < len(self._waypoints):
             self._index += 1
             self._state = 'WAITING_SERVER'
             return
 
-        if self._loop:
-            self._index = 0
-            self._state = 'WAITING_SERVER'
-            self.get_logger().info('一轮巡航完成，开始下一轮')
-        else:
-            self._state = 'COMPLETE'
-            self.get_logger().info('全部巡航点已完成')
+        # A patrol lap is only complete after physically returning to point 1.
+        self._index = 0
+        self._returning_home = True
+        self._state = 'WAITING_SERVER'
+        self.get_logger().info('末巡检点已完成，正在返回第一个巡检点')
 
     def _on_start(self, _request, response):
         if self._state not in ('PAUSED', 'COMPLETE'):
@@ -373,6 +420,8 @@ class PatrolManager(Node):
         if self._state == 'COMPLETE':
             self._index = 0
             self._retry_count = 0
+            self._completed_loops = 0
+            self._returning_home = False
         self._state = 'WAITING_SERVER'
         response.success = True
         response.message = '巡航已启动'

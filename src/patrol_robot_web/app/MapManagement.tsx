@@ -17,7 +17,7 @@ type Props = {
   onDelete: (id: string) => void;
   onNotice: (message: string) => void;
   connected: boolean;
-  runtimeMap: { active_id: string; active_name: string; transitioning: boolean; error?: string | null };
+  runtimeMap: { active_id: string; active_name: string; transitioning: boolean; localization_ready?: boolean; error?: string | null };
 };
 
 const sourceLabels = { preset: "预置", generated: "种子", imported: "导入" } as const;
@@ -178,7 +178,7 @@ export function MapManagement({
           <input ref={fileInput} type="file" accept=".json,.yaml,.yml,.pgm" multiple hidden onChange={(event) => void handleImport(event.target.files)} />
           <button className="secondary-map-action" onClick={() => fileInput.current?.click()} disabled={importing}>{importing ? "正在导入…" : "⇧ 导入地图"}</button>
           <button className="secondary-map-action" onClick={exportMap}>⇩ 导出当前地图</button>
-          <button className="primary-map-action" onClick={() => onActivate(activeMap)} disabled={!connected || runtimeMap.transitioning}>{!connected ? "等待车辆连接" : runtimeMap.transitioning ? "正在切换地图…" : runtimeMap.active_id === activeMap.id && !runtimeMap.error ? "✓ 已应用到车辆" : "应用到车辆"}</button>
+          <button className="primary-map-action" onClick={() => onActivate(activeMap)} disabled={!connected || runtimeMap.transitioning}>{!connected ? "等待车辆连接" : runtimeMap.transitioning ? runtimeMap.localization_ready === false ? "正在校准车辆定位…" : "正在切换地图…" : runtimeMap.active_id === activeMap.id && !runtimeMap.error ? "✓ 已应用到车辆" : "应用到车辆"}</button>
         </div>
       </div>
 

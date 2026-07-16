@@ -45,7 +45,7 @@ test("server-renders the patrol robot control console", async () => {
 });
 
 test("includes live ROS controls and both map implementations", async () => {
-  const [page, map2d, map3d, mapManagement, mapTypes, bridge, simulator, nav2, gazeboSync, gazeboLaunch, bringup] = await Promise.all([
+  const [page, map2d, map3d, mapManagement, mapTypes, bridge, simulator, nav2, gazeboSync, gazeboLaunch, bringup, patrolManager] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/Industrial2DMap.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/Industrial3DMap.tsx", import.meta.url), "utf8"),
@@ -57,6 +57,7 @@ test("includes live ROS controls and both map implementations", async () => {
     readFile(new URL("../../patrol_robot_gazebo/scripts/gazebo_scene_sync.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_gazebo/launch/simulation.launch.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_bringup/launch/simulation_navigation.launch.py", import.meta.url), "utf8"),
+    readFile(new URL("../../patrol_robot_patrol/patrol_robot_patrol/patrol_manager.py", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /\/api\/status/);
@@ -93,6 +94,9 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(bridge, /\/api\/maps\/activate/);
   assert.match(bridge, /LoadMap/);
   assert.match(bridge, /\/patrol\/map_scenario/);
+  assert.match(bridge, /PoseWithCovarianceStamped/);
+  assert.match(bridge, /\/initialpose/);
+  assert.match(bridge, /odom_pose_is_world/);
   assert.match(bridge, /lidar_obstacle_layer\.enabled/);
   assert.match(bridge, /camera_voxel_layer\.enabled/);
   assert.match(bridge, /camera_stream_fps', 12\.0/);
@@ -106,6 +110,11 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(gazeboSync, /<collision name="collision">/);
   assert.match(gazeboLaunch, /executable='gazebo_scene_sync'/);
   assert.match(bringup, /DeclareLaunchArgument\('use_gazebo', default_value='true'\)/);
+  assert.match(patrolManager, /loop_count/);
+  assert.match(patrolManager, /returning_home/);
+  assert.match(patrolManager, /正在返回第一个巡检点/);
+  assert.match(page, /巡检圈数/);
+  assert.match(page, /地图定位尚未稳定/);
   assert.match(nav2, /plugins: \[lidar_obstacle_layer, camera_voxel_layer, inflation_layer\]/);
   assert.match(nav2, /plugin: nav2_costmap_2d::VoxelLayer/);
   assert.match(nav2, /topic: \/camera\/points\/filtered/);
