@@ -87,6 +87,7 @@ def generate_launch_description():
             'max_retries': 1,
             'retry_delay_seconds': 3.0,
             'stop_on_failure': False,
+            'action_name': 'navigate_through_poses',
         }],
     )
 

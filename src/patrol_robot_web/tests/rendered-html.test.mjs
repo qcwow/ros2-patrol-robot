@@ -86,6 +86,8 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(mapManagement, /向左移动/);
   assert.match(mapTypes, /generatePatrolMap/);
   assert.match(mapTypes, /parsePgm/);
+  assert.match(mapTypes, /validatePatrolWaypoints/);
+  assert.match(mapTypes, /WAYPOINT_SAFETY_RADIUS = 0\.45/);
   assert.match(bridge, /\/api\/control\/manual/);
   assert.match(bridge, /\/api\/camera\/enable/);
   assert.match(bridge, /\/api\/camera\/stream/);
@@ -114,12 +116,15 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(bringup, /DeclareLaunchArgument\('use_gazebo', default_value='true'\)/);
   assert.match(patrolManager, /loop_count/);
   assert.match(patrolManager, /returning_home/);
-  assert.match(patrolManager, /正在返回第一个巡检点/);
+  assert.match(patrolManager, /NavigateThroughPoses/);
+  assert.match(patrolManager, /开始连续路线规划/);
   assert.match(page, /巡检圈数/);
   assert.match(page, /地图定位尚未稳定/);
   assert.match(nav2, /plugins: \[lidar_obstacle_layer, camera_voxel_layer, inflation_layer\]/);
   assert.match(nav2, /plugin: nav2_costmap_2d::VoxelLayer/);
   assert.match(nav2, /topic: \/camera\/points\/filtered/);
   assert.match(nav2, /tf_broadcast: false/);
+  assert.match(nav2, /nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController/);
+  assert.match(nav2, /nav2_smac_planner::SmacPlanner2D/);
   assert.match(bringup, /ground_truth_localization/);
 });

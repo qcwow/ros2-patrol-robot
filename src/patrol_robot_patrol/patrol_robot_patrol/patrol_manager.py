@@ -8,7 +8,7 @@ import rclpy
 import yaml
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped
-from nav2_msgs.action import NavigateToPose
+from nav2_msgs.action import NavigateThroughPoses
 from rclpy.action import ActionClient
 from rclpy.node import Node
 from std_srvs.srv import Trigger
@@ -57,7 +57,7 @@ def load_waypoints(path: str, default_dwell: float) -> tuple[str, list[Waypoint]
 
 
 class PatrolManager(Node):
-    """Navigate through YAML waypoints one by one with retry and timeout control."""
+    """Navigate a complete patrol route with retry and timeout control."""
 
     def __init__(self) -> None:
         super().__init__('patrol_manager')
@@ -72,7 +72,7 @@ class PatrolManager(Node):
         self.declare_parameter('max_retries', 1)
         self.declare_parameter('retry_delay_seconds', 3.0)
         self.declare_parameter('stop_on_failure', False)
-        self.declare_parameter('action_name', 'navigate_to_pose')
+        self.declare_parameter('action_name', 'navigate_through_poses')
 
         self._loop = self.get_parameter('loop').value
         self._loop_count = max(1, int(self.get_parameter('loop_count').value))
@@ -100,7 +100,7 @@ class PatrolManager(Node):
         )
 
         action_name = str(self.get_parameter('action_name').value)
-        self._navigation = ActionClient(self, NavigateToPose, action_name)
+        self._navigation = ActionClient(self, NavigateThroughPoses, action_name)
         self.create_service(Trigger, '~/start', self._on_start)
         self.create_service(Trigger, '~/stop', self._on_stop)
         self.create_service(Trigger, '~/reset', self._on_reset)
@@ -119,6 +119,8 @@ class PatrolManager(Node):
         self._last_feedback_log = 0.0
         self._completed_loops = 0
         self._returning_home = False
+        self._active_route: list[tuple[int, Waypoint, bool]] = []
+        self._active_route_position = -1
 
         self.create_timer(0.25, self._tick)
         self.create_timer(0.5, self._publish_status)
@@ -184,34 +186,52 @@ class PatrolManager(Node):
             if now >= self._state_deadline:
                 self._state = 'WAITING_SERVER'
 
-        if self._state == 'DWELL' and now >= self._state_deadline:
-            self._advance_waypoint(arrived=True)
-
         if self._state == 'WAITING_SERVER':
             if self._navigation.wait_for_server(timeout_sec=0.0):
                 self._send_current_goal()
             return
 
         if self._state == 'NAVIGATING':
-            if now - self._goal_started_at >= self._goal_timeout:
+            route_timeout = self._goal_timeout * max(1, len(self._active_route))
+            if now - self._goal_started_at >= route_timeout:
                 waypoint = self._waypoints[self._index]
                 self.get_logger().warning(
                     f'巡航点“{waypoint.name}”导航超时，正在取消目标'
                 )
                 self._request_cancel('timeout')
 
-    def _send_current_goal(self) -> None:
-        waypoint = self._waypoints[self._index]
-        pose = PoseStamped()
-        pose.header.frame_id = self._frame_id
-        pose.header.stamp = self.get_clock().now().to_msg()
-        pose.pose.position.x = waypoint.x
-        pose.pose.position.y = waypoint.y
-        pose.pose.orientation.z = math.sin(waypoint.yaw / 2.0)
-        pose.pose.orientation.w = math.cos(waypoint.yaw / 2.0)
+    def _build_route(self) -> list[tuple[int, Waypoint, bool]]:
+        if len(self._waypoints) == 1:
+            return [(0, self._waypoints[0], False)]
+        if self._returning_home:
+            return [(0, self._waypoints[0], True)]
+        start = min(max(self._index, 0), len(self._waypoints) - 1)
+        route = [
+            (index, self._waypoints[index], False)
+            for index in range(start, len(self._waypoints))
+        ]
+        # Every route finishes at point 1. On the initial run point 1 is also
+        # the first target, ensuring a map switch always starts from home.
+        route.append((0, self._waypoints[0], True))
+        return route
 
-        goal = NavigateToPose.Goal()
-        goal.pose = pose
+    def _send_current_goal(self) -> None:
+        self._active_route = self._build_route()
+        self._active_route_position = -1
+        poses = []
+        stamp = self.get_clock().now().to_msg()
+        for _index, waypoint, _returning_home in self._active_route:
+            pose = PoseStamped()
+            pose.header.frame_id = self._frame_id
+            pose.header.stamp = stamp
+            pose.pose.position.x = waypoint.x
+            pose.pose.position.y = waypoint.y
+            pose.pose.orientation.z = math.sin(waypoint.yaw / 2.0)
+            pose.pose.orientation.w = math.cos(waypoint.yaw / 2.0)
+            poses.append(pose)
+
+        goal = NavigateThroughPoses.Goal()
+        goal.poses = poses
 
         self._goal_token += 1
         token = self._goal_token
@@ -221,10 +241,8 @@ class PatrolManager(Node):
         self._goal_started_at = self._now()
         self._state = 'SENDING_GOAL'
 
-        self.get_logger().info(
-            f'前往 {self._index + 1}/{len(self._waypoints)} “{waypoint.name}” '
-            f'(x={waypoint.x:.2f}, y={waypoint.y:.2f}, yaw={waypoint.yaw:.2f})'
-        )
+        route_names = ' → '.join(target.name for _, target, _ in self._active_route)
+        self.get_logger().info(f'开始连续路线规划：{route_names}')
         future = self._navigation.send_goal_async(
             goal,
             feedback_callback=lambda feedback, goal_token=token:
@@ -272,13 +290,32 @@ class PatrolManager(Node):
     def _on_feedback(self, feedback_message, token: int) -> None:
         if token != self._active_token or self._state != 'NAVIGATING':
             return
+        feedback = feedback_message.feedback
+        remaining = max(
+            0,
+            min(int(feedback.number_of_poses_remaining), len(self._active_route)),
+        )
+        route_position = min(
+            max(len(self._active_route) - remaining, 0),
+            len(self._active_route) - 1,
+        )
+        if self._active_route and route_position != self._active_route_position:
+            self._active_route_position = route_position
+            self._index, target, self._returning_home = self._active_route[route_position]
+            if self._returning_home:
+                self.get_logger().info('本圈路线已通过所有巡检点，正在返回出发点')
+            else:
+                self.get_logger().info(
+                    f'连续路线当前目标：{self._index + 1}/{len(self._waypoints)} '
+                    f'“{target.name}”'
+                )
         now = self._now()
         if now - self._last_feedback_log < 5.0:
             return
         self._last_feedback_log = now
-        feedback = feedback_message.feedback
         self.get_logger().info(
-            f'距目标约 {feedback.distance_remaining:.2f} m'
+            f'整段路线剩余约 {feedback.distance_remaining:.2f} m，'
+            f'剩余 {remaining} 个目标'
         )
 
     def _on_result(self, future, token: int) -> None:
@@ -295,6 +332,7 @@ class PatrolManager(Node):
         self._goal_handle = None
         self._active_token = None
         self._cancel_reason = None
+        self._active_route = []
 
         if cancel_reason == 'stop':
             self._state = 'PAUSED'
@@ -309,14 +347,12 @@ class PatrolManager(Node):
             self.get_logger().info('巡航已复位到第一个巡航点')
             return
 
-        waypoint = self._waypoints[self._index]
         if status == GoalStatus.STATUS_SUCCEEDED:
-            self.get_logger().info(f'已到达“{waypoint.name}”')
             self._retry_count = 0
-            self._state = 'DWELL'
-            self._state_deadline = self._now() + waypoint.dwell
+            self._complete_route()
             return
 
+        waypoint = self._waypoints[self._index]
         if cancel_reason == 'timeout':
             self.get_logger().warning(f'巡航点“{waypoint.name}”因超时未到达')
         else:
@@ -340,6 +376,7 @@ class PatrolManager(Node):
     def _finish_local_cancel(self, reason: str) -> None:
         self._goal_handle = None
         self._active_token = None
+        self._active_route = []
         self._cancel_reason = None
         if reason == 'reset':
             self._index = 0
@@ -351,6 +388,7 @@ class PatrolManager(Node):
     def _handle_failure(self) -> None:
         self._goal_handle = None
         self._active_token = None
+        self._active_route = []
         if self._retry_count < self._max_retries:
             self._retry_count += 1
             self.get_logger().warning(
@@ -367,6 +405,23 @@ class PatrolManager(Node):
         else:
             self.get_logger().warning('跳过当前巡航点')
             self._advance_waypoint(arrived=False)
+
+    def _complete_route(self) -> None:
+        self._completed_loops += 1
+        self._index = 0
+        self._returning_home = False
+        if self._completed_loops >= self._loop_count:
+            self._state = 'COMPLETE'
+            self.get_logger().info(
+                f'已完成 {self._completed_loops} 圈连续巡检并返回出发点'
+            )
+            return
+        self._index = 1 if len(self._waypoints) > 1 else 0
+        self._state = 'WAITING_SERVER'
+        self.get_logger().info(
+            f'第 {self._completed_loops} 圈完成，开始第 '
+            f'{self._completed_loops + 1} 圈连续巡检'
+        )
 
     def _advance_waypoint(self, arrived: bool) -> None:
         if self._returning_home:

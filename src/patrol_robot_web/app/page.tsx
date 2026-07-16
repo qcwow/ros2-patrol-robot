@@ -6,7 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Industrial3DMap } from "./Industrial3DMap";
 import { Industrial2DMap } from "./Industrial2DMap";
 import { MapManagement } from "./MapManagement";
-import { DEFAULT_MAPS, mapToRobotPayload, type PatrolMap, type Waypoint } from "./mapTypes";
+import { DEFAULT_MAPS, findNearestSafeWaypointPosition, mapToRobotPayload, validatePatrolWaypoints, type PatrolMap, type Waypoint } from "./mapTypes";
 
 type CameraStatus = {
   enabled: boolean; ok: boolean; frames: number; width: number; height: number;
@@ -301,7 +301,18 @@ export default function Home() {
     }
   }
 
-  async function saveWaypoints(next = waypoints, loopCount = patrolLoops) {
+  async function saveWaypoints(next = waypoints, loopCount = patrolLoops, routeMap = activeMap) {
+    if (!next.length) {
+      notify("路线未同步：请先在地图上添加至少一个巡检点");
+      return false;
+    }
+    const candidateMap = { ...routeMap, waypoints: next };
+    const safetyIssues = validatePatrolWaypoints(candidateMap);
+    if (safetyIssues.length) {
+      const summary = safetyIssues.slice(0, 2).map(({ waypoint, reason }) => `${waypoint.name}：${reason}`).join("；");
+      notify(`路线未同步：${summary}${safetyIssues.length > 2 ? `；另有 ${safetyIssues.length - 2} 个问题` : ""}`);
+      return false;
+    }
     const saved = await send("/api/navigation/waypoints", {
       frame_id: "map",
       loop_count: Math.max(1, Math.min(1000, Math.round(loopCount))),
@@ -329,9 +340,18 @@ export default function Home() {
     setActiveMapId(next.id);
     setSelected(next.waypoints[0]?.id ?? 0);
     setMapMode("3d");
+    if (!next.waypoints.length) {
+      notify(`“${next.name}”尚未设置巡检点，请编辑路线后再应用到车辆`);
+      return;
+    }
+    const safetyIssues = validatePatrolWaypoints(next);
+    if (safetyIssues.length) {
+      notify(`“${next.name}”包含不安全巡检点，请调整后再应用到车辆`);
+      return;
+    }
     if (connected) {
       const applied = await send("/api/maps/activate", mapToRobotPayload(next));
-      if (applied) await saveWaypoints(next.waypoints);
+      if (applied) await saveWaypoints(next.waypoints, patrolLoops, next);
     } else {
       notify(`已在本机切换到“${next.name}”，连接车辆后可应用到 ROS 2`);
     }
@@ -370,7 +390,14 @@ export default function Home() {
 
   function addWaypoint() {
     const id = Math.max(...waypoints.map((item) => item.id), 0) + 1;
-    const point = { id, name: `新巡检点 ${id}`, x: activeMap.bounds.minX + activeMap.bounds.width / 2, y: activeMap.bounds.minY + activeMap.bounds.height / 2, dwell: 3 };
+    const centerX = activeMap.bounds.minX + activeMap.bounds.width / 2;
+    const centerY = activeMap.bounds.minY + activeMap.bounds.height / 2;
+    const safePosition = findNearestSafeWaypointPosition(activeMap, centerX, centerY);
+    if (!safePosition) {
+      notify("当前地图没有找到可用的巡检点位置，请先移除部分障碍物");
+      return;
+    }
+    const point = { id, name: `新巡检点 ${id}`, ...safePosition, dwell: 3 };
     updateWaypoints([...waypoints, point]);
     setSelected(id);
     saveWaypoints([...waypoints, point]);

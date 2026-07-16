@@ -45,6 +45,15 @@ export type PatrolMap = {
   updatedAt: string;
 };
 
+export type WaypointSafetyIssue = {
+  waypoint: Waypoint;
+  reason: string;
+};
+
+// The simulated footprint is 0.58 m x 0.46 m. Its circumscribed radius is
+// about 0.37 m; the extra margin keeps goals out of Nav2's inflated cells.
+export const WAYPOINT_SAFETY_RADIUS = 0.45;
+
 const now = "2026-07-15T00:00:00.000Z";
 
 export const DEFAULT_MAPS: PatrolMap[] = [
@@ -205,6 +214,69 @@ export function decodeOccupancy(layer?: OccupancyLayer) {
     cells[index] = (binary.charCodeAt(index >> 3) >> (index & 7)) & 1;
   }
   return cells;
+}
+
+function occupancyBlocksCircle(layer: OccupancyLayer, x: number, y: number, radius: number) {
+  const cells = decodeOccupancy(layer);
+  if (!cells.length) return false;
+  const minColumn = Math.max(0, Math.floor((x - radius - layer.originX) / layer.resolution));
+  const maxColumn = Math.min(layer.width - 1, Math.floor((x + radius - layer.originX) / layer.resolution));
+  const minMapRow = Math.max(0, Math.floor((y - radius - layer.originY) / layer.resolution));
+  const maxMapRow = Math.min(layer.height - 1, Math.floor((y + radius - layer.originY) / layer.resolution));
+  for (let mapRow = minMapRow; mapRow <= maxMapRow; mapRow += 1) {
+    const cellY = layer.originY + (mapRow + 0.5) * layer.resolution;
+    const imageRow = layer.height - 1 - mapRow;
+    for (let column = minColumn; column <= maxColumn; column += 1) {
+      if (!cells[imageRow * layer.width + column]) continue;
+      const cellX = layer.originX + (column + 0.5) * layer.resolution;
+      const halfCell = layer.resolution * Math.SQRT1_2;
+      if (Math.hypot(cellX - x, cellY - y) <= radius + halfCell) return true;
+    }
+  }
+  return false;
+}
+
+export function validatePatrolWaypoints(map: PatrolMap, radius = WAYPOINT_SAFETY_RADIUS): WaypointSafetyIssue[] {
+  const maxX = map.bounds.minX + map.bounds.width;
+  const maxY = map.bounds.minY + map.bounds.height;
+  return map.waypoints.flatMap((waypoint) => {
+    if (
+      waypoint.x < map.bounds.minX + radius || waypoint.x > maxX - radius ||
+      waypoint.y < map.bounds.minY + radius || waypoint.y > maxY - radius
+    ) {
+      return [{ waypoint, reason: "距离地图边界过近" }];
+    }
+    const collision = map.objects.find((object) =>
+      Math.abs(waypoint.x - object.x) <= object.width / 2 + radius &&
+      Math.abs(waypoint.y - object.y) <= object.depth / 2 + radius
+    );
+    if (collision) return [{ waypoint, reason: `进入“${collision.name}”的安全区` }];
+    if (map.occupancy && occupancyBlocksCircle(map.occupancy, waypoint.x, waypoint.y, radius)) {
+      return [{ waypoint, reason: "落在栅格障碍物或其安全区内" }];
+    }
+    return [];
+  });
+}
+
+export function findNearestSafeWaypointPosition(map: PatrolMap, x: number, y: number) {
+  const step = Math.max(map.resolution, 0.2);
+  const candidate = (nextX: number, nextY: number) => {
+    const waypoint: Waypoint = { id: -1, name: "候选巡检点", x: nextX, y: nextY, dwell: 0 };
+    return validatePatrolWaypoints({ ...map, waypoints: [waypoint] }).length === 0;
+  };
+  if (candidate(x, y)) return { x, y };
+  for (let ring = 1; ring <= 40; ring += 1) {
+    for (let offset = -ring; offset <= ring; offset += 1) {
+      const points = [
+        [x + offset * step, y - ring * step], [x + offset * step, y + ring * step],
+        [x - ring * step, y + offset * step], [x + ring * step, y + offset * step],
+      ];
+      for (const [nextX, nextY] of points) {
+        if (candidate(nextX, nextY)) return { x: Number(nextX.toFixed(2)), y: Number(nextY.toFixed(2)) };
+      }
+    }
+  }
+  return null;
 }
 
 function safeNumber(value: unknown, fallback: number, min = -10000, max = 10000) {

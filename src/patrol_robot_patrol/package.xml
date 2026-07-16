@@ -2,7 +2,7 @@
 <package format="3">
   <name>patrol_robot_patrol</name>
   <version>0.1.0</version>
-  <description>Multi-waypoint patrol manager built on the Nav2 NavigateToPose action.</description>
+  <description>Continuous multi-waypoint patrol manager built on the Nav2 NavigateThroughPoses action.</description>
   <maintainer email="maintainer@example.com">Patrol Robot Maintainer</maintainer>
   <license>Apache-2.0</license>
 
