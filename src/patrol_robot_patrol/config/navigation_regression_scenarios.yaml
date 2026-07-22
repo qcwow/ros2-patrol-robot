@@ -1,0 +1,32 @@
+scenarios:
+  - id: normal_complete
+    description: 完整巡航并返回基地
+    expected_terminal_state: COMPLETE
+    maximum_position_error: 0.10
+    maximum_yaw_error: 0.14
+
+  - id: corridor_blocked
+    description: 在窄通道加入持续障碍，验证有限恢复和 BLOCKED
+    fault: persistent_obstacle
+    expected_terminal_state: BLOCKED
+    maximum_retry_count: 2
+
+  - id: lidar_dropout
+    description: 巡航中断开 scan 数据，验证健康门安全停车
+    fault: scan_dropout
+    expected_terminal_state: BLOCKED
+
+  - id: odom_drift
+    description: 使用轮速里程计、IMU、EKF 和 AMCL 完成巡航
+    localization_mode: ekf
+    expected_terminal_state: COMPLETE
+
+  - id: unreachable_inspection
+    description: 将巡检目标放入障碍物膨胀区，验证不跳过任务
+    fault: unreachable_goal
+    expected_terminal_state: BLOCKED
+
+  - id: estop_latch
+    description: 触发急停后验证普通开始和任务复位不能解除锁定
+    fault: emergency_stop
+    expected_terminal_state: ESTOP

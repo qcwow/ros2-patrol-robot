@@ -7,6 +7,14 @@ export type Waypoint = {
   x: number;
   y: number;
   dwell: number;
+  yaw?: number;
+  type?: "HOME" | "TRANSIT" | "INSPECTION";
+  position_tolerance?: number;
+  yaw_tolerance?: number;
+  speed_limit?: number;
+  recovery_policy?: "standard" | "no_spin" | "restricted";
+  required_sensor?: string;
+  count_as_task?: boolean;
 };
 
 export type SceneObject = {
@@ -53,6 +61,11 @@ export type WaypointSafetyIssue = {
 // The simulated footprint is 0.58 m x 0.46 m. Its circumscribed radius is
 // about 0.37 m; the extra margin keeps goals out of Nav2's inflated cells.
 export const WAYPOINT_SAFETY_RADIUS = 0.45;
+// pipeline_world.sdf places each 0.5 m-thick perimeter wall completely
+// inside the advertised map bounds. Boundary goals need both this inset and
+// the full in-place rotation envelope used for objects and occupancy cells.
+export const GAZEBO_BOUNDARY_WALL_INSET = 0.50;
+export const WAYPOINT_BOUNDARY_CLEARANCE = WAYPOINT_SAFETY_RADIUS + GAZEBO_BOUNDARY_WALL_INSET;
 
 const now = "2026-07-15T00:00:00.000Z";
 
@@ -63,7 +76,7 @@ export const DEFAULT_MAPS: PatrolMap[] = [
     description: "标准管廊、控制柜与维护间场景",
     source: "preset",
     bounds: { minX: -8, minY: -6, width: 16, height: 12 },
-    resolution: 0.5,
+    resolution: 0.05,
     objects: [
       { id: "pipe-a", type: "device", name: "A区管道架", x: -2.75, y: 1.5, width: 1, depth: 4, height: 1.2 },
       { id: "pipe-b", type: "device", name: "B区管道架", x: 2.25, y: -2, width: 1, depth: 4, height: 1.2 },
@@ -72,11 +85,11 @@ export const DEFAULT_MAPS: PatrolMap[] = [
       { id: "maintenance-room", type: "device", name: "维护间", x: -5.4, y: 0.2, width: 1.7, depth: 1.3, height: 0.9 },
     ],
     waypoints: [
-      { id: 1, name: "起点东侧", x: -4.8, y: -3.8, dwell: 2 },
-      { id: 2, name: "A区管道北侧", x: -4.6, y: 3.8, dwell: 3 },
-      { id: 3, name: "控制柜检查点", x: 0.2, y: 3.2, dwell: 3 },
-      { id: 4, name: "B区管道东侧", x: 4.6, y: -1, dwell: 3 },
-      { id: 5, name: "返回区", x: -5.8, y: -4, dwell: 2 },
+      { id: 1, name: "起点东侧", type: "HOME", x: -4.8, y: -3.8, dwell: 0, position_tolerance: 0.08, yaw_tolerance: 0.10, speed_limit: 0.15, recovery_policy: "restricted", count_as_task: false },
+      { id: 2, name: "A区管道北侧", type: "INSPECTION", x: -4.6, y: 3.8, dwell: 3, position_tolerance: 0.08, yaw_tolerance: 0.10, speed_limit: 0.15, recovery_policy: "restricted", required_sensor: "rgbd", count_as_task: true },
+      { id: 3, name: "控制柜检查点", type: "INSPECTION", x: 0.2, y: 3.2, dwell: 3, position_tolerance: 0.06, yaw_tolerance: 0.08, speed_limit: 0.12, recovery_policy: "restricted", required_sensor: "rgbd", count_as_task: true },
+      { id: 4, name: "B区管道东侧", type: "INSPECTION", x: 4.6, y: -1, dwell: 3, position_tolerance: 0.08, yaw_tolerance: 0.10, speed_limit: 0.15, recovery_policy: "restricted", required_sensor: "rgbd", count_as_task: true },
+      { id: 5, name: "基地入口", type: "TRANSIT", x: -5.8, y: -4, dwell: 0, position_tolerance: 0.20, yaw_tolerance: 0.25, speed_limit: 0.25, recovery_policy: "no_spin", count_as_task: false },
     ],
     createdAt: now,
     updatedAt: now,
@@ -87,7 +100,7 @@ export const DEFAULT_MAPS: PatrolMap[] = [
     description: "连续窄通道与急转弯组合",
     source: "preset",
     bounds: { minX: -8, minY: -6, width: 16, height: 12 },
-    resolution: 0.25,
+    resolution: 0.05,
     objects: [
       { id: "wall-n1", type: "obstacle", name: "北侧隔离墙", x: -1.7, y: 2.2, width: 8.2, depth: 0.55, height: 1.4 },
       { id: "wall-s1", type: "obstacle", name: "南侧隔离墙", x: 1.4, y: -1.1, width: 8.5, depth: 0.55, height: 1.4 },
@@ -110,7 +123,7 @@ export const DEFAULT_MAPS: PatrolMap[] = [
     description: "设备密集、局部遮挡与多巡检目标",
     source: "preset",
     bounds: { minX: -8, minY: -6, width: 16, height: 12 },
-    resolution: 0.25,
+    resolution: 0.05,
     objects: [
       { id: "tank-1", type: "device", name: "储罐 01", x: -3.8, y: 2.8, width: 1.7, depth: 1.7, height: 2.1 },
       { id: "tank-2", type: "device", name: "储罐 02", x: -0.8, y: 2.8, width: 1.7, depth: 1.7, height: 2.1 },
@@ -185,7 +198,7 @@ export function generatePatrolMap(seedValue: string): PatrolMap {
     source: "generated",
     seed,
     bounds: { minX: -8, minY: -6, width: 16, height: 12 },
-    resolution: 0.25,
+    resolution: 0.05,
     objects,
     waypoints: reserved.map((point, index) => ({ id: index + 1, name: `巡检点 ${index + 1}`, ...point, dwell: index === 0 ? 2 : 3 })),
     createdAt: timestamp,
@@ -239,16 +252,20 @@ function occupancyBlocksCircle(layer: OccupancyLayer, x: number, y: number, radi
 export function validatePatrolWaypoints(map: PatrolMap, radius = WAYPOINT_SAFETY_RADIUS): WaypointSafetyIssue[] {
   const maxX = map.bounds.minX + map.bounds.width;
   const maxY = map.bounds.minY + map.bounds.height;
+  const boundaryClearance = radius + GAZEBO_BOUNDARY_WALL_INSET;
+  // Generated scene rectangles are rasterized onto whole Nav2 cells. Include
+  // the cell's half diagonal so the browser and bridge reject the same goals.
+  const rasterMargin = map.resolution * Math.SQRT1_2;
   return map.waypoints.flatMap((waypoint) => {
     if (
-      waypoint.x < map.bounds.minX + radius || waypoint.x > maxX - radius ||
-      waypoint.y < map.bounds.minY + radius || waypoint.y > maxY - radius
+      waypoint.x < map.bounds.minX + boundaryClearance || waypoint.x > maxX - boundaryClearance ||
+      waypoint.y < map.bounds.minY + boundaryClearance || waypoint.y > maxY - boundaryClearance
     ) {
-      return [{ waypoint, reason: "距离地图边界过近" }];
+      return [{ waypoint, reason: `距离边界实体墙过近，车体无法安全原地转向（至少 ${boundaryClearance.toFixed(2)} m）` }];
     }
     const collision = map.objects.find((object) =>
-      Math.abs(waypoint.x - object.x) <= object.width / 2 + radius &&
-      Math.abs(waypoint.y - object.y) <= object.depth / 2 + radius
+      Math.abs(waypoint.x - object.x) <= object.width / 2 + radius + rasterMargin &&
+      Math.abs(waypoint.y - object.y) <= object.depth / 2 + radius + rasterMargin
     );
     if (collision) return [{ waypoint, reason: `进入“${collision.name}”的安全区` }];
     if (map.occupancy && occupancyBlocksCircle(map.occupancy, waypoint.x, waypoint.y, radius)) {
@@ -279,6 +296,26 @@ export function findNearestSafeWaypointPosition(map: PatrolMap, x: number, y: nu
   return null;
 }
 
+export type RouteWaypoint = Waypoint & { yaw: number };
+
+/** Aim each task at the next distinct task, and the final task back at home. */
+export function withRouteHeadings(waypoints: Waypoint[]): RouteWaypoint[] {
+  return waypoints.map((waypoint, index) => {
+    let target: Waypoint | undefined;
+    for (let offset = 1; offset < waypoints.length; offset += 1) {
+      const candidate = waypoints[(index + offset) % waypoints.length];
+      if (Math.hypot(candidate.x - waypoint.x, candidate.y - waypoint.y) > 1e-6) {
+        target = candidate;
+        break;
+      }
+    }
+    const yaw = Number.isFinite(waypoint.yaw)
+      ? Number(waypoint.yaw)
+      : target ? Math.atan2(target.y - waypoint.y, target.x - waypoint.x) : 0;
+    return { ...waypoint, yaw: Number(yaw.toFixed(6)) };
+  });
+}
+
 function safeNumber(value: unknown, fallback: number, min = -10000, max = 10000) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
@@ -301,6 +338,14 @@ function normalizeMap(raw: unknown, fallbackName = "导入地图"): PatrolMap {
     id: safeNumber(item.id, index + 1, 1, 100000),
     name: String(item.name || `巡检点 ${index + 1}`),
     x: safeNumber(item.x, 0), y: safeNumber(item.y, 0), dwell: safeNumber(item.dwell, 3, 0, 3600),
+    ...(Number.isFinite(item.yaw) ? { yaw: safeNumber(item.yaw, 0, -Math.PI, Math.PI) } : {}),
+    ...(item.type === "HOME" || item.type === "TRANSIT" || item.type === "INSPECTION" ? { type: item.type } : {}),
+    ...(Number.isFinite(item.position_tolerance) ? { position_tolerance: safeNumber(item.position_tolerance, 0.08, 0.01, 1) } : {}),
+    ...(Number.isFinite(item.yaw_tolerance) ? { yaw_tolerance: safeNumber(item.yaw_tolerance, 0.10, 0.01, Math.PI) } : {}),
+    ...(Number.isFinite(item.speed_limit) ? { speed_limit: safeNumber(item.speed_limit, 0.15, 0.05, 1.5) } : {}),
+    ...(item.recovery_policy === "standard" || item.recovery_policy === "no_spin" || item.recovery_policy === "restricted" ? { recovery_policy: item.recovery_policy } : {}),
+    ...(typeof item.required_sensor === "string" ? { required_sensor: item.required_sensor } : {}),
+    ...(typeof item.count_as_task === "boolean" ? { count_as_task: item.count_as_task } : {}),
   })) : [];
   return {
     id: `imported-${hashSeed(`${String(input.id || fallbackName)}-${timestamp}`).toString(36)}`,
@@ -407,10 +452,16 @@ export function mapToRobotPayload(map: PatrolMap) {
   return {
     id: map.id,
     name: map.name,
+    description: map.description,
+    source: map.source,
+    route_id: map.id,
+    seed: map.seed,
+    revision: map.updatedAt,
+    createdAt: map.createdAt,
     bounds: map.bounds,
     resolution: map.resolution,
     objects: map.objects,
-    waypoints: map.waypoints,
+    waypoints: withRouteHeadings(map.waypoints),
     occupancy: map.occupancy,
   };
 }

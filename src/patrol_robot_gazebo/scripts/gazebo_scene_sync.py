@@ -41,11 +41,16 @@ class GazeboSceneSync(Node):
     def __init__(self):
         super().__init__('gazebo_scene_sync')
         self.declare_parameter('world_name', 'pipeline_inspection')
+        self.declare_parameter('robot_name', 'patrol_robot')
         self.declare_parameter('scenario_topic', '/patrol/map_scenario')
         self.declare_parameter('service_timeout_ms', 5000)
         self._world = safe_fragment(
             self.get_parameter('world_name').value,
             'pipeline_inspection',
+        )
+        self._robot = safe_fragment(
+            self.get_parameter('robot_name').value,
+            'patrol_robot',
         )
         self._timeout = max(
             1000,
@@ -60,6 +65,11 @@ class GazeboSceneSync(Node):
             String,
             str(self.get_parameter('scenario_topic').value),
             self._on_scenario,
+            10,
+        )
+        self._status_publisher = self.create_publisher(
+            String,
+            '/patrol/map_scenario_status',
             10,
         )
         self._worker = threading.Thread(target=self._run, daemon=True)
@@ -105,6 +115,19 @@ class GazeboSceneSync(Node):
                 self._apply_scene(payload)
             except (OSError, RuntimeError, ValueError) as error:
                 self.get_logger().error(f'Gazebo 场景同步失败：{error}')
+                self._publish_status(payload, False, str(error))
+            else:
+                self._publish_status(payload, True, None)
+
+    def _publish_status(self, payload, ok, error):
+        message = String()
+        message.data = json.dumps({
+            'map_id': str(payload.get('id', '')),
+            'ok': bool(ok),
+            'robot_home_ready': bool(ok),
+            'error': error,
+        }, ensure_ascii=False)
+        self._status_publisher.publish(message)
 
     def _gz_service(self, service, request_type, request):
         command = [
@@ -177,6 +200,51 @@ class GazeboSceneSync(Node):
         if not created:
             raise RuntimeError(f'无法创建场景实体 {name}')
 
+    def _teleport_robot_home(self, payload):
+        waypoints = payload.get('waypoints', [])
+        if not isinstance(waypoints, list) or not waypoints:
+            raise ValueError('地图必须包含作为基地的第一个巡检点')
+        home = waypoints[0]
+        if not isinstance(home, dict):
+            raise ValueError('第一个巡检点格式无效')
+        x = bounded_number(home.get('x'), 0.0, -10000.0, 10000.0)
+        y = bounded_number(home.get('y'), 0.0, -10000.0, 10000.0)
+        if 'yaw' in home:
+            yaw = bounded_number(home.get('yaw'), 0.0, -math.pi, math.pi)
+        else:
+            # Older web clients did not send yaw and always spawned the robot
+            # facing east. Aim at the next distinct task so map activation
+            # does not immediately require a risky in-place turn at home.
+            yaw = 0.0
+            for candidate in waypoints[1:]:
+                if not isinstance(candidate, dict):
+                    continue
+                target_x = bounded_number(candidate.get('x'), x, -10000.0, 10000.0)
+                target_y = bounded_number(candidate.get('y'), y, -10000.0, 10000.0)
+                if math.hypot(target_x - x, target_y - y) > 1e-6:
+                    yaw = math.atan2(target_y - y, target_x - x)
+                    break
+        request = (
+            f'name: "{self._robot}", '
+            f'position {{x: {x:.6f}, y: {y:.6f}, z: 0.020000}}, '
+            'orientation {'
+            f'z: {math.sin(yaw / 2.0):.9f}, '
+            f'w: {math.cos(yaw / 2.0):.9f}'
+            '}'
+        )
+        moved = self._gz_service(
+            f'/world/{self._world}/set_pose',
+            'gz.msgs.Pose',
+            request,
+        )
+        if not moved:
+            raise RuntimeError(
+                f'无法将车辆 {self._robot} 重置到第一个巡检点'
+            )
+        self.get_logger().warning(
+            f'车辆已重置到基地：x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}'
+        )
+
     def _apply_scene(self, payload):
         if not self._legacy_cleared:
             for name in LEGACY_MODELS:
@@ -186,6 +254,11 @@ class GazeboSceneSync(Node):
         for name in tuple(self._owned_names):
             self._remove(name, required=True)
         self._owned_names.clear()
+
+        # Move the stopped robot after old obstacles are gone but before the
+        # new entities are spawned. This avoids a collision impulse at a home
+        # position that happened to be occupied on the previous map.
+        self._teleport_robot_home(payload)
 
         objects = payload.get('objects', [])
         created = []
@@ -224,7 +297,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

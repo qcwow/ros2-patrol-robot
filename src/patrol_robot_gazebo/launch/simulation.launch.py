@@ -11,6 +11,7 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     headless = LaunchConfiguration('headless')
+    ground_truth_odometry = LaunchConfiguration('ground_truth_odometry')
 
     description_share = FindPackageShare('patrol_robot_description')
     gazebo_share = FindPackageShare('patrol_robot_gazebo')
@@ -21,7 +22,10 @@ def generate_launch_description():
     bridge_config = PathJoinSubstitution([gazebo_share, 'config', 'bridge.yaml'])
 
     robot_description = ParameterValue(
-        Command(['xacro ', robot_xacro]),
+        Command([
+            'xacro ', robot_xacro,
+            ' ground_truth_odometry:=', ground_truth_odometry,
+        ]),
         value_type=str,
     )
 
@@ -88,6 +92,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'world_name': 'pipeline_inspection',
+            'robot_name': 'patrol_robot',
             'scenario_topic': '/patrol/map_scenario',
         }],
     )
@@ -95,6 +100,7 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('headless', default_value='false'),
+        DeclareLaunchArgument('ground_truth_odometry', default_value='true'),
         gazebo_gui,
         gazebo_headless,
         state_publisher,

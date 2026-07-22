@@ -19,6 +19,7 @@ source "${ENV_FILE}"
 : "${VM_PORT:=22}"
 : "${VM_WORKSPACE:?请在 .vm.env 中设置 VM_WORKSPACE}"
 : "${VM_DISPLAY:=:0}"
+: "${VM_SSH_KEY:=}"
 
 if [[ ! "${VM_PORT}" =~ ^[0-9]+$ ]]; then
   echo "VM_PORT 必须是数字。"
@@ -33,3 +34,10 @@ fi
 VM_TARGET="${VM_USER}@${VM_HOST}"
 SSH=(ssh -p "${VM_PORT}")
 
+if [[ -n "${VM_SSH_KEY}" ]]; then
+  if [[ ! -r "${VM_SSH_KEY}" ]]; then
+    echo "VM_SSH_KEY 不可读取: ${VM_SSH_KEY}"
+    exit 1
+  fi
+  SSH+=( -i "${VM_SSH_KEY}" -o IdentitiesOnly=yes )
+fi

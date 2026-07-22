@@ -83,7 +83,9 @@ def generate_launch_description():
         'controller_server',
         params_file,
         use_sim_time,
-        tf_remappings + [('cmd_vel', 'cmd_vel_nav')],
+        # Controllers and recovery behaviors share a raw navigation channel.
+        # Only the velocity smoother may publish the final navigation command.
+        tf_remappings + [('cmd_vel', 'cmd_vel_nav_raw')],
     )
     smoother = nav2_node(
         'nav2_smoother',
@@ -91,7 +93,7 @@ def generate_launch_description():
         'smoother_server',
         params_file,
         use_sim_time,
-        tf_remappings,
+        tf_remappings + [('cmd_vel', 'cmd_vel_nav_raw')],
     )
     planner = nav2_node(
         'nav2_planner',
@@ -107,7 +109,10 @@ def generate_launch_description():
         'behavior_server',
         params_file,
         use_sim_time,
-        tf_remappings,
+        # Recovery commands must pass through the same smoother and manual
+        # arbitration path as ordinary controller commands. Nothing except the
+        # web bridge may publish directly to the physical /cmd_vel topic.
+        tf_remappings + [('cmd_vel', 'cmd_vel_nav_raw')],
     )
     bt_navigator = nav2_node(
         'nav2_bt_navigator',
@@ -132,8 +137,8 @@ def generate_launch_description():
         params_file,
         use_sim_time,
         tf_remappings + [
-            ('cmd_vel', 'cmd_vel_nav'),
-            ('cmd_vel_smoothed', 'cmd_vel'),
+            ('cmd_vel', 'cmd_vel_nav_raw'),
+            ('cmd_vel_smoothed', 'cmd_vel_nav'),
         ],
     )
 

@@ -8,6 +8,7 @@ type Props = {
   robotX: number;
   robotY: number;
   robotYaw: number;
+  navigationPath?: XY[];
   zoom: number;
   selected: number;
   onSelect: (id: number) => void;
@@ -15,7 +16,7 @@ type Props = {
 
 type XY = { x: number; y: number };
 
-export function Industrial2DMap({ map, robotX, robotY, robotYaw, zoom, selected, onSelect }: Props) {
+export function Industrial2DMap({ map, robotX, robotY, robotYaw, navigationPath = [], zoom, selected, onSelect }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
   useEffect(() => {
@@ -150,7 +151,15 @@ export function Industrial2DMap({ map, robotX, robotY, robotYaw, zoom, selected,
       });
 
       if (map.waypoints.length > 1) {
-        line(map.waypoints.map((point) => project(point.x, point.y)));
+        line([...map.waypoints, map.waypoints[0]].map((point) => project(point.x, point.y)));
+        context.setLineDash([6, 6]);
+        context.strokeStyle = "#8fa0ac";
+        context.lineWidth = 2;
+        context.stroke();
+        context.setLineDash([]);
+      }
+      if (navigationPath.length > 1) {
+        line(navigationPath.map((point) => project(point.x, point.y)));
         context.strokeStyle = "#ffffff";
         context.lineWidth = 7;
         context.stroke();
@@ -162,7 +171,7 @@ export function Industrial2DMap({ map, robotX, robotY, robotYaw, zoom, selected,
         const point = project(waypoint.x, waypoint.y);
         context.beginPath();
         context.arc(point.x, point.y, waypoint.id === selected ? 12 : 10, 0, Math.PI * 2);
-        context.fillStyle = waypoint.id === selected ? "#e9822b" : "#637b89";
+        context.fillStyle = waypoint.id === selected || index === 0 ? "#e9822b" : "#637b89";
         context.fill();
         context.strokeStyle = "#ffffff";
         context.lineWidth = 3;
@@ -237,7 +246,7 @@ export function Industrial2DMap({ map, robotX, robotY, robotYaw, zoom, selected,
       observer.disconnect();
       canvas.removeEventListener("click", handleClick);
     };
-  }, [map, robotX, robotY, robotYaw, selected, zoom, onSelect]);
+  }, [map, robotX, robotY, robotYaw, navigationPath, selected, zoom, onSelect]);
 
-  return <canvas ref={canvasRef} className="industrial-2d-map" role="img" aria-label={`${map.name} 巡检工程平面图，显示设备、障碍物、巡检路线和车辆实时位置`} />;
+  return <canvas ref={canvasRef} className="industrial-2d-map" role="img" aria-label={`${map.name} 巡检工程平面图，灰色虚线为巡检点顺序，蓝线为 Nav2 当前实际规划路径`} />;
 }

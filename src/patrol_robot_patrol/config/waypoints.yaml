@@ -1,32 +1,61 @@
 frame_id: map
+route_id: pipeline_normal_patrol
 waypoints:
-  - name: 起点东侧
+  - id: home
+    name: 起点东侧
+    type: HOME
     x: -4.8
     y: -3.8
     yaw: 0.0
-    dwell: 2.0
+    dwell: 0.0
+    tolerance: {position: 0.08, yaw: 0.10}
+    speed_limit: 0.15
+    recovery_policy: restricted
 
-  - name: A区管道北侧
+  - id: area_a_inspection
+    name: A区管道北侧
+    type: INSPECTION
     x: -4.6
     y: 3.8
     yaw: 1.57
     dwell: 3.0
+    tolerance: {position: 0.08, yaw: 0.10}
+    speed_limit: 0.15
+    recovery_policy: restricted
+    required_sensor: rgbd
 
-  - name: 控制柜检查点
+  - id: cabinet_inspection
+    name: 控制柜检查点
+    type: INSPECTION
     x: 0.2
     y: 3.2
     yaw: -1.57
     dwell: 3.0
+    tolerance: {position: 0.06, yaw: 0.08}
+    speed_limit: 0.12
+    recovery_policy: restricted
+    required_sensor: rgbd
 
-  - name: B区管道东侧
+  - id: area_b_inspection
+    name: B区管道东侧
+    type: INSPECTION
     x: 4.6
     y: -1.0
     yaw: 3.14
     dwell: 3.0
+    tolerance: {position: 0.08, yaw: 0.10}
+    speed_limit: 0.15
+    recovery_policy: restricted
+    required_sensor: rgbd
 
-  - name: 返回区
+  - id: home_approach
+    name: 基地入口
+    type: TRANSIT
     x: -5.8
     y: -4.0
     yaw: 3.14
-    dwell: 2.0
-
+    dwell: 0.0
+    tolerance: {position: 0.20, yaw: 0.25}
+    speed_limit: 0.25
+    recovery_policy: no_spin
+    count_as_task: false

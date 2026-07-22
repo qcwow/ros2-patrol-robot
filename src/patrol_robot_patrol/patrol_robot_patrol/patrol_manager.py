@@ -1,63 +1,27 @@
 import math
 import json
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional
 
 import rclpy
-import yaml
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped
-from nav2_msgs.action import NavigateThroughPoses
+from nav2_msgs.action import ComputePathToPose, NavigateToPose
+from nav2_msgs.srv import ClearEntireCostmap
+from rcl_interfaces.srv import SetParameters
 from rclpy.action import ActionClient
 from rclpy.node import Node
+from rclpy.parameter import Parameter
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_srvs.srv import Trigger
-from std_msgs.msg import String
+from std_msgs.msg import Bool, Float32, String
 
-
-@dataclass(frozen=True)
-class Waypoint:
-    name: str
-    x: float
-    y: float
-    yaw: float
-    dwell: float
-
-
-def load_waypoints(path: str, default_dwell: float) -> tuple[str, list[Waypoint]]:
-    waypoint_path = Path(path).expanduser()
-    if not waypoint_path.is_file():
-        raise FileNotFoundError(f'巡航点文件不存在: {waypoint_path}')
-
-    with waypoint_path.open('r', encoding='utf-8') as stream:
-        document = yaml.safe_load(stream) or {}
-
-    frame_id = str(document.get('frame_id', 'map'))
-    raw_waypoints = document.get('waypoints')
-    if not isinstance(raw_waypoints, list) or not raw_waypoints:
-        raise ValueError('巡航点文件必须包含非空的 waypoints 列表')
-
-    waypoints = []
-    for index, item in enumerate(raw_waypoints):
-        if not isinstance(item, dict):
-            raise ValueError(f'第 {index + 1} 个巡航点不是对象')
-        try:
-            waypoint = Waypoint(
-                name=str(item.get('name', f'waypoint_{index + 1}')),
-                x=float(item['x']),
-                y=float(item['y']),
-                yaw=float(item.get('yaw', 0.0)),
-                dwell=max(0.0, float(item.get('dwell', default_dwell))),
-            )
-        except (KeyError, TypeError, ValueError) as error:
-            raise ValueError(f'第 {index + 1} 个巡航点格式错误: {error}') from error
-        waypoints.append(waypoint)
-
-    return frame_id, waypoints
+from patrol_robot_patrol.health_recovery_progress import HealthRecoveryProgress
+from patrol_robot_patrol.route_model import PatrolRoute, Waypoint, load_route, parse_route
+from patrol_robot_patrol.task_ledger import PatrolTaskLedger
 
 
 class PatrolManager(Node):
-    """Navigate a complete patrol route with retry and timeout control."""
+    """Execute every waypoint as an individually acknowledged patrol task."""
 
     def __init__(self) -> None:
         super().__init__('patrol_manager')
@@ -69,11 +33,20 @@ class PatrolManager(Node):
         self.declare_parameter('default_dwell_seconds', 2.0)
         self.declare_parameter('start_delay_seconds', 8.0)
         self.declare_parameter('goal_timeout_seconds', 120.0)
-        self.declare_parameter('max_retries', 1)
+        self.declare_parameter('max_retries', 2)
         self.declare_parameter('retry_delay_seconds', 3.0)
-        self.declare_parameter('stop_on_failure', False)
-        self.declare_parameter('action_name', 'navigate_through_poses')
+        self.declare_parameter('lap_restart_delay_seconds', 1.5)
+        self.declare_parameter('action_name', 'navigate_to_pose')
         self.declare_parameter('behavior_tree', '')
+        self.declare_parameter('behavior_tree_no_spin', '')
+        self.declare_parameter('behavior_tree_restricted', '')
+        self.declare_parameter('require_navigation_health', False)
+        self.declare_parameter('enforce_required_sensors', False)
+        self.declare_parameter('health_recovery_timeout_seconds', 8.0)
+        self.declare_parameter('health_recovery_stable_seconds', 1.5)
+        self.declare_parameter('max_health_recoveries', 3)
+        self.declare_parameter('health_recovery_reset_stable_seconds', 5.0)
+        self.declare_parameter('health_recovery_reset_progress_meters', 0.5)
 
         self._loop = self.get_parameter('loop').value
         self._loop_count = max(1, int(self.get_parameter('loop_count').value))
@@ -91,76 +64,347 @@ class PatrolManager(Node):
         self._retry_delay = max(
             0.0, float(self.get_parameter('retry_delay_seconds').value)
         )
-        self._stop_on_failure = self.get_parameter('stop_on_failure').value
+        self._lap_restart_delay = max(
+            0.5,
+            float(self.get_parameter('lap_restart_delay_seconds').value),
+        )
         self._behavior_tree = str(self.get_parameter('behavior_tree').value)
+        self._behavior_trees = {
+            'standard': self._behavior_tree,
+            'no_spin': str(self.get_parameter('behavior_tree_no_spin').value),
+            'restricted': str(
+                self.get_parameter('behavior_tree_restricted').value
+            ),
+        }
+        self._require_navigation_health = bool(
+            self.get_parameter('require_navigation_health').value
+        )
+        self._enforce_required_sensors = bool(
+            self.get_parameter('enforce_required_sensors').value
+        )
+        self._health_recovery_timeout = max(
+            2.0,
+            float(self.get_parameter('health_recovery_timeout_seconds').value),
+        )
+        self._health_recovery_stable = max(
+            0.5,
+            float(self.get_parameter('health_recovery_stable_seconds').value),
+        )
+        self._max_health_recoveries = max(
+            0,
+            int(self.get_parameter('max_health_recoveries').value),
+        )
+        self._health_recovery_reset_stable = max(
+            0.5,
+            float(
+                self.get_parameter(
+                    'health_recovery_reset_stable_seconds'
+                ).value
+            ),
+        )
+        self._health_recovery_reset_progress = max(
+            0.05,
+            float(
+                self.get_parameter(
+                    'health_recovery_reset_progress_meters'
+                ).value
+            ),
+        )
 
         waypoint_file = str(self.get_parameter('waypoint_file').value)
         if not waypoint_file:
             raise ValueError('参数 waypoint_file 不能为空')
-        self._frame_id, self._waypoints = load_waypoints(
-            waypoint_file, self._default_dwell
-        )
+        self._set_route(load_route(waypoint_file, self._default_dwell))
 
         action_name = str(self.get_parameter('action_name').value)
-        self._navigation = ActionClient(self, NavigateThroughPoses, action_name)
+        self._navigation = ActionClient(self, NavigateToPose, action_name)
+        self._path_preflight = ActionClient(
+            self,
+            ComputePathToPose,
+            'compute_path_to_pose',
+        )
+        self._controller_parameters = self.create_client(
+            SetParameters,
+            '/controller_server/set_parameters',
+        )
+        self._costmap_clear_clients = (
+            self.create_client(
+                ClearEntireCostmap,
+                '/local_costmap/clear_entirely_local_costmap',
+            ),
+            self.create_client(
+                ClearEntireCostmap,
+                '/global_costmap/clear_entirely_global_costmap',
+            ),
+        )
         self.create_service(Trigger, '~/start', self._on_start)
         self.create_service(Trigger, '~/stop', self._on_stop)
         self.create_service(Trigger, '~/reset', self._on_reset)
+        self.create_service(Trigger, '~/estop', self._on_estop)
+        self.create_service(Trigger, '~/clear_estop', self._on_clear_estop)
         self.create_subscription(String, '~/set_waypoints', self._on_set_waypoints, 10)
+        self.create_subscription(
+            Bool,
+            '/navigation_health/ready',
+            self._on_navigation_health,
+            10,
+        )
+        self.create_subscription(
+            String,
+            '/navigation_health/status',
+            self._on_navigation_health_status,
+            10,
+        )
         self._status_publisher = self.create_publisher(String, '~/status', 10)
+        selector_qos = QoSProfile(depth=1)
+        selector_qos.reliability = ReliabilityPolicy.RELIABLE
+        selector_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+        self._goal_checker_publisher = self.create_publisher(
+            String,
+            '/goal_checker_selector',
+            selector_qos,
+        )
+        self._speed_limit_publisher = self.create_publisher(
+            Float32,
+            '~/speed_limit',
+            selector_qos,
+        )
 
-        self._index = 0
+        self._route_cursor = 0
+        self._index = self._route.home_index
         self._retry_count = 0
         self._state = 'START_DELAY' if self._autostart else 'PAUSED'
         self._state_deadline = self._now() + self._start_delay
         self._goal_started_at = 0.0
         self._goal_handle = None
         self._goal_token = 0
+        self._policy_generation = 0
+        self._preflight_generation = 0
         self._active_token: Optional[int] = None
         self._cancel_reason: Optional[str] = None
         self._last_feedback_log = 0.0
         self._completed_loops = 0
         self._returning_home = False
-        self._active_route: list[tuple[int, Waypoint, bool]] = []
-        self._active_route_position = -1
+        self._task_ledger = PatrolTaskLedger(
+            len(self._waypoints), self._loop_count, self._route.task_indices
+        )
+        self._dwell_deadline = 0.0
+        self._blocked_reason: Optional[str] = None
+        self._last_failure_status: Optional[int] = None
+        self._navigation_health_ready = not self._require_navigation_health
+        self._navigation_health_reason: Optional[str] = None
+        self._navigation_health_checks: dict[str, bool] = {}
+        self._health_recovery_count = 0
+        self._health_recovery_deadline = 0.0
+        self._health_ready_since: Optional[float] = None
+        self._health_recovery_progress = HealthRecoveryProgress(
+            self._health_recovery_reset_stable,
+            self._health_recovery_reset_progress,
+        )
 
         self.create_timer(0.25, self._tick)
         self.create_timer(0.5, self._publish_status)
         self.get_logger().info(
-            f'已加载 {len(self._waypoints)} 个巡航点，坐标系={self._frame_id}，'
+            f'已加载路线 {self._route.route_id}，共 {len(self._waypoints)} 个点，'
+            f'巡检任务 {len(self._route.task_indices)} 个，坐标系={self._frame_id}，'
             f'自动启动={self._autostart}，循环={self._loop}'
         )
 
+    def _set_route(self, route: PatrolRoute) -> None:
+        self._route = route
+        self._frame_id = route.frame_id
+        self._waypoints = list(route.waypoints)
+
     def _now(self) -> float:
         return self.get_clock().now().nanoseconds / 1_000_000_000.0
+
+    def _ready_state(self) -> str:
+        if self._require_navigation_health and not self._navigation_health_ready:
+            return 'WAITING_HEALTH'
+        if not self._required_sensor_ready(self._waypoints[self._index]):
+            return 'WAITING_SENSOR'
+        return 'WAITING_SERVER'
+
+    def _required_sensor_ready(self, waypoint: Waypoint) -> bool:
+        if not self._enforce_required_sensors:
+            return True
+        sensor = waypoint.required_sensor
+        if sensor == 'none':
+            return True
+        lidar_ok = bool(self._navigation_health_checks.get('scan_ok'))
+        camera_ok = bool(self._navigation_health_checks.get('camera_ok'))
+        if sensor == 'lidar':
+            return lidar_ok
+        if sensor == 'rgbd':
+            return camera_ok
+        return lidar_ok and camera_ok
+
+    def _on_navigation_health_status(self, message: String) -> None:
+        try:
+            status = json.loads(message.data)
+            reason = status.get('reason')
+            self._navigation_health_reason = str(reason) if reason else None
+            checks = status.get('checks')
+            self._navigation_health_checks = (
+                checks if isinstance(checks, dict) else {}
+            )
+            if (
+                not self._navigation_health_ready
+                and self._state in ('BLOCKED', 'HEALTH_RECOVERY')
+                and self._navigation_health_reason
+            ):
+                self._blocked_reason = self._navigation_health_reason
+            if (
+                self._state == 'HEALTH_RECOVERY'
+                and self._health_fault_requires_manual()
+            ):
+                self._block_health_recovery(
+                    self._navigation_health_reason
+                    or '底盘驱动或硬件急停未处于安全状态'
+                )
+            if (
+                self._state == 'WAITING_SENSOR'
+                and self._required_sensor_ready(self._waypoints[self._index])
+            ):
+                self._state = 'WAITING_SERVER'
+                self.get_logger().info('路线点要求的传感器已就绪')
+        except (TypeError, json.JSONDecodeError):
+            self._navigation_health_reason = '导航健康状态格式无效'
+
+    def _on_navigation_health(self, message: Bool) -> None:
+        ready = bool(message.data)
+        self._navigation_health_ready = ready
+        if ready:
+            if self._state == 'HEALTH_RECOVERY':
+                if self._health_ready_since is None:
+                    self._health_ready_since = self._now()
+                    self.get_logger().info(
+                        '导航健康已恢复，正在确认状态持续稳定'
+                    )
+                return
+            if self._state == 'WAITING_HEALTH':
+                self._state = self._ready_state()
+                self.get_logger().info('导航健康检查已通过，允许发送巡检目标')
+            return
+        if not self._require_navigation_health:
+            return
+        if self._state == 'HEALTH_RECOVERY':
+            self._health_ready_since = None
+            return
+        unsafe_states = {
+            'WAITING_SERVER',
+            'SENDING_GOAL',
+            'CONFIGURING_GOAL',
+            'CHECKING_PATH',
+            'NAVIGATING',
+            'DWELL',
+            'RETRY_WAIT',
+        }
+        if self._state in unsafe_states:
+            self._blocked_reason = (
+                self._navigation_health_reason or '导航健康检查未通过'
+            )
+            self.get_logger().error(
+                f'导航健康状态失效：{self._blocked_reason}；正在安全停车'
+            )
+            self._request_cancel('health')
+
+    def _health_fault_requires_manual(self) -> bool:
+        return bool(
+            self._navigation_health_checks.get('base_driver_ok') is False
+            or self._navigation_health_checks.get('estop_released') is False
+        )
+
+    def _block_health_recovery(self, reason: str) -> None:
+        self._health_ready_since = None
+        self._health_recovery_progress.clear()
+        self._blocked_reason = reason
+        self._state = 'BLOCKED'
+        self.get_logger().error(
+            f'导航健康自动恢复终止：{reason}；等待人工确认'
+        )
+
+    def _begin_health_recovery(self) -> None:
+        reason = self._navigation_health_reason or '导航健康检查未通过'
+        self._blocked_reason = reason
+        if self._health_fault_requires_manual():
+            self._block_health_recovery(reason)
+            return
+        if self._health_recovery_count >= self._max_health_recoveries:
+            self._block_health_recovery(
+                f'{reason}；自动恢复已达到 {self._max_health_recoveries} 次上限'
+            )
+            return
+        self._health_recovery_count += 1
+        # Every new health event must prove a fresh stretch of safe motion.
+        # Repeated faults at the same bottleneck therefore remain consecutive,
+        # while faults separated by meaningful healthy travel start a new streak.
+        self._health_recovery_progress.arm()
+        now = self._now()
+        self._health_recovery_deadline = now + self._health_recovery_timeout
+        self._health_ready_since = now if self._navigation_health_ready else None
+        self._state = 'HEALTH_RECOVERY'
+        self._clear_costmaps('导航健康瞬态故障')
+        self.get_logger().warning(
+            f'车辆已安全停车；等待健康状态稳定后自动续行 '
+            f'({self._health_recovery_count}/{self._max_health_recoveries})'
+        )
+
+    def _tick_health_recovery(self, now: float) -> None:
+        if self._health_fault_requires_manual():
+            self._block_health_recovery(
+                self._navigation_health_reason
+                or '底盘驱动或硬件急停未处于安全状态'
+            )
+            return
+        if now >= self._health_recovery_deadline:
+            self._block_health_recovery(
+                f'{self._blocked_reason or "导航健康检查未通过"}；'
+                f'{self._health_recovery_timeout:.1f} 秒内未稳定恢复'
+            )
+            return
+        if not self._navigation_health_ready:
+            self._health_ready_since = None
+            return
+        if self._health_ready_since is None:
+            self._health_ready_since = now
+            return
+        if now - self._health_ready_since < self._health_recovery_stable:
+            return
+        self._blocked_reason = None
+        self._last_failure_status = None
+        self._health_ready_since = None
+        self._state = 'RETRY_WAIT'
+        self._state_deadline = now + min(self._retry_delay, 1.0)
+        self.get_logger().warning(
+            '导航健康已持续稳定，正在自动低速重试当前路线点'
+        )
 
     def _on_set_waypoints(self, message: String) -> None:
         """Replace the active route from a JSON message without restarting."""
         try:
             document = json.loads(message.data)
-            raw_waypoints = document.get('waypoints', [])
-            if not isinstance(raw_waypoints, list) or not raw_waypoints:
-                raise ValueError('waypoints 必须为非空数组')
-            waypoints = []
-            for index, item in enumerate(raw_waypoints):
-                waypoints.append(Waypoint(
-                    name=str(item.get('name', f'waypoint_{index + 1}')),
-                    x=float(item['x']),
-                    y=float(item['y']),
-                    yaw=float(item.get('yaw', 0.0)),
-                    dwell=max(0.0, float(item.get('dwell', self._default_dwell))),
-                ))
+            route = parse_route(document, self._default_dwell)
             self._request_cancel('reset')
-            self._frame_id = str(document.get('frame_id', 'map'))
-            self._waypoints = waypoints
+            self._set_route(route)
             self._loop_count = max(1, min(int(document.get('loop_count', 1)), 1000))
-            self._index = 0
+            self._route_cursor = 0
+            self._index = self._route.home_index
             self._retry_count = 0
+            self._reset_health_recovery_streak()
             self._completed_loops = 0
             self._returning_home = False
+            self._task_ledger = PatrolTaskLedger(
+                len(self._waypoints), self._loop_count, self._route.task_indices
+            )
+            self._dwell_deadline = 0.0
+            self._blocked_reason = None
+            self._last_failure_status = None
             self._state = 'PAUSED'
             self.get_logger().info(
-                f'网页已更新巡检路线，共 {len(waypoints)} 个点，'
+                f'网页已更新语义路线 {route.route_id}，'
+                f'共 {len(route.waypoints)} 个点，'
+                f'{len(route.task_indices)} 个巡检任务，'
                 f'计划 {self._loop_count} 圈'
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
@@ -169,72 +413,313 @@ class PatrolManager(Node):
     def _publish_status(self) -> None:
         message = String()
         current = self._waypoints[self._index] if self._waypoints else None
+        running = self._state not in ('PAUSED', 'BLOCKED', 'ESTOP', 'COMPLETE')
+        tasks = []
+        route_positions = {
+            index: position
+            for position, index in enumerate(self._route.ordered_indices)
+        }
+        for index, waypoint in enumerate(self._waypoints):
+            is_current = index == self._index
+            if is_current and self._state == 'BLOCKED':
+                task_state = 'blocked'
+            elif waypoint.waypoint_type == 'HOME':
+                task_state = 'returning' if self._returning_home and running else 'home'
+            elif is_current and self._state == 'DWELL':
+                task_state = 'dwell'
+            elif is_current and running:
+                task_state = 'active'
+            elif waypoint.count_as_task and self._task_ledger.remaining[index] == 0:
+                task_state = 'complete'
+            elif (
+                not waypoint.count_as_task
+                and route_positions[index] < self._route_cursor
+            ):
+                task_state = 'passed'
+            else:
+                task_state = 'pending'
+            tasks.append({
+                'index': index,
+                'id': waypoint.waypoint_id,
+                'name': waypoint.name,
+                'role': waypoint.role,
+                'type': waypoint.waypoint_type,
+                'count_as_task': waypoint.count_as_task,
+                'remaining_visits': (
+                    self._task_ledger.remaining[index]
+                    if waypoint.count_as_task else None
+                ),
+                'completed_visits': (
+                    self._task_ledger.completed_visits(index)
+                    if waypoint.count_as_task else None
+                ),
+                'position_tolerance': waypoint.position_tolerance,
+                'yaw_tolerance': waypoint.yaw_tolerance,
+                'speed_limit': waypoint.speed_limit,
+                'recovery_policy': waypoint.recovery_policy,
+                'required_sensor': waypoint.required_sensor,
+                'state': task_state,
+            })
         message.data = json.dumps({
+            'route_id': self._route.route_id,
             'state': self._state,
-            'running': self._state not in ('PAUSED', 'COMPLETE'),
+            'running': running,
             'current_index': self._index,
+            'current_waypoint_id': current.waypoint_id if current else None,
             'current_waypoint': current.name if current else None,
+            'current_waypoint_type': current.waypoint_type if current else None,
+            'current_goal': ({
+                'x': current.x,
+                'y': current.y,
+                'yaw': current.yaw,
+            } if current else None),
+            'speed_limit': current.speed_limit if current else None,
+            'position_tolerance': current.position_tolerance if current else None,
+            'yaw_tolerance': current.yaw_tolerance if current else None,
+            'recovery_policy': current.recovery_policy if current else None,
             'waypoint_count': len(self._waypoints),
+            'inspection_task_count': len(self._route.task_indices),
             'loop_count': self._loop_count,
             'completed_loops': self._completed_loops,
+            'current_loop': min(
+                self._loop_count,
+                self._completed_loops + 1,
+            ),
+            'remaining_loops': max(
+                0, self._loop_count - self._completed_loops
+            ),
             'returning_home': self._returning_home,
+            'retry_count': self._retry_count,
+            'max_retries': self._max_retries,
+            'automatic_retry': (
+                (
+                    self._state == 'RETRY_WAIT'
+                    and (
+                        self._retry_count > 0
+                        or self._health_recovery_count > 0
+                    )
+                )
+                or self._state == 'HEALTH_RECOVERY'
+            ),
+            'health_recovery_count': self._health_recovery_count,
+            'max_health_recoveries': self._max_health_recoveries,
+            'health_recovery_reset_pending': (
+                self._health_recovery_count > 0
+                and self._health_recovery_progress.armed
+            ),
+            'health_recovery_safe_progress_meters': round(
+                self._health_recovery_progress.progress_meters,
+                2,
+            ),
+            'health_recovery_safe_seconds': round(
+                self._health_recovery_progress.elapsed_seconds(self._now()),
+                1,
+            ),
+            'health_recovery_reset_progress_meters': (
+                self._health_recovery_reset_progress
+            ),
+            'health_recovery_reset_stable_seconds': (
+                self._health_recovery_reset_stable
+            ),
+            'blocked_reason': self._blocked_reason,
+            'last_failure_status': self._last_failure_status,
+            'navigation_health_ready': self._navigation_health_ready,
+            'navigation_health_reason': self._navigation_health_reason,
+            'required_sensor_ready': (
+                self._required_sensor_ready(current) if current else False
+            ),
+            'waypoint_tasks': tasks,
         }, ensure_ascii=False)
         self._status_publisher.publish(message)
 
     def _tick(self) -> None:
         now = self._now()
 
+        if self._state == 'HEALTH_RECOVERY':
+            self._tick_health_recovery(now)
+            return
+
+        if self._state == 'DWELL':
+            if now >= self._dwell_deadline:
+                self._advance_after_inspection()
+            return
+
         if self._state in ('START_DELAY', 'RETRY_WAIT'):
             if now >= self._state_deadline:
-                self._state = 'WAITING_SERVER'
+                self._state = self._ready_state()
+
+        if self._state == 'WAITING_HEALTH':
+            return
+
+        if self._state == 'WAITING_SENSOR':
+            return
 
         if self._state == 'WAITING_SERVER':
-            if self._navigation.wait_for_server(timeout_sec=0.0):
-                self._send_current_goal()
+            if (
+                self._navigation.wait_for_server(timeout_sec=0.0)
+                and self._path_preflight.wait_for_server(timeout_sec=0.0)
+                and self._controller_parameters.service_is_ready()
+            ):
+                self._check_current_path()
             return
 
         if self._state == 'NAVIGATING':
-            route_timeout = self._goal_timeout * max(1, len(self._active_route))
-            if now - self._goal_started_at >= route_timeout:
+            if now - self._goal_started_at >= self._goal_timeout:
                 waypoint = self._waypoints[self._index]
                 self.get_logger().warning(
                     f'巡航点“{waypoint.name}”导航超时，正在取消目标'
                 )
                 self._request_cancel('timeout')
 
-    def _build_route(self) -> list[tuple[int, Waypoint, bool]]:
-        if len(self._waypoints) == 1:
-            return [(0, self._waypoints[0], False)]
-        if self._returning_home:
-            return [(0, self._waypoints[0], True)]
-        start = min(max(self._index, 0), len(self._waypoints) - 1)
-        route = [
-            (index, self._waypoints[index], False)
-            for index in range(start, len(self._waypoints))
+    def _pose_for_waypoint(self, waypoint: Waypoint) -> PoseStamped:
+        pose = PoseStamped()
+        pose.header.frame_id = self._frame_id
+        pose.header.stamp = self.get_clock().now().to_msg()
+        pose.pose.position.x = waypoint.x
+        pose.pose.position.y = waypoint.y
+        pose.pose.orientation.z = math.sin(waypoint.yaw / 2.0)
+        pose.pose.orientation.w = math.cos(waypoint.yaw / 2.0)
+        return pose
+
+    def _check_current_path(self) -> None:
+        goal = ComputePathToPose.Goal()
+        goal.goal = self._pose_for_waypoint(self._waypoints[self._index])
+        goal.planner_id = 'GridBased'
+        goal.use_start = False
+        self._preflight_generation += 1
+        generation = self._preflight_generation
+        self._state = 'CHECKING_PATH'
+        future = self._path_preflight.send_goal_async(goal)
+        future.add_done_callback(
+            lambda result, token=generation: self._on_preflight_response(
+                result, token
+            )
+        )
+
+    def _on_preflight_response(self, future, generation: int) -> None:
+        if (
+            generation != self._preflight_generation
+            or self._state != 'CHECKING_PATH'
+        ):
+            return
+        try:
+            goal_handle = future.result()
+        except Exception as error:
+            self._block_preflight(f'路径预检请求失败: {error}')
+            return
+        if not goal_handle.accepted:
+            self._block_preflight('规划器拒绝路径预检请求')
+            return
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(
+            lambda result, token=generation: self._on_preflight_result(
+                result, token
+            )
+        )
+
+    def _on_preflight_result(self, future, generation: int) -> None:
+        if (
+            generation != self._preflight_generation
+            or self._state != 'CHECKING_PATH'
+        ):
+            return
+        try:
+            wrapped = future.result()
+            path = wrapped.result.path
+            if wrapped.status != GoalStatus.STATUS_SUCCEEDED or not path.poses:
+                error_code = getattr(wrapped.result, 'error_code', None)
+                self._block_preflight(
+                    f'当前路线点不存在可行路径，错误码={error_code}'
+                )
+                return
+        except Exception as error:
+            self._block_preflight(f'读取路径预检结果失败: {error}')
+            return
+        self._configure_current_goal()
+
+    def _block_preflight(self, reason: str) -> None:
+        waypoint = self._waypoints[self._index]
+        self.get_logger().warning(
+            f'路线点“{waypoint.name}”路径预检失败：{reason}'
+        )
+        self._handle_failure(
+            status=GoalStatus.STATUS_ABORTED,
+            failure_detail=f'路径预检失败：{reason}',
+        )
+
+    def _configure_current_goal(self) -> None:
+        waypoint = self._waypoints[self._index]
+        goal_checker = (
+            'transit_goal_checker'
+            if waypoint.waypoint_type == 'TRANSIT'
+            else 'precise_goal_checker'
+        )
+        request = SetParameters.Request()
+        request.parameters = [
+            Parameter(
+                f'{goal_checker}.xy_goal_tolerance',
+                value=waypoint.position_tolerance,
+            ).to_parameter_msg(),
+            Parameter(
+                f'{goal_checker}.yaw_goal_tolerance',
+                value=waypoint.yaw_tolerance,
+            ).to_parameter_msg(),
         ]
-        # Every route finishes at point 1. On the initial run point 1 is also
-        # the first target, ensuring a map switch always starts from home.
-        route.append((0, self._waypoints[0], True))
-        return route
+        self._policy_generation += 1
+        generation = self._policy_generation
+        self._state = 'CONFIGURING_GOAL'
+        future = self._controller_parameters.call_async(request)
+        future.add_done_callback(
+            lambda result, token=generation: self._on_goal_policy_configured(
+                result, token
+            )
+        )
+
+    def _on_goal_policy_configured(self, future, generation: int) -> None:
+        if (
+            generation != self._policy_generation
+            or self._state != 'CONFIGURING_GOAL'
+        ):
+            return
+        try:
+            response = future.result()
+            failures = [
+                result.reason or '控制器拒绝参数'
+                for result in response.results
+                if not result.successful
+            ]
+        except Exception as error:
+            failures = [str(error)]
+        if failures:
+            self.get_logger().error(
+                '应用逐点导航容差失败: ' + '；'.join(failures)
+            )
+            self._handle_failure()
+            return
+        self._send_current_goal()
 
     def _send_current_goal(self) -> None:
-        self._active_route = self._build_route()
-        self._active_route_position = -1
-        poses = []
-        stamp = self.get_clock().now().to_msg()
-        for _index, waypoint, _returning_home in self._active_route:
-            pose = PoseStamped()
-            pose.header.frame_id = self._frame_id
-            pose.header.stamp = stamp
-            pose.pose.position.x = waypoint.x
-            pose.pose.position.y = waypoint.y
-            pose.pose.orientation.z = math.sin(waypoint.yaw / 2.0)
-            pose.pose.orientation.w = math.cos(waypoint.yaw / 2.0)
-            poses.append(pose)
+        # Submit one pose per action. A closed route whose first and last pose
+        # are identical can otherwise be reported as zero distance before its
+        # intermediate inspection tasks have actually completed.
+        waypoint = self._waypoints[self._index]
+        pose = self._pose_for_waypoint(waypoint)
 
-        goal = NavigateThroughPoses.Goal()
-        goal.poses = poses
-        goal.behavior_tree = self._behavior_tree
+        goal = NavigateToPose.Goal()
+        goal.pose = pose
+        goal.behavior_tree = (
+            self._behavior_trees.get(waypoint.recovery_policy)
+            or self._behavior_tree
+        )
+
+        goal_checker = String()
+        goal_checker.data = (
+            'transit_goal_checker'
+            if waypoint.waypoint_type == 'TRANSIT'
+            else 'precise_goal_checker'
+        )
+        self._goal_checker_publisher.publish(goal_checker)
+        effective_speed = self._publish_current_speed_limit()
 
         self._goal_token += 1
         token = self._goal_token
@@ -244,8 +729,23 @@ class PatrolManager(Node):
         self._goal_started_at = self._now()
         self._state = 'SENDING_GOAL'
 
-        route_names = ' → '.join(target.name for _, target, _ in self._active_route)
-        self.get_logger().info(f'开始连续路线规划：{route_names}')
+        if self._returning_home:
+            description = f'返回基地“{waypoint.name}”'
+        elif waypoint.waypoint_type == 'HOME':
+            description = f'确认基地“{waypoint.name}”'
+        elif waypoint.waypoint_type == 'TRANSIT':
+            description = f'通过路线点“{waypoint.name}”'
+        else:
+            description = (
+                f'执行巡检任务“{waypoint.name}”，剩余 '
+                f'{self._task_ledger.remaining[self._index]} 次'
+            )
+        self.get_logger().info(
+            f'开始单点导航：{description}；限速 {effective_speed:.2f} m/s，'
+            f'容差 {waypoint.position_tolerance:.2f} m / '
+            f'{math.degrees(waypoint.yaw_tolerance):.1f}°，'
+            f'恢复策略 {waypoint.recovery_policy}'
+        )
         future = self._navigation.send_goal_async(
             goal,
             feedback_callback=lambda feedback, goal_token=token:
@@ -294,31 +794,68 @@ class PatrolManager(Node):
         if token != self._active_token or self._state != 'NAVIGATING':
             return
         feedback = feedback_message.feedback
-        remaining = max(
-            0,
-            min(int(feedback.number_of_poses_remaining), len(self._active_route)),
-        )
-        route_position = min(
-            max(len(self._active_route) - remaining, 0),
-            len(self._active_route) - 1,
-        )
-        if self._active_route and route_position != self._active_route_position:
-            self._active_route_position = route_position
-            self._index, target, self._returning_home = self._active_route[route_position]
-            if self._returning_home:
-                self.get_logger().info('本圈路线已通过所有巡检点，正在返回出发点')
-            else:
-                self.get_logger().info(
-                    f'连续路线当前目标：{self._index + 1}/{len(self._waypoints)} '
-                    f'“{target.name}”'
-                )
         now = self._now()
+        self._observe_health_recovery_progress(
+            now,
+            float(feedback.distance_remaining),
+        )
         if now - self._last_feedback_log < 5.0:
             return
         self._last_feedback_log = now
+        waypoint = self._waypoints[self._index]
         self.get_logger().info(
-            f'整段路线剩余约 {feedback.distance_remaining:.2f} m，'
-            f'剩余 {remaining} 个目标'
+            f'当前任务“{waypoint.name}”剩余约 '
+            f'{feedback.distance_remaining:.2f} m'
+        )
+
+    def _effective_speed_limit(self, waypoint: Waypoint) -> float:
+        # Bounded retries become progressively slower so the controller has
+        # more time to regulate curvature and obstacle cost near walls.
+        return max(
+            0.06,
+            waypoint.speed_limit * (
+                0.80 ** (self._retry_count + self._health_recovery_count)
+            ),
+        )
+
+    def _publish_current_speed_limit(self) -> float:
+        effective_speed = self._effective_speed_limit(
+            self._waypoints[self._index]
+        )
+        message = Float32()
+        message.data = effective_speed
+        self._speed_limit_publisher.publish(message)
+        return effective_speed
+
+    def _reset_health_recovery_streak(self) -> None:
+        self._health_recovery_count = 0
+        self._health_recovery_progress.clear()
+
+    def _observe_health_recovery_progress(
+        self,
+        now: float,
+        distance_remaining: float,
+    ) -> None:
+        if self._health_recovery_count <= 0:
+            return
+        qualified = self._health_recovery_progress.observe(
+            now,
+            distance_remaining,
+            self._navigation_health_ready,
+        )
+        if not qualified:
+            return
+
+        safe_distance = self._health_recovery_progress.progress_meters
+        safe_seconds = self._health_recovery_progress.elapsed_seconds(now)
+        previous_count = self._health_recovery_count
+        self._reset_health_recovery_streak()
+        restored_speed = self._publish_current_speed_limit()
+        self.get_logger().info(
+            f'自动恢复后已连续健康行驶 {safe_distance:.2f} m / '
+            f'{safe_seconds:.1f} 秒；连续健康恢复记录 '
+            f'{previous_count}/{self._max_health_recoveries} 已清零，'
+            f'当前路线点限速恢复为 {restored_speed:.2f} m/s'
         )
 
     def _on_result(self, future, token: int) -> None:
@@ -335,24 +872,43 @@ class PatrolManager(Node):
         self._goal_handle = None
         self._active_token = None
         self._cancel_reason = None
-        self._active_route = []
 
         if cancel_reason == 'stop':
+            if self._health_recovery_count > 0:
+                self._health_recovery_progress.arm()
             self._state = 'PAUSED'
             self.get_logger().info('巡航已停止')
             return
         if cancel_reason == 'reset':
-            self._index = 0
+            self._route_cursor = 0
+            self._index = self._route.home_index
             self._retry_count = 0
+            self._reset_health_recovery_streak()
             self._completed_loops = 0
             self._returning_home = False
+            self._task_ledger.reset()
+            self._dwell_deadline = 0.0
+            self._blocked_reason = None
+            self._last_failure_status = None
             self._state = 'PAUSED'
-            self.get_logger().info('巡航已复位到第一个巡航点')
+            self.get_logger().info('巡航已复位到基地')
+            return
+        if cancel_reason == 'health':
+            self._begin_health_recovery()
+            return
+        if cancel_reason == 'estop':
+            self._state = 'ESTOP'
+            self._retry_count = 0
+            self._reset_health_recovery_streak()
+            self.get_logger().error('急停已锁定，普通启动命令不能解除')
             return
 
         if status == GoalStatus.STATUS_SUCCEEDED:
             self._retry_count = 0
-            self._complete_route()
+            self._reset_health_recovery_streak()
+            self._blocked_reason = None
+            self._last_failure_status = None
+            self._complete_current_task()
             return
 
         waypoint = self._waypoints[self._index]
@@ -362,7 +918,7 @@ class PatrolManager(Node):
             self.get_logger().warning(
                 f'巡航点“{waypoint.name}”导航失败，状态码={status}'
             )
-        self._handle_failure()
+        self._handle_failure(status=status, timed_out=cancel_reason == 'timeout')
 
     def _request_cancel(self, reason: str) -> None:
         if self._state == 'CANCELLING':
@@ -377,21 +933,51 @@ class PatrolManager(Node):
             self._finish_local_cancel(reason)
 
     def _finish_local_cancel(self, reason: str) -> None:
+        was_dwelling = self._state == 'DWELL'
+        self._policy_generation += 1
+        self._preflight_generation += 1
         self._goal_handle = None
         self._active_token = None
-        self._active_route = []
         self._cancel_reason = None
         if reason == 'reset':
-            self._index = 0
+            self._route_cursor = 0
+            self._index = self._route.home_index
             self._retry_count = 0
+            self._reset_health_recovery_streak()
             self._completed_loops = 0
             self._returning_home = False
-        self._state = 'PAUSED'
+            self._task_ledger.reset()
+            self._dwell_deadline = 0.0
+            self._blocked_reason = None
+            self._last_failure_status = None
+        elif reason == 'stop' and was_dwelling:
+            # Arrival was already acknowledged and its counter was already
+            # decremented, so resume from the following task after a stop.
+            self._advance_after_inspection()
+        if reason == 'health':
+            self._begin_health_recovery()
+        elif reason == 'estop':
+            self._retry_count = 0
+            self._reset_health_recovery_streak()
+            self._state = 'ESTOP'
+        else:
+            self._state = 'PAUSED'
 
-    def _handle_failure(self) -> None:
+    def _handle_failure(
+        self,
+        status: Optional[int] = None,
+        timed_out: bool = False,
+        failure_detail: Optional[str] = None,
+    ) -> None:
         self._goal_handle = None
         self._active_token = None
-        self._active_route = []
+        self._last_failure_status = status
+        waypoint = self._waypoints[self._index]
+        # Clearing maps never moves the base, so this remains safe even for
+        # restricted HOME/equipment points where reverse and spin are forbidden.
+        self._clear_costmaps('导航失败')
+        if self._health_recovery_count > 0:
+            self._health_recovery_progress.arm()
         if self._retry_count < self._max_retries:
             self._retry_count += 1
             self.get_logger().warning(
@@ -401,94 +987,150 @@ class PatrolManager(Node):
             self._state_deadline = self._now() + self._retry_delay
             return
 
-        self._retry_count = 0
-        if self._stop_on_failure:
-            self._state = 'PAUSED'
-            self.get_logger().error('连续导航失败，已按配置停止巡航')
-        else:
-            self.get_logger().warning('跳过当前巡航点')
-            self._advance_waypoint(arrived=False)
+        failure = failure_detail or (
+            '导航超时' if timed_out else f'导航失败（状态码 {status}）'
+        )
+        self._blocked_reason = f'{waypoint.name}：{failure}'
+        self._state = 'BLOCKED'
+        self.get_logger().error(
+            f'路线点“{waypoint.name}”连续失败 {self._max_retries + 1} 次，'
+            '已进入 BLOCKED 并保持停车；请检查现场后人工确认继续'
+        )
 
-    def _complete_route(self) -> None:
+    def _complete_current_task(self) -> None:
+        waypoint = self._waypoints[self._index]
+        if self._returning_home:
+            self._finish_loop()
+            return
+
+        if waypoint.waypoint_type == 'HOME':
+            self.get_logger().info(f'车辆已位于基地“{waypoint.name}”')
+            if len(self._route.ordered_indices) == 1:
+                self._finish_loop()
+            else:
+                self._route_cursor = 1
+                self._index = self._route.ordered_indices[self._route_cursor]
+                self._state = self._ready_state()
+            return
+
+        if waypoint.count_as_task:
+            remaining = self._task_ledger.complete_inspection(self._index)
+            self.get_logger().info(
+                f'巡检任务“{waypoint.name}”已完成，本项目剩余 {remaining} 次'
+            )
+        else:
+            self.get_logger().info(f'已通过路线过渡点“{waypoint.name}”')
+        if waypoint.dwell > 0.0:
+            self._state = 'DWELL'
+            self._dwell_deadline = self._now() + waypoint.dwell
+            self.get_logger().info(
+                f'在“{waypoint.name}”停留 {waypoint.dwell:.1f} 秒'
+            )
+        else:
+            self._advance_after_inspection()
+
+    def _advance_after_inspection(self) -> None:
+        self._dwell_deadline = 0.0
+        if self._route_cursor + 1 < len(self._route.ordered_indices):
+            self._route_cursor += 1
+            self._index = self._route.ordered_indices[self._route_cursor]
+            self._state = self._ready_state()
+            return
+        self._route_cursor = 0
+        self._index = self._route.home_index
+        self._returning_home = True
+        self._state = self._ready_state()
+        self.get_logger().info('本圈全部巡检任务完成，正在返回基地')
+
+    def _finish_loop(self) -> None:
+        if not self._task_ledger.round_ready(self._completed_loops):
+            self._state = 'PAUSED'
+            self._returning_home = False
+            self.get_logger().error(
+                '已到达基地，但本圈仍有未完成巡检任务；拒绝计入完成圈数'
+            )
+            return
+
         self._completed_loops += 1
-        self._index = 0
+        # A fresh lap must not inherit transient lidar marks from the previous
+        # approach to the home point. Static map obstacles are restored by the
+        # static layer immediately after this clear request.
+        self._clear_costmaps('开始下一圈前')
+        self._route_cursor = 0
+        self._index = self._route.home_index
         self._returning_home = False
         if self._completed_loops >= self._loop_count:
             self._state = 'COMPLETE'
             self.get_logger().info(
-                f'已完成 {self._completed_loops} 圈连续巡检并返回出发点'
+                f'已完成 {self._completed_loops} 圈巡检并返回基地'
             )
             return
-        self._index = 1 if len(self._waypoints) > 1 else 0
-        self._state = 'WAITING_SERVER'
+        if len(self._route.ordered_indices) > 1:
+            self._route_cursor = 1
+            self._index = self._route.ordered_indices[self._route_cursor]
+        # Give the static layer and a fresh laser scan time to repopulate after
+        # clearing; otherwise the next lap may plan against a half-reset map.
+        self._state = 'RETRY_WAIT'
+        self._state_deadline = self._now() + self._lap_restart_delay
         self.get_logger().info(
-            f'第 {self._completed_loops} 圈完成，开始第 '
-            f'{self._completed_loops + 1} 圈连续巡检'
+            f'第 {self._completed_loops} 圈完成，车辆已在基地；'
+            f'{self._lap_restart_delay:.1f} 秒后开始第 '
+            f'{self._completed_loops + 1} 圈'
         )
 
-    def _advance_waypoint(self, arrived: bool) -> None:
-        if self._returning_home:
-            if not arrived:
-                self._state = 'PAUSED'
-                self.get_logger().error('返回出发点失败，巡检已暂停，未计入完成圈数')
-                return
-            self._completed_loops += 1
-            self._returning_home = False
-            if self._completed_loops >= self._loop_count:
-                self._state = 'COMPLETE'
-                self.get_logger().info(
-                    f'已完成 {self._completed_loops} 圈巡检并返回出发点'
-                )
-                return
-            self._index = 1 if len(self._waypoints) > 1 else 0
-            self._state = 'WAITING_SERVER'
+    def _clear_costmaps(self, reason: str) -> None:
+        requested = 0
+        for client in self._costmap_clear_clients:
+            if client.service_is_ready():
+                client.call_async(ClearEntireCostmap.Request())
+                requested += 1
+        if requested:
             self.get_logger().info(
-                f'第 {self._completed_loops} 圈完成，开始第 '
-                f'{self._completed_loops + 1} 圈'
+                f'{reason}：已请求清理 {requested} 个导航代价地图'
             )
-            return
-
-        if len(self._waypoints) == 1:
-            self._completed_loops += 1
-            if self._completed_loops >= self._loop_count:
-                self._state = 'COMPLETE'
-                self.get_logger().info(
-                    f'已完成 {self._completed_loops} 圈巡检并停在出发点'
-                )
-            else:
-                self._state = 'WAITING_SERVER'
-            return
-
-        if self._index + 1 < len(self._waypoints):
-            self._index += 1
-            self._state = 'WAITING_SERVER'
-            return
-
-        # A patrol lap is only complete after physically returning to point 1.
-        self._index = 0
-        self._returning_home = True
-        self._state = 'WAITING_SERVER'
-        self.get_logger().info('末巡检点已完成，正在返回第一个巡检点')
 
     def _on_start(self, _request, response):
-        if self._state not in ('PAUSED', 'COMPLETE'):
+        if self._state not in ('PAUSED', 'BLOCKED', 'COMPLETE'):
             response.success = False
             response.message = f'当前状态为 {self._state}，无需重复启动'
             return response
+        was_blocked = self._state == 'BLOCKED'
         if self._state == 'COMPLETE':
-            self._index = 0
+            self._route_cursor = 0
+            self._index = self._route.home_index
             self._retry_count = 0
+            self._reset_health_recovery_streak()
             self._completed_loops = 0
             self._returning_home = False
-        self._state = 'WAITING_SERVER'
+            self._task_ledger.reset()
+        if was_blocked:
+            self.get_logger().warning(
+                '收到人工确认，重新尝试路线点'
+                f'“{self._waypoints[self._index].name}”'
+            )
+            self._clear_costmaps('人工恢复')
+        self._retry_count = 0
+        self._reset_health_recovery_streak()
+        self._blocked_reason = None
+        self._last_failure_status = None
+        self._state = self._ready_state()
         response.success = True
-        response.message = '巡航已启动'
+        if was_blocked and self._state == 'WAITING_HEALTH':
+            response.message = '已重新检查；导航健康恢复后自动重试当前路线点'
+        elif was_blocked:
+            response.message = '已确认安全，正在清理地图并重试当前路线点'
+        else:
+            response.message = '巡航已启动'
         return response
 
     def _on_stop(self, _request, response):
-        if self._state == 'PAUSED':
+        if self._state in ('PAUSED', 'BLOCKED', 'ESTOP'):
             response.success = True
-            response.message = '巡航已经停止'
+            response.message = (
+                '巡航已经停止'
+                if self._state == 'PAUSED'
+                else '车辆已停车且保持安全锁定'
+            )
             return response
         self._request_cancel('stop')
         response.success = True
@@ -496,9 +1138,37 @@ class PatrolManager(Node):
         return response
 
     def _on_reset(self, _request, response):
+        if self._state == 'ESTOP':
+            response.success = False
+            response.message = '急停锁定中，不能通过任务复位解除'
+            return response
         self._request_cancel('reset')
         response.success = True
         response.message = '正在复位巡航任务'
+        return response
+
+    def _on_estop(self, _request, response):
+        self._blocked_reason = '急停已触发'
+        if self._state != 'ESTOP':
+            self._request_cancel('estop')
+        response.success = True
+        response.message = '急停已触发并锁定'
+        return response
+
+    def _on_clear_estop(self, _request, response):
+        if self._state != 'ESTOP':
+            response.success = False
+            response.message = '当前未处于急停状态'
+            return response
+        if self._require_navigation_health and not self._navigation_health_ready:
+            response.success = False
+            response.message = '导航健康检查未通过，拒绝解除急停'
+            return response
+        self._blocked_reason = None
+        self._last_failure_status = None
+        self._state = 'PAUSED'
+        response.success = True
+        response.message = '急停已解除，巡检仍保持暂停'
         return response
 
 

@@ -16,6 +16,7 @@ type Props = {
   editing?: boolean;
   tool?: MapEditorTool;
   selectedEntity?: string | null;
+  unsafeWaypointIds?: ReadonlySet<number>;
   onSelectEntity?: (selection: string | null) => void;
   onPlace?: (tool: Exclude<MapEditorTool, "select">, x: number, y: number) => void;
   onMoveEntity?: (selection: string, x: number, y: number) => void;
@@ -26,7 +27,7 @@ type XY = { x: number; y: number };
 export function Industrial3DMap({
   map, robotX, robotY, robotYaw, zoom, selected, onSelect,
   editing = false, tool = "select", selectedEntity = null,
-  onSelectEntity, onPlace, onMoveEntity,
+  unsafeWaypointIds, onSelectEntity, onPlace, onMoveEntity,
 }: Props) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const dragStateRef = useRef<{
@@ -203,7 +204,7 @@ export function Industrial3DMap({
       map.objects.slice().sort((a, b) => b.y - a.y).forEach(drawObject);
 
       if (map.waypoints.length > 1) {
-        path(map.waypoints.map((point) => project(point.x, point.y)));
+        path([...map.waypoints, map.waypoints[0]].map((point) => project(point.x, point.y)));
         context.strokeStyle = "#ffffff";
         context.lineWidth = 7;
         context.stroke();
@@ -215,11 +216,21 @@ export function Industrial3DMap({
       map.waypoints.forEach((waypoint, index) => {
         const point = project(waypoint.x, waypoint.y);
         const active = selectedEntity === `waypoint:${waypoint.id}` || (!editing && waypoint.id === selected);
+        const unsafe = unsafeWaypointIds?.has(waypoint.id) ?? false;
+        if (unsafe) {
+          context.beginPath();
+          context.arc(point.x, point.y, active ? 17 : 15, 0, Math.PI * 2);
+          context.fillStyle = "#ff334433";
+          context.fill();
+          context.strokeStyle = "#e32636";
+          context.lineWidth = 3;
+          context.stroke();
+        }
         context.beginPath();
         context.arc(point.x, point.y, active ? 12 : 10, 0, Math.PI * 2);
-        context.fillStyle = active ? "#ff8a24" : "#71899b";
+        context.fillStyle = unsafe ? "#e32636" : active || index === 0 ? "#ff8a24" : "#71899b";
         context.fill();
-        context.strokeStyle = "#ffffff";
+        context.strokeStyle = unsafe ? "#fff1f2" : "#ffffff";
         context.lineWidth = 3;
         context.stroke();
         context.fillStyle = "#ffffff";
@@ -327,7 +338,7 @@ export function Industrial3DMap({
       canvas.removeEventListener("pointercancel", endDrag);
       canvas.removeEventListener("lostpointercapture", endDrag);
     };
-  }, [editing, map, onMoveEntity, onPlace, onSelect, onSelectEntity, robotX, robotY, robotYaw, selected, selectedEntity, tool, zoom]);
+  }, [editing, map, onMoveEntity, onPlace, onSelect, onSelectEntity, robotX, robotY, robotYaw, selected, selectedEntity, tool, unsafeWaypointIds, zoom]);
 
   return <canvas ref={canvasRef} className="industrial-3d-map" role="img" aria-label={`${map.name} 三维地图，显示设备、障碍物、巡检点和车辆位置`} />;
 }

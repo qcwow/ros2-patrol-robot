@@ -1,5 +1,6 @@
 <?xml version="1.0"?>
 <robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="patrol_robot">
+  <xacro:arg name="ground_truth_odometry" default="true"/>
   <!-- 将来适配真机时，优先修改下面这些尺寸和质量。 -->
   <xacro:property name="base_length" value="0.52"/>
   <xacro:property name="base_width" value="0.42"/>
@@ -230,9 +231,6 @@
     <origin xyz="0.036 0 0" rpy="${-pi / 2.0} 0 ${-pi / 2.0}"/>
   </joint>
 
-  <gazebo reference="base_link">
-    <material>Gazebo/Blue</material>
-  </gazebo>
   <gazebo reference="laser_link">
     <sensor name="lidar" type="gpu_lidar">
       <topic>/scan</topic>
@@ -268,16 +266,24 @@
       <gz_frame_id>imu_link</gz_frame_id>
       <update_rate>50</update_rate>
       <always_on>true</always_on>
+      <angular_velocity>
+        <x><noise type="gaussian"><mean>0</mean><stddev>0.002</stddev><bias_mean>0.0002</bias_mean><bias_stddev>0.0001</bias_stddev></noise></x>
+        <y><noise type="gaussian"><mean>0</mean><stddev>0.002</stddev><bias_mean>0.0002</bias_mean><bias_stddev>0.0001</bias_stddev></noise></y>
+        <z><noise type="gaussian"><mean>0</mean><stddev>0.004</stddev><bias_mean>0.0005</bias_mean><bias_stddev>0.0002</bias_stddev></noise></z>
+      </angular_velocity>
+      <linear_acceleration>
+        <x><noise type="gaussian"><mean>0</mean><stddev>0.03</stddev><bias_mean>0.01</bias_mean><bias_stddev>0.005</bias_stddev></noise></x>
+        <y><noise type="gaussian"><mean>0</mean><stddev>0.03</stddev><bias_mean>0.01</bias_mean><bias_stddev>0.005</bias_stddev></noise></y>
+        <z><noise type="gaussian"><mean>0</mean><stddev>0.04</stddev><bias_mean>0.01</bias_mean><bias_stddev>0.005</bias_stddev></noise></z>
+      </linear_acceleration>
     </sensor>
-  </gazebo>
-  <gazebo reference="camera_pan_link">
-    <material>Gazebo/DarkGrey</material>
   </gazebo>
   <gazebo reference="camera_link">
     <sensor name="rgbd_camera" type="rgbd_camera">
       <topic>/camera</topic>
       <gz_frame_id>camera_depth_optical_frame</gz_frame_id>
-      <update_rate>15</update_rate>
+      <!-- 10 Hz 足以支撑室内低速避障，并给 Nav2 控制循环预留 CPU。 -->
+      <update_rate>10</update_rate>
       <always_on>true</always_on>
       <visualize>false</visualize>
       <camera>
@@ -316,20 +322,28 @@
       <max_linear_acceleration>0.8</max_linear_acceleration>
       <max_angular_acceleration>1.8</max_angular_acceleration>
     </plugin>
-    <!--
-      3D 物理仿真会出现轮胎滑移。若用轮速积分发布 odom，物理车体上的
-      laser_link 会逐渐与 TF 中的机器人分离，激光点云便会在地图中形成
-      假墙。OdometryPublisher 直接使用 Gazebo 模型实际位姿，使导航、
-      机器人模型和激光传感器始终处于同一坐标位置。
-    -->
-    <plugin filename="gz-sim-odometry-publisher-system" name="gz::sim::systems::OdometryPublisher">
-      <odom_frame>odom</odom_frame>
-      <robot_base_frame>base_footprint</robot_base_frame>
-      <odom_topic>/odom</odom_topic>
-      <tf_topic>/tf</tf_topic>
-      <odom_publish_frequency>30</odom_publish_frequency>
-      <dimensions>2</dimensions>
-    </plugin>
+    <!-- Keep truth available for comparison, but let the default navigation
+         profile expose wheel slip and IMU drift through an EKF. -->
+    <xacro:if value="$(arg ground_truth_odometry)">
+      <plugin filename="gz-sim-odometry-publisher-system" name="gz::sim::systems::OdometryPublisher">
+        <odom_frame>odom</odom_frame>
+        <robot_base_frame>base_footprint</robot_base_frame>
+        <odom_topic>/odom</odom_topic>
+        <tf_topic>/tf</tf_topic>
+        <odom_publish_frequency>30</odom_publish_frequency>
+        <dimensions>2</dimensions>
+      </plugin>
+    </xacro:if>
+    <xacro:unless value="$(arg ground_truth_odometry)">
+      <plugin filename="gz-sim-odometry-publisher-system" name="gz::sim::systems::OdometryPublisher">
+        <odom_frame>ground_truth_odom</odom_frame>
+        <robot_base_frame>base_footprint</robot_base_frame>
+        <odom_topic>/ground_truth/odom</odom_topic>
+        <tf_topic>/ground_truth/tf</tf_topic>
+        <odom_publish_frequency>30</odom_publish_frequency>
+        <dimensions>2</dimensions>
+      </plugin>
+    </xacro:unless>
     <plugin filename="gz-sim-joint-state-publisher-system" name="gz::sim::systems::JointStatePublisher">
       <topic>/joint_states</topic>
       <joint_name>left_wheel_joint</joint_name>

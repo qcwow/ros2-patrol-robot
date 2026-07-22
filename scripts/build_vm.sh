@@ -39,7 +39,10 @@ echo "正在虚拟机内安装工作空间依赖并编译。"
        exit 1; \
      fi; \
    fi; \
-   rosdep install --from-paths src --ignore-src -r -y && \
+   # ament_python is a colcon build type exported in package.xml, not a
+   # system dependency key in the Jazzy rosdep index. It is already supplied
+   # by the ROS installation, so skip it without hiding real dependency errors.
+   rosdep install --from-paths src --ignore-src --skip-keys ament_python -y && \
    colcon build --symlink-install --event-handlers console_direct+ && \
    test -f install/setup.bash && \
    source install/setup.bash && \

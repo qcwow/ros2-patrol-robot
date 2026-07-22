@@ -1,30 +1,32 @@
 <!--
-  Plan the complete patrol route once and keep following that path. A new plan
-  is computed only after FollowPath fails and the recovery branch is entered.
-  This avoids replacing a valid controller path every three seconds on slower
-  simulation hosts. The controller progress timeout is deliberately short, so
-  a genuinely blocked path reaches this failure-triggered replan promptly.
+  Each inspection point is a separate NavigateToPose task. The path is planned
+  once and followed until completion; replanning only happens after a genuine
+  planner/controller failure enters the recovery branch. This keeps a valid
+  path from being replaced continuously on slower simulation hosts.
 -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="3" name="NavigateRecovery">
+    <RecoveryNode number_of_retries="1" name="NavigateRecovery">
       <Sequence name="NavigateWithStablePath">
         <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
         <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
-        <RecoveryNode number_of_retries="1" name="ComputePathThroughPoses">
-          <ReactiveSequence>
-            <!-- Each action contains one auditable inspection task. Do not
-                 prune it until the robot is inside the configured goal area. -->
-            <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.25"/>
-            <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
-          </ReactiveSequence>
+        <GoalCheckerSelector selected_goal_checker="{selected_goal_checker}" default_goal_checker="precise_goal_checker" topic_name="goal_checker_selector"/>
+        <RecoveryNode number_of_retries="1" name="ComputeAndSmoothPathToPose">
+          <Sequence>
+            <ComputePathToPose goal="{goal}" path="{raw_path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+            <!-- NavFn's grid path contains small stair steps and hard corners.
+                 Smooth once per waypoint, with collision checking, so RPP gets
+                 a continuous CPU-light reference instead of turning at every
+                 grid-cell direction change. -->
+            <SmoothPath unsmoothed_path="{raw_path}" smoothed_path="{path}" smoother_id="simple_smoother" max_smoothing_duration="0.20" check_for_collisions="true"/>
+          </Sequence>
           <Sequence>
             <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
           </Sequence>
         </RecoveryNode>
         <RecoveryNode number_of_retries="1" name="FollowStablePath">
-          <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
+          <FollowPath path="{path}" controller_id="{selected_controller}" goal_checker_id="{selected_goal_checker}" error_code_id="{follow_path_error_code}"/>
           <Sequence>
             <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
             <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
@@ -41,8 +43,8 @@
             <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
             <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
           </Sequence>
-          <Spin spin_dist="1.20" error_code_id="{spin_error_code}"/>
-          <BackUp backup_dist="0.20" backup_speed="0.10" error_code_id="{backup_error_code}"/>
+          <BackUp backup_dist="0.25" backup_speed="0.10" error_code_id="{backup_error_code}"/>
+          <Spin spin_dist="0.60" error_code_id="{spin_error_code}"/>
           <Wait wait_duration="2.0"/>
         </RoundRobin>
       </Sequence>

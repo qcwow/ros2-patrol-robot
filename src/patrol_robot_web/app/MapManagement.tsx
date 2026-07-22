@@ -2,7 +2,7 @@
 
 import { useMemo, useRef, useState } from "react";
 import { Industrial3DMap, type MapEditorTool } from "./Industrial3DMap";
-import { generatePatrolMap, importMapFiles, type PatrolMap, type SceneObject, type Waypoint } from "./mapTypes";
+import { generatePatrolMap, importMapFiles, validatePatrolWaypoints, type PatrolMap, type SceneObject, type Waypoint } from "./mapTypes";
 
 type Props = {
   maps: PatrolMap[];
@@ -10,14 +10,23 @@ type Props = {
   robotX: number;
   robotY: number;
   robotYaw: number;
-  onActivate: (map: PatrolMap) => void;
+  onSelect: (map: PatrolMap) => void;
+  onApply: (map: PatrolMap) => void;
   onChange: (map: PatrolMap) => void;
   onAdd: (maps: PatrolMap[]) => void;
   onDuplicate: (map: PatrolMap) => void;
   onDelete: (id: string) => void;
   onNotice: (message: string) => void;
   connected: boolean;
-  runtimeMap: { active_id: string; active_name: string; transitioning: boolean; localization_ready?: boolean; error?: string | null };
+  hasPendingChanges: boolean;
+  runtimeMap: {
+    active_id: string; active_name: string; active_revision?: string | null;
+    pending_id?: string | null; pending_name?: string | null;
+    source_resolution?: number | null; navigation_resolution?: number | null;
+    pending_navigation_resolution?: number | null; resampled?: boolean;
+    transitioning: boolean; localization_ready?: boolean;
+    error?: string | null; error_map_id?: string | null;
+  };
 };
 
 const sourceLabels = { preset: "预置", generated: "种子", imported: "导入" } as const;
@@ -30,7 +39,8 @@ const toolOptions: Array<{ id: MapEditorTool; icon: string; label: string; help:
 
 export function MapManagement({
   maps, activeMapId, robotX, robotY, robotYaw,
-  onActivate, onChange, onAdd, onDuplicate, onDelete, onNotice, connected, runtimeMap,
+  onSelect, onApply, onChange, onAdd, onDuplicate, onDelete, onNotice,
+  connected, hasPendingChanges, runtimeMap,
 }: Props) {
   const activeMap = maps.find((map) => map.id === activeMapId) ?? maps[0];
   const [tool, setTool] = useState<MapEditorTool>("select");
@@ -51,6 +61,23 @@ export function MapManagement({
     const value = activeMap.waypoints.find((waypoint) => waypoint.id === Number(id));
     return value ? { kind: "waypoint" as const, value } : null;
   }, [activeMap, selectedEntity]);
+
+  const safetyIssues = useMemo(
+    () => activeMap ? validatePatrolWaypoints(activeMap) : [],
+    [activeMap],
+  );
+  const unsafeWaypointIds = useMemo(
+    () => new Set(safetyIssues.map(({ waypoint }) => waypoint.id)),
+    [safetyIssues],
+  );
+  const backendError = runtimeMap.error && runtimeMap.error_map_id === activeMap?.id
+    ? runtimeMap.error
+    : null;
+  const sourceResolution = activeMap.occupancy?.resolution ?? activeMap.resolution;
+  const effectiveNavigationResolution = runtimeMap.active_id === activeMap.id && runtimeMap.navigation_resolution
+    ? runtimeMap.navigation_resolution
+    : Math.min(sourceResolution, 0.1);
+  const resolutionWasRefined = effectiveNavigationResolution < sourceResolution - 0.0001;
 
   if (!activeMap) return null;
 
@@ -178,7 +205,7 @@ export function MapManagement({
           <input ref={fileInput} type="file" accept=".json,.yaml,.yml,.pgm" multiple hidden onChange={(event) => void handleImport(event.target.files)} />
           <button className="secondary-map-action" onClick={() => fileInput.current?.click()} disabled={importing}>{importing ? "正在导入…" : "⇧ 导入地图"}</button>
           <button className="secondary-map-action" onClick={exportMap}>⇩ 导出当前地图</button>
-          <button className="primary-map-action" onClick={() => onActivate(activeMap)} disabled={!connected || runtimeMap.transitioning}>{!connected ? "等待车辆连接" : runtimeMap.transitioning ? runtimeMap.localization_ready === false ? "正在校准车辆定位…" : "正在切换地图…" : runtimeMap.active_id === activeMap.id && !runtimeMap.error ? "✓ 已应用到车辆" : "应用到车辆"}</button>
+          <button className="primary-map-action" onClick={() => onApply(activeMap)} disabled={!connected || runtimeMap.transitioning || safetyIssues.length > 0}>{!connected ? "等待车辆连接" : safetyIssues.length ? `修复 ${safetyIssues.length} 个不安全巡检点后应用` : runtimeMap.transitioning ? runtimeMap.localization_ready === false ? "正在校准车辆定位…" : "正在切换地图…" : runtimeMap.active_id === activeMap.id && !hasPendingChanges && !backendError ? "✓ 已应用到车辆" : runtimeMap.active_id === activeMap.id ? "应用修改到车辆" : "应用到车辆"}</button>
         </div>
       </div>
 
@@ -187,14 +214,23 @@ export function MapManagement({
           <div className="map-library-title"><strong>场景库</strong><span>{maps.length} 张地图</span></div>
           <div className="map-card-list">
             {maps.map((map) => (
-              <button key={map.id} className={`map-card ${map.id === activeMapId ? "active" : ""}`} onClick={() => onActivate(map)}>
-                <span className={`map-card-thumb source-${map.source}`}><i></i><b></b><em></em></span>
-                <span className="map-card-copy">
-                  <span><em>{sourceLabels[map.source]}</em>{map.id === activeMapId && <b>使用中</b>}</span>
-                  <strong>{map.name}</strong>
-                  <small>{map.objects.length} 个实体 · {map.waypoints.length} 个巡检点</small>
-                </span>
-              </button>
+              <div key={map.id} className={`map-card-row ${map.id === activeMapId ? "active" : ""}`}>
+                <button className="map-card" onClick={() => onSelect(map)}>
+                  <span className={`map-card-thumb source-${map.source}`}><i></i><b></b><em></em></span>
+                  <span className="map-card-copy">
+                    <span><em>{sourceLabels[map.source]}</em>{runtimeMap.active_id === map.id && <b>车辆使用中</b>}{runtimeMap.pending_id === map.id && <b>应用中</b>}{map.id === activeMapId && runtimeMap.active_id !== map.id && <b>编辑中</b>}</span>
+                    <strong>{map.name}</strong>
+                    <small>{map.objects.length} 个实体 · {map.waypoints.length} 个巡检点</small>
+                  </span>
+                </button>
+                <button
+                  className="map-card-delete"
+                  aria-label={`删除地图${map.name}`}
+                  title={runtimeMap.active_id === map.id ? "车辆正在使用，不可删除" : "删除地图"}
+                  disabled={maps.length <= 1 || runtimeMap.active_id === map.id}
+                  onClick={() => onDelete(map.id)}
+                >×</button>
+              </div>
             ))}
           </div>
           <div className="seed-generator">
@@ -204,7 +240,7 @@ export function MapManagement({
           </div>
           <div className="map-library-foot">
             <button onClick={() => onDuplicate(activeMap)}>复制</button>
-            <button onClick={() => onDelete(activeMap.id)} disabled={maps.length <= 1}>删除</button>
+            <button onClick={() => onDelete(activeMap.id)} disabled={maps.length <= 1 || runtimeMap.active_id === activeMap.id}>删除</button>
           </div>
         </aside>
 
@@ -212,7 +248,7 @@ export function MapManagement({
           <div className="map-editor-topline">
             <div>
               <input aria-label="地图名称" value={activeMap.name} onChange={(event) => commit({ name: event.target.value })} />
-              <span><i className={runtimeMap.error ? "error" : ""}></i>{runtimeMap.error ? runtimeMap.error : `${sourceLabels[activeMap.source]}地图 · ${activeMap.bounds.width.toFixed(1)} × ${activeMap.bounds.height.toFixed(1)} m · ${activeMap.resolution} m/格`}</span>
+              <span><i className={backendError || safetyIssues.length ? "error" : ""}></i>{backendError ?? (safetyIssues.length ? `请先修复 ${safetyIssues.length} 个标红的不安全巡检点` : `${sourceLabels[activeMap.source]}地图 · ${activeMap.bounds.width.toFixed(1)} × ${activeMap.bounds.height.toFixed(1)} m · ${sourceResolution} m/格${resolutionWasRefined ? ` → Nav2 自动细化为 ${effectiveNavigationResolution.toFixed(2)} m/格` : ""}`)}</span>
             </div>
             <div className="editor-zoom"><button onClick={() => setZoom((value) => Math.max(0.7, value - 0.15))}>−</button><span>{Math.round(zoom * 100)}%</span><button onClick={() => setZoom((value) => Math.min(1.8, value + 0.15))}>＋</button></div>
           </div>
@@ -227,6 +263,7 @@ export function MapManagement({
               editing
               tool={tool}
               selectedEntity={selectedEntity}
+              unsafeWaypointIds={unsafeWaypointIds}
               onSelectEntity={setSelectedEntity}
               onPlace={placeEntity}
               onMoveEntity={moveEntity}
@@ -234,6 +271,24 @@ export function MapManagement({
             <div className="editor-toolbox" role="toolbar" aria-label="地图编辑工具">
               {toolOptions.map((option) => <button key={option.id} className={tool === option.id ? "active" : ""} onClick={() => setTool(option.id)} title={option.help}><i>{option.icon}</i><span>{option.label}</span></button>)}
             </div>
+            {(safetyIssues.length > 0 || backendError) && (
+              <div className="map-safety-alert" role="alert">
+                <strong>⚠ 地图无法应用{Boolean(safetyIssues.length) && `：发现 ${safetyIssues.length} 个不安全巡检点`}</strong>
+                {safetyIssues.length > 0 ? <ul>
+                  {safetyIssues.map(({ waypoint, reason }) => {
+                    const routeIndex = activeMap.waypoints.findIndex((item) => item.id === waypoint.id) + 1;
+                    return (
+                      <li key={waypoint.id}>
+                        <button onClick={() => { setSelectedEntity(`waypoint:${waypoint.id}`); setTool("select"); }}>
+                          <b>#{routeIndex} {waypoint.name}</b>
+                          <span>{reason}</span>
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul> : <p>{backendError}</p>}
+              </div>
+            )}
             <div className="editor-hint">{tool === "select" ? "点选场景元素查看属性，按住并拖动可调整位置" : `在地图空白处点击以添加${toolOptions.find((item) => item.id === tool)?.label}`}</div>
           </div>
         </div>
@@ -257,7 +312,7 @@ export function MapManagement({
               <div className="inspector-pair"><label>X 坐标<input type="number" step={moveStep} value={selection.value.x} onChange={(event) => updateWaypoint({ x: Number(event.target.value) })} /></label><label>Y 坐标<input type="number" step={moveStep} value={selection.value.y} onChange={(event) => updateWaypoint({ y: Number(event.target.value) })} /></label></div>
               {positionNudge}
               <label>到点停留时间<div className="dwell-input"><input type="number" min="0" max="3600" value={selection.value.dwell} onChange={(event) => updateWaypoint({ dwell: Number(event.target.value) })} /><span>秒</span></div></label>
-              <div className="waypoint-callout"><i>⌖</i><p><strong>路线顺序 #{activeMap.waypoints.findIndex((point) => point.id === selection.value.id) + 1}</strong><small>应用地图后会自动同步到巡检任务。</small></p></div>
+              <div className="waypoint-callout"><i>⌖</i><p><strong>{activeMap.waypoints.findIndex((point) => point.id === selection.value.id) === 0 ? "基地点 · 路线顺序 #1" : `巡检任务 · 路线顺序 #${activeMap.waypoints.findIndex((point) => point.id === selection.value.id) + 1}`}</strong><small>{activeMap.waypoints.findIndex((point) => point.id === selection.value.id) === 0 ? "应用地图时车辆会重置到这里；每轮从此出发并返回。" : "每轮成功到达并完成停留后，剩余次数减 1。"}</small></p></div>
             </div>
           ) : (
             <div className="empty-inspector"><span>↖</span><strong>选择一个场景元素</strong><p>可编辑名称、坐标与三维尺寸；也可以从左侧选择或生成另一张地图。</p></div>

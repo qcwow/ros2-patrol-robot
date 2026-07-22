@@ -24,6 +24,8 @@ setup(
     entry_points={
         'console_scripts': [
             'patrol_manager = patrol_robot_patrol.patrol_manager:main',
+            'navigation_health_monitor = patrol_robot_patrol.navigation_health_monitor:main',
+            'navigation_regression_recorder = patrol_robot_patrol.navigation_regression_recorder:main',
         ],
     },
 )

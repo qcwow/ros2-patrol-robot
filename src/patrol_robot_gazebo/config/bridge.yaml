@@ -3,48 +3,104 @@
   ros_type_name: rosgraph_msgs/msg/Clock
   gz_type_name: gz.msgs.Clock
   direction: GZ_TO_ROS
+  # 仿真运行时间较长或 CPU 短时繁忙时，只转发最新时钟。
+  # 旧时钟排队会让后续传感器消息落到 TF 缓存时间范围之外。
+  subscriber_queue: 1
+  publisher_queue: 1
+  qos_profile: CLOCK
 
 - ros_topic_name: /cmd_vel
   gz_topic_name: /cmd_vel
   ros_type_name: geometry_msgs/msg/Twist
   gz_type_name: gz.msgs.Twist
   direction: ROS_TO_GZ
+  # 速度指令不能排队执行，否则车辆恢复后会重放过期控制量。
+  subscriber_queue: 1
+  publisher_queue: 1
 
 - ros_topic_name: /odom
   gz_topic_name: /odom
   ros_type_name: nav_msgs/msg/Odometry
   gz_type_name: gz.msgs.Odometry
   direction: GZ_TO_ROS
+  subscriber_queue: 1
+  publisher_queue: 1
+
+- ros_topic_name: /wheel_odom
+  gz_topic_name: /wheel_odom
+  ros_type_name: nav_msgs/msg/Odometry
+  gz_type_name: gz.msgs.Odometry
+  direction: GZ_TO_ROS
+  subscriber_queue: 1
+  publisher_queue: 1
+
+- ros_topic_name: /ground_truth/odom
+  gz_topic_name: /ground_truth/odom
+  ros_type_name: nav_msgs/msg/Odometry
+  gz_type_name: gz.msgs.Odometry
+  direction: GZ_TO_ROS
+  subscriber_queue: 1
+  publisher_queue: 1
 
 - ros_topic_name: /tf
   gz_topic_name: /tf
   ros_type_name: tf2_msgs/msg/TFMessage
   gz_type_name: gz.msgs.Pose_V
   direction: GZ_TO_ROS
+  subscriber_queue: 1
+  publisher_queue: 1
+
+- ros_topic_name: /wheel_tf
+  gz_topic_name: /wheel_tf
+  ros_type_name: tf2_msgs/msg/TFMessage
+  gz_type_name: gz.msgs.Pose_V
+  direction: GZ_TO_ROS
+  subscriber_queue: 1
+  publisher_queue: 1
+
+- ros_topic_name: /ground_truth/tf
+  gz_topic_name: /ground_truth/tf
+  ros_type_name: tf2_msgs/msg/TFMessage
+  gz_type_name: gz.msgs.Pose_V
+  direction: GZ_TO_ROS
+  subscriber_queue: 1
+  publisher_queue: 1
 
 - ros_topic_name: /scan
   gz_topic_name: /scan
   ros_type_name: sensor_msgs/msg/LaserScan
   gz_type_name: gz.msgs.LaserScan
   direction: GZ_TO_ROS
+  # Nav2 只需要最新一帧扫描。限制两侧队列可避免旧扫描在数秒后
+  # 才进入 costmap，触发 "timestamp earlier than TF cache"。
+  subscriber_queue: 1
+  publisher_queue: 1
+  qos_profile: SENSOR_DATA
 
 - ros_topic_name: /imu
   gz_topic_name: /imu
   ros_type_name: sensor_msgs/msg/Imu
   gz_type_name: gz.msgs.IMU
   direction: GZ_TO_ROS
+  subscriber_queue: 1
+  publisher_queue: 1
+  qos_profile: SENSOR_DATA
 
 - ros_topic_name: /joint_states
   gz_topic_name: /joint_states
   ros_type_name: sensor_msgs/msg/JointState
   gz_type_name: gz.msgs.Model
   direction: GZ_TO_ROS
+  subscriber_queue: 1
+  publisher_queue: 1
 
 - ros_topic_name: /camera/color/image_raw
   gz_topic_name: /camera/image
   ros_type_name: sensor_msgs/msg/Image
   gz_type_name: gz.msgs.Image
   direction: GZ_TO_ROS
+  subscriber_queue: 1
+  publisher_queue: 1
   qos_profile: SENSOR_DATA
   frame_id: camera_depth_optical_frame
 
@@ -53,6 +109,8 @@
   ros_type_name: sensor_msgs/msg/Image
   gz_type_name: gz.msgs.Image
   direction: GZ_TO_ROS
+  subscriber_queue: 1
+  publisher_queue: 1
   qos_profile: SENSOR_DATA
   frame_id: camera_depth_optical_frame
 
@@ -61,6 +119,8 @@
   ros_type_name: sensor_msgs/msg/CameraInfo
   gz_type_name: gz.msgs.CameraInfo
   direction: GZ_TO_ROS
+  subscriber_queue: 1
+  publisher_queue: 1
   qos_profile: SENSOR_DATA
   frame_id: camera_depth_optical_frame
 
@@ -69,9 +129,13 @@
   ros_type_name: std_msgs/msg/Float64
   gz_type_name: gz.msgs.Double
   direction: ROS_TO_GZ
+  subscriber_queue: 1
+  publisher_queue: 1
 
 - ros_topic_name: /camera/gimbal/tilt/command
   gz_topic_name: /camera/gimbal/tilt/command
   ros_type_name: std_msgs/msg/Float64
   gz_type_name: gz.msgs.Double
   direction: ROS_TO_GZ
+  subscriber_queue: 1
+  publisher_queue: 1

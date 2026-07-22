@@ -32,8 +32,35 @@ if ! ros2 pkg prefix ros_gz_sim >/dev/null 2>&1; then
   exit 2
 fi
 
-echo "启动 Gazebo 3D 场景、RGB-D 处理、Nav2、RViz 和自动循环巡检。"
+# `gz sim` starts separate server and GUI processes. On some VMware images the
+# Ruby launcher exits before those children, leaving them to consume CPU after
+# Ctrl+C. Remember pre-existing Gazebo processes and clean up only the ones
+# created by this script.
+GAZEBO_PIDS_BEFORE=" $( (pgrep -f '^gz sim' 2>/dev/null || true) | tr '\n' ' ') "
+cleanup_gazebo_children() {
+  local new_pids=()
+  local pid
+  while read -r pid; do
+    [[ -z "${pid}" ]] && continue
+    case "${GAZEBO_PIDS_BEFORE}" in
+      *" ${pid} "*) ;;
+      *) new_pids+=("${pid}") ;;
+    esac
+  done < <(pgrep -f '^gz sim' 2>/dev/null || true)
+  if ((${#new_pids[@]} == 0)); then
+    return
+  fi
+  kill -TERM "${new_pids[@]}" 2>/dev/null || true
+  sleep 2
+  for pid in "${new_pids[@]}"; do
+    kill -0 "${pid}" 2>/dev/null && kill -KILL "${pid}" 2>/dev/null || true
+  done
+}
+trap cleanup_gazebo_children EXIT
+
+echo "启动 Gazebo 3D 场景、RGB-D 处理、Nav2 和自动循环巡检。"
+echo "为给网页控制台留出资源，默认不启动 RViz；需要时追加 start_rviz:=true。"
 echo "相机彩色点云发布到 /camera/points/filtered；可在网页切换雷达、视觉或融合避障。"
-exec ros2 launch patrol_robot_bringup simulation_navigation.launch.py \
+ros2 launch patrol_robot_bringup simulation_navigation.launch.py \
   patrol_autostart:=true loop:=true use_gazebo:=true \
-  headless:=false start_rviz:=true
+  headless:=false start_rviz:=false "$@"

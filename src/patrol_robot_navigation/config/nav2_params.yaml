@@ -74,16 +74,25 @@ bt_navigator:
 controller_server:
   ros__parameters:
     use_sim_time: true
-    # The RGB-D simulator and Gazebo share CPU with Nav2. Ten control updates
-    # per second are sufficient for a 0.55 m/s indoor robot and remain stable
-    # on virtualized hosts.
+    # Jazzy 的 Gazebo 驱动和 velocity_smoother 使用 geometry_msgs/Twist。
+    # 显式固定类型，避免不同 Nav2 版本默认切换为 TwistStamped 后路线存在但底盘收不到速度。
+    enable_stamped_cmd_vel: false
+    # TurtleBot3 Jazzy also uses 10 Hz. RGB-D is no longer part of the default
+    # base-navigation costmap, so this rate remains responsive without making
+    # point-cloud projection part of the controller's critical path.
     controller_frequency: 10.0
     min_x_velocity_threshold: 0.001
     min_y_velocity_threshold: 0.001
     min_theta_velocity_threshold: 0.001
-    failure_tolerance: 0.3
+    # A single delayed scan or a tight turn must not abort FollowPath in 0.3 s.
+    # Keep publishing a safe zero command briefly, then enter BT recovery if
+    # the collision prediction remains valid.
+    failure_tolerance: 1.5
     progress_checker_plugins: [progress_checker]
-    goal_checker_plugins: [goal_checker]
+    # The patrol manager selects a profile before each NavigateToPose goal.
+    # Transit nodes remain fluid while equipment and home poses use the
+    # tighter profile required for repeatable inspection framing.
+    goal_checker_plugins: [transit_goal_checker, precise_goal_checker]
     controller_plugins: [FollowPath]
     use_realtime_priority: false
 
@@ -91,58 +100,105 @@ controller_server:
       # Count in-place heading correction as real progress. The former simple
       # checker observed translation only and aborted while RPP was rotating.
       plugin: nav2_controller::PoseProgressChecker
-      required_movement_radius: 0.08
-      required_movement_angle: 0.12
-      movement_time_allowance: 30.0
-    goal_checker:
+      # The checker must be finer than the 6-8 cm inspection tolerance;
+      # otherwise legitimate centimetre-scale settling is misclassified as a
+      # stall just before SimpleGoalChecker accepts the pose.
+      required_movement_radius: 0.03
+      required_movement_angle: 0.05
+      # 真正卡住时尽快进入清图和失败后重规划；正常原地转向会由
+      # required_movement_angle 持续刷新进度，不会被误判。
+      movement_time_allowance: 15.0
+    transit_goal_checker:
       stateful: true
       plugin: nav2_controller::SimpleGoalChecker
-      # 预制地图分辨率为 0.5 m；0.18 m 容差会让机器人在栅格边界反复修正。
-      xy_goal_tolerance: 0.30
-      yaw_goal_tolerance: 0.30
+      xy_goal_tolerance: 0.20
+      yaw_goal_tolerance: 0.25
+    precise_goal_checker:
+      stateful: true
+      plugin: nav2_controller::SimpleGoalChecker
+      xy_goal_tolerance: 0.08
+      yaw_goal_tolerance: 0.10
     FollowPath:
-      plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
-      desired_linear_vel: 0.55
-      lookahead_dist: 0.55
-      min_lookahead_dist: 0.28
-      max_lookahead_dist: 0.85
-      lookahead_time: 1.4
-      rotate_to_heading_angular_vel: 0.55
+      # NavFn produces a geometric path whose first heading can differ
+      # greatly from the robot heading. The shim owns that initial rotation
+      # and uses separate engage/disengage thresholds, preventing the raw RPP
+      # controller from alternating left/right around the hand-off angle.
+      plugin: nav2_rotation_shim_controller::RotationShimController
+      primary_controller: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
+      angular_dist_threshold: 0.55
+      # Jazzy 支持独立的退出阈值。原先 0.12 rad 对带延迟的仿真里程计
+      # 过于苛刻，车辆会越过目标角后反向修正，始终无法交还给 RPP。
+      angular_disengage_threshold: 0.20
+      forward_sampling_distance: 0.45
+      rotate_to_heading_angular_vel: 0.32
+      max_angular_accel: 0.8
+      simulate_ahead_time: 0.8
+      rotate_to_goal_heading: true
+      # 旋转加速度使用上一周期命令估算；底层 velocity_smoother 仍负责
+      # 20 Hz 速度斜坡，避免低频/延迟里程计造成正负方向反复追逐。
+      closed_loop: false
+      use_path_orientations: false
+      # 化工设备区优先保证拐角跟踪与制动距离，不追求直线路段峰值速度。
+      desired_linear_vel: 0.32
+      # 前视点不得落在 0.58 m 长的车体内部；同时限制最大前视距离，
+      # 避免在直角弯提前追逐弯后路径并切入内角。
+      lookahead_dist: 0.40
+      min_lookahead_dist: 0.30
+      max_lookahead_dist: 0.45
+      lookahead_time: 1.0
       transform_tolerance: 0.2
       use_velocity_scaled_lookahead_dist: true
-      min_approach_linear_velocity: 0.08
+      # Slow enough to settle inside a 6-8 cm goal window without repeatedly
+      # crossing it. The speed limit topic still caps the overall waypoint
+      # velocity, and the base watchdog remains the final safety boundary.
+      min_approach_linear_velocity: 0.03
       approach_velocity_scaling_dist: 0.65
       use_collision_detection: true
-      max_allowed_time_to_collision_up_to_carrot: 1.2
+      # At 0.32 m/s this checks roughly 0.16 m beyond the current footprint.
+      # A long arc over-reports collisions before valid turns in narrow aisles.
+      max_allowed_time_to_collision_up_to_carrot: 0.50
       use_regulated_linear_velocity_scaling: true
+      # 膨胀区已经收窄并加快衰减，因此重新启用近障减速：窄通道仍可通行，
+      # 但接近设备和墙角时会在碰撞检测介入前先降低线速度。
       use_cost_regulated_linear_velocity_scaling: true
-      regulated_linear_scaling_min_radius: 0.85
-      regulated_linear_scaling_min_speed: 0.12
-      cost_scaling_dist: 0.45
-      cost_scaling_gain: 1.0
-      inflation_cost_scaling_factor: 3.2
+      regulated_linear_scaling_min_radius: 0.75
+      regulated_linear_scaling_min_speed: 0.06
+      cost_scaling_dist: 0.38
+      cost_scaling_gain: 0.75
+      inflation_cost_scaling_factor: 5.0
+      # RotationShim 处理新路径的初始对齐；RPP 还必须处理路径中间的尖角。
+      # 当弯后路径与车头相差较大时先原地对齐，再继续前进，避免用圆弧切内弯。
       use_rotate_to_heading: true
       rotate_to_heading_min_angle: 0.65
-      max_angular_accel: 1.8
       allow_reversing: false
-      max_robot_pose_search_dist: 10.0
+      # Search only the nearby integrated portion of the path. A 10 m search
+      # could select a later segment of a looping route that passed close to
+      # the robot, flipping the desired heading on every control cycle.
+      max_robot_pose_search_dist: 1.5
+      use_interpolation: true
       interpolate_curvature_after_goal: true
 
 local_costmap:
   local_costmap:
     ros__parameters:
       use_sim_time: true
-      update_frequency: 8.0
-      publish_frequency: 4.0
+      # 代价地图不必与控制器同频重算；速度平滑器仍以 20 Hz 连续输出。
+      update_frequency: 6.0
+      publish_frequency: 3.0
       global_frame: odom
       robot_base_frame: base_footprint
       rolling_window: true
-      # 6 m 窗口确保转弯和恢复时仍有足够的全局路径点可供 DWB 评分。
+      # 6 m 窗口确保转弯和恢复时仍有足够路径供 RPP 选择前视点和检查碰撞。
       width: 6
       height: 6
       resolution: 0.05
+      # 给 TF/传感器线程一次短暂调度余量；真正过期的数据仍由消息过滤器丢弃。
+      transform_tolerance: 0.5
       footprint: "[[0.29, 0.23], [0.29, -0.23], [-0.29, -0.23], [-0.29, 0.23]]"
-      plugins: [lidar_obstacle_layer, camera_voxel_layer, inflation_layer]
+      # 轮廓本身已经比 0.52 x 0.42 m 实体底盘宽；再保留 1 cm 动态余量。
+      # 膨胀层只负责路线偏好，不能代替轮廓碰撞检查。
+      footprint_padding: 0.01
+      plugins: [lidar_obstacle_layer, camera_obstacle_layer, inflation_layer]
       lidar_obstacle_layer:
         plugin: nav2_costmap_2d::ObstacleLayer
         enabled: true
@@ -162,16 +218,12 @@ local_costmap:
           raytrace_min_range: 0.08
           obstacle_max_range: 6.0
           obstacle_min_range: 0.08
-      camera_voxel_layer:
-        plugin: nav2_costmap_2d::VoxelLayer
-        enabled: true
+      camera_obstacle_layer:
+        # RGB-D 点云按高度过滤后直接投影到 2D 障碍层，不维护 3D 体素网格。
+        # 这保留视觉避障能力，同时显著减少无显卡工控机的投影和内存开销。
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: false
         footprint_clearing_enabled: true
-        publish_voxel_map: false
-        origin_z: 0.0
-        z_resolution: 0.10
-        z_voxels: 16
-        unknown_threshold: 15
-        mark_threshold: 1
         combination_method: 1
         observation_sources: camera_cloud
         camera_cloud:
@@ -190,99 +242,54 @@ local_costmap:
           obstacle_min_range: 0.25
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
-        cost_scaling_factor: 3.2
-        inflation_radius: 0.48
+        # 车体外接半径约 0.37 m；0.40 m 留下一条较薄的路线偏好带，
+        # 让窄通道更容易通行。较大的 scaling factor 使代价快速衰减。
+        cost_scaling_factor: 5.0
+        inflation_radius: 0.40
       always_send_full_costmap: true
 
 global_costmap:
   global_costmap:
     ros__parameters:
       use_sim_time: true
-      update_frequency: 2.0
-      publish_frequency: 1.0
+      update_frequency: 1.0
+      publish_frequency: 0.5
       global_frame: map
       robot_base_frame: base_footprint
       resolution: 0.05
+      transform_tolerance: 0.5
       footprint: "[[0.29, 0.23], [0.29, -0.23], [-0.29, -0.23], [-0.29, 0.23]]"
+      footprint_padding: 0.01
       track_unknown_space: true
-      plugins: [static_layer, lidar_obstacle_layer, camera_voxel_layer, inflation_layer]
+      # 全局规划只使用已审核的静态地图。实时雷达/相机障碍只进入局部
+      # 代价地图，使车辆在原路减速停车，而不是在化工区自行规划绕行。
+      plugins: [static_layer, inflation_layer]
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
         map_subscribe_transient_local: true
-      lidar_obstacle_layer:
-        plugin: nav2_costmap_2d::ObstacleLayer
-        enabled: true
-        observation_sources: scan
-        scan:
-          topic: /scan
-          max_obstacle_height: 1.5
-          clearing: true
-          marking: true
-          data_type: LaserScan
-          inf_is_valid: true
-          observation_persistence: 0.0
-          expected_update_rate: 0.0
-          raytrace_max_range: 8.0
-          raytrace_min_range: 0.08
-          obstacle_max_range: 6.0
-          obstacle_min_range: 0.08
-      camera_voxel_layer:
-        plugin: nav2_costmap_2d::VoxelLayer
-        # Camera points remain in the local collision map. Keeping thousands
-        # of RGB-D points in the global map caused needless full-route updates;
-        # the 360-degree lidar still marks global dynamic obstacles.
-        enabled: false
-        footprint_clearing_enabled: true
-        publish_voxel_map: false
-        origin_z: 0.0
-        z_resolution: 0.10
-        z_voxels: 16
-        unknown_threshold: 15
-        mark_threshold: 1
-        combination_method: 1
-        observation_sources: camera_cloud
-        camera_cloud:
-          topic: /camera/points/filtered
-          data_type: PointCloud2
-          transport_type: raw
-          min_obstacle_height: 0.05
-          max_obstacle_height: 1.5
-          clearing: true
-          marking: true
-          observation_persistence: 0.0
-          expected_update_rate: 0.0
-          raytrace_max_range: 7.0
-          raytrace_min_range: 0.25
-          obstacle_max_range: 6.0
-          obstacle_min_range: 0.25
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
-        cost_scaling_factor: 3.2
-        inflation_radius: 0.48
+        cost_scaling_factor: 5.0
+        inflation_radius: 0.40
       always_send_full_costmap: true
 
 planner_server:
   ros__parameters:
     use_sim_time: true
-    expected_planner_frequency: 5.0
+    # 此参数只用于规划耗时告警，不控制重规划频率。实际行为树在每个
+    # NavigateToPose 开始时规划一次，只有 FollowPath 失败后才重新规划。
+    expected_planner_frequency: 1.0
     planner_plugins: [GridBased]
     GridBased:
-      plugin: nav2_smac_planner::SmacPlanner2D
-      tolerance: 0.35
-      downsample_costmap: false
-      downsampling_factor: 1
+      # NavFn/Dijkstra 是无运动学约束的轻量 2D 全局规划器；尖角朝向
+      # 由 RotationShim + RPP 处理，不需要高算力轨迹优化器。
+      plugin: nav2_navfn_planner::NavfnPlanner
+      # Do not silently move an inspection goal to a distant free cell. One
+      # map cell is enough for discretization; invalid goals must fail visibly.
+      tolerance: 0.05
+      use_astar: false
       allow_unknown: true
-      max_iterations: 1000000
-      max_on_approach_iterations: 1000
-      max_planning_time: 2.0
-      cost_travel_multiplier: 2.0
       use_final_approach_orientation: false
-      smoother:
-        max_iterations: 1000
-        w_smooth: 0.3
-        w_data: 0.2
-        tolerance: 1.0e-10
-        do_refinement: true
 
 smoother_server:
   ros__parameters:
@@ -297,6 +304,7 @@ smoother_server:
 behavior_server:
   ros__parameters:
     use_sim_time: true
+    enable_stamped_cmd_vel: false
     local_costmap_topic: local_costmap/costmap_raw
     local_footprint_topic: local_costmap/published_footprint
     global_costmap_topic: global_costmap/costmap_raw
@@ -335,13 +343,17 @@ waypoint_follower:
 velocity_smoother:
   ros__parameters:
     use_sim_time: true
+    enable_stamped_cmd_vel: false
     smoothing_frequency: 20.0
     scale_velocities: false
+    # Nav2 and TurtleBot3 use OPEN_LOOP by default. It prevents delayed or
+    # driver-specific odometry signs from feeding back into the command ramp and
+    # suppressing an otherwise valid controller command.
     feedback: OPEN_LOOP
-    max_velocity: [1.5, 0.0, 0.8]
-    min_velocity: [-0.20, 0.0, -0.8]
-    max_accel: [0.8, 0.0, 1.8]
-    max_decel: [-0.8, 0.0, -1.8]
+    max_velocity: [1.5, 0.0, 0.45]
+    min_velocity: [-0.20, 0.0, -0.45]
+    max_accel: [0.8, 0.0, 0.8]
+    max_decel: [-0.8, 0.0, -0.8]
     odom_topic: odom
     odom_duration: 0.1
     deadband_velocity: [0.0, 0.0, 0.0]

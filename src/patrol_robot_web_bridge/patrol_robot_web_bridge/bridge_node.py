@@ -16,7 +16,7 @@ import cv2
 import rclpy
 from cv_bridge import CvBridge, CvBridgeError
 from geometry_msgs.msg import PoseWithCovarianceStamped, TransformStamped, Twist
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import Odometry, Path as NavPath
 from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap, LoadMap
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
@@ -25,9 +25,159 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from sensor_msgs.msg import Image, JointState, LaserScan, PointCloud2
-from std_msgs.msg import Float64, String
+from std_msgs.msg import Float32, Float64, String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
+
+
+WAYPOINT_SAFETY_RADIUS = 0.45
+GAZEBO_BOUNDARY_WALL_INSET = 0.50
+WAYPOINT_BOUNDARY_CLEARANCE = (
+    WAYPOINT_SAFETY_RADIUS + GAZEBO_BOUNDARY_WALL_INSET
+)
+# Keep generated and coarse imported maps at 0.05 m/cell whenever the
+# configured size limit allows it. This matches the packaged vector-generated
+# map and retains enough structure for the 0.58 m x 0.46 m footprint.
+NAVIGATION_GRID_TARGET_RESOLUTION = 0.05
+MAX_NAVIGATION_GRID_DIMENSION = 2000
+MAX_NAVIGATION_PATH_POINTS = 300
+
+
+def _finite_float(value, field):
+    try:
+        number = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f'{field} 不是有效数字') from error
+    if not math.isfinite(number):
+        raise ValueError(f'{field} 不是有限数字')
+    return number
+
+
+def _with_route_headings(document):
+    """Fill missing headings while preserving explicit inspection framing."""
+    waypoints = document.get('waypoints', [])
+    if not isinstance(waypoints, list):
+        raise ValueError('巡检点列表格式无效')
+    if not waypoints:
+        raise ValueError('至少需要一个作为基地的巡检点')
+    normalized = []
+    coordinates = []
+    for index, waypoint in enumerate(waypoints):
+        if not isinstance(waypoint, dict):
+            raise ValueError(f'第 {index + 1} 个巡检点格式无效')
+        coordinates.append((
+            _finite_float(waypoint.get('x'), f'巡检点 {index + 1} x'),
+            _finite_float(waypoint.get('y'), f'巡检点 {index + 1} y'),
+        ))
+    for index, waypoint in enumerate(waypoints):
+        x, y = coordinates[index]
+        if waypoint.get('yaw') is not None:
+            yaw = _finite_float(waypoint.get('yaw'), f'巡检点 {index + 1} yaw')
+        else:
+            yaw = 0.0
+            for offset in range(1, len(waypoints)):
+                target_x, target_y = coordinates[(index + offset) % len(waypoints)]
+                if math.hypot(target_x - x, target_y - y) > 1e-6:
+                    yaw = math.atan2(target_y - y, target_x - x)
+                    break
+        normalized.append({**waypoint, 'x': x, 'y': y, 'yaw': yaw})
+    return {**document, 'waypoints': normalized}
+
+
+def _occupancy_blocks_circle(grid, x, y, radius):
+    origin_x, origin_y, resolution, width, height, occupied = grid
+    min_column = max(0, int(math.floor((x - radius - origin_x) / resolution)))
+    max_column = min(width - 1, int(math.floor((x + radius - origin_x) / resolution)))
+    min_grid_y = max(0, int(math.floor((y - radius - origin_y) / resolution)))
+    max_grid_y = min(height - 1, int(math.floor((y + radius - origin_y) / resolution)))
+    half_cell = resolution * math.sqrt(0.5)
+    for grid_y in range(min_grid_y, max_grid_y + 1):
+        cell_y = origin_y + (grid_y + 0.5) * resolution
+        row = height - 1 - grid_y
+        for column in range(min_column, max_column + 1):
+            if not occupied[row * width + column]:
+                continue
+            cell_x = origin_x + (column + 0.5) * resolution
+            if math.hypot(cell_x - x, cell_y - y) <= radius + half_cell:
+                return True
+    return False
+
+
+def _resample_occupancy(occupied, width, height, source_resolution):
+    """Upsample a coarse image-row occupancy grid without changing its world size."""
+    world_width = width * source_resolution
+    world_height = height * source_resolution
+    target_resolution = max(
+        min(source_resolution, NAVIGATION_GRID_TARGET_RESOLUTION),
+        world_width / MAX_NAVIGATION_GRID_DIMENSION,
+        world_height / MAX_NAVIGATION_GRID_DIMENSION,
+    )
+    if target_resolution >= source_resolution - 1.0e-9:
+        return source_resolution, width, height, occupied
+
+    target_width = max(1, int(math.ceil(world_width / target_resolution - 1.0e-9)))
+    target_height = max(1, int(math.ceil(world_height / target_resolution - 1.0e-9)))
+    resampled = [False] * (target_width * target_height)
+    for target_row in range(target_height):
+        source_row = min(
+            height - 1,
+            int(((target_row + 0.5) * target_resolution) / source_resolution),
+        )
+        source_offset = source_row * width
+        target_offset = target_row * target_width
+        for target_column in range(target_width):
+            source_column = min(
+                width - 1,
+                int(((target_column + 0.5) * target_resolution) / source_resolution),
+            )
+            resampled[target_offset + target_column] = occupied[
+                source_offset + source_column
+            ]
+    return target_resolution, target_width, target_height, resampled
+
+
+def _scenario_waypoint_issues(payload, grid):
+    """Mirror the UI guard so stale or direct API clients cannot bypass it."""
+    bounds = payload.get('bounds') or {}
+    min_x = _finite_float(bounds.get('minX', -8.0), '地图 minX')
+    min_y = _finite_float(bounds.get('minY', -6.0), '地图 minY')
+    max_x = min_x + _finite_float(bounds.get('width', 16.0), '地图 width')
+    max_y = min_y + _finite_float(bounds.get('height', 12.0), '地图 height')
+    objects = payload.get('objects') or []
+    raster_margin = grid[2] * math.sqrt(0.5)
+    issues = []
+    for index, waypoint in enumerate(payload.get('waypoints') or []):
+        x = _finite_float(waypoint.get('x'), f'巡检点 {index + 1} x')
+        y = _finite_float(waypoint.get('y'), f'巡检点 {index + 1} y')
+        name = str(waypoint.get('name') or f'巡检点 {index + 1}')
+        prefix = f'#{index + 1} {name}'
+        if (
+            x < min_x + WAYPOINT_BOUNDARY_CLEARANCE
+            or x > max_x - WAYPOINT_BOUNDARY_CLEARANCE
+            or y < min_y + WAYPOINT_BOUNDARY_CLEARANCE
+            or y > max_y - WAYPOINT_BOUNDARY_CLEARANCE
+        ):
+            issues.append(
+                f'{prefix}：距离边界实体墙不足 '
+                f'{WAYPOINT_BOUNDARY_CLEARANCE:.2f} m，无法安全原地转向'
+            )
+            continue
+        collision = next((item for item in objects if isinstance(item, dict) and (
+            abs(x - _finite_float(item.get('x', 0.0), '场景元素 x'))
+            <= max(0.1, _finite_float(item.get('width', 1.0), '场景元素 width')) / 2.0
+            + WAYPOINT_SAFETY_RADIUS + raster_margin
+            and abs(y - _finite_float(item.get('y', 0.0), '场景元素 y'))
+            <= max(0.1, _finite_float(item.get('depth', 1.0), '场景元素 depth')) / 2.0
+            + WAYPOINT_SAFETY_RADIUS + raster_margin
+        )), None)
+        if collision is not None:
+            issues.append(
+                f'{prefix}：进入“{collision.get("name", "未命名场景元素")}”的安全区'
+            )
+            continue
+        if _occupancy_blocks_circle(grid, x, y, WAYPOINT_SAFETY_RADIUS):
+            issues.append(f'{prefix}：落在栅格障碍物或其旋转安全区内')
+    return issues
 
 
 class RobotWebBridge(Node):
@@ -50,12 +200,16 @@ class RobotWebBridge(Node):
         self.declare_parameter('camera_pan_limit_degrees', 90.0)
         self.declare_parameter('camera_tilt_up_limit_degrees', 25.0)
         self.declare_parameter('camera_tilt_down_limit_degrees', 35.0)
-        self.declare_parameter('perception_initial_mode', 'fusion')
+        self.declare_parameter('perception_initial_mode', 'lidar')
+        self.declare_parameter('camera_cloud_timeout_seconds', 5.0)
+        self.declare_parameter('perception_fault_delay_seconds', 3.0)
+        self.declare_parameter('perception_recovery_stable_seconds', 1.5)
         self.declare_parameter('simulation_origin_x', -6.0)
         self.declare_parameter('simulation_origin_y', -4.0)
         self.declare_parameter('simulation_origin_yaw', 0.0)
         self.declare_parameter('odom_pose_is_world', True)
         self.declare_parameter('ground_truth_localization', False)
+        self.declare_parameter('seed_initial_pose_at_start', False)
 
         self._max_linear = float(self.get_parameter('max_linear_speed').value)
         self._max_angular = float(self.get_parameter('max_angular_speed').value)
@@ -72,7 +226,22 @@ class RobotWebBridge(Node):
             self.get_parameter('ground_truth_localization').value
         )
         self._latest_odom_pose = None
-        self._initial_pose_repeats = 0
+        self._latest_ground_truth_pose = None
+        self._last_ground_truth_pose_update = None
+        self._initial_pose_repeats = (
+            3
+            if bool(self.get_parameter('seed_initial_pose_at_start').value)
+            else 0
+        )
+        self._expected_scene_map_id = None
+        self._pending_map_status = None
+        self._pending_map_route = None
+        self._pending_map_payload = None
+        self._active_map_payload = None
+        self._scene_ready = True
+        self._scene_error = None
+        self._localization_pose_ready = True
+        self._last_map_initial_pose = None
         self._map_storage_dir = Path(
             str(self.get_parameter('map_storage_dir').value)
         ).expanduser()
@@ -101,14 +270,31 @@ class RobotWebBridge(Node):
             5.0,
             min(float(self.get_parameter('camera_tilt_down_limit_degrees').value), 90.0),
         )
+        self._camera_cloud_timeout = max(
+            2.0,
+            float(self.get_parameter('camera_cloud_timeout_seconds').value),
+        )
+        self._perception_fault_delay = max(
+            1.0,
+            float(self.get_parameter('perception_fault_delay_seconds').value),
+        )
+        self._perception_recovery_stable = max(
+            0.5,
+            float(self.get_parameter('perception_recovery_stable_seconds').value),
+        )
         initial_mode = str(self.get_parameter('perception_initial_mode').value)
         self._perception_mode = (
-            initial_mode if initial_mode in ('lidar', 'camera', 'fusion') else 'fusion'
+            initial_mode if initial_mode in ('lidar', 'camera', 'fusion') else 'lidar'
         )
         self._perception_generation = 0
         self._perception_pending = 0
         self._perception_fault_active = False
-        self._perception_started_at = time.monotonic()
+        self._perception_unhealthy_since = None
+        self._perception_healthy_since = None
+        self._perception_hold_active = False
+        self._perception_stopped_patrol = False
+        self._perception_resume_requested = False
+        self._patrol_speed_limit = None
         self._commands = queue.Queue()
         self._lock = threading.Condition()
         self._last_manual_command = 0.0
@@ -134,12 +320,28 @@ class RobotWebBridge(Node):
             'speed': 0.0, 'angular_speed': 0.0, 'x': 0.0, 'y': 0.0,
             'battery': None, 'lidar_ok': False, 'last_scan_age': None,
             'max_linear_speed': self._max_linear,
+            'navigation': {
+                'path': [],
+                'frame_id': 'map',
+                'source': 'none',
+                '_updated_monotonic': None,
+            },
             'map': {
                 'active_id': 'pipeline-demo',
                 'active_name': '管廊综合测试区',
+                'active_revision': None,
+                'pending_id': None,
+                'pending_name': None,
+                'pending_revision': None,
+                'active_payload_available': False,
+                'source_resolution': None,
+                'navigation_resolution': None,
+                'resampled': False,
+                'pending_navigation_resolution': None,
                 'transitioning': False,
                 'localization_ready': True,
                 'error': None,
+                'error_map_id': None,
             },
             'perception': {
                 'mode': self._perception_mode,
@@ -168,7 +370,15 @@ class RobotWebBridge(Node):
             },
         }
 
+        # This node is the only publisher allowed on the physical base topic.
+        # It arbitrates smoothed Nav2 output and high-priority manual commands.
         self._cmd_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.create_subscription(
+            Twist,
+            '/cmd_vel_nav',
+            self._on_navigation_command,
+            10,
+        )
         self._waypoint_publisher = self.create_publisher(
             String,
             '/patrol_manager/set_waypoints',
@@ -185,6 +395,21 @@ class RobotWebBridge(Node):
             10,
         )
         self.create_subscription(Odometry, '/odom', self._on_odom, 10)
+        # Gazebo teleportation does not reset wheel/EKF odometry. The truth
+        # pose is used only to seed AMCL after a simulated map change; it is
+        # never exposed as the continuous navigation odometry source.
+        self.create_subscription(
+            Odometry,
+            '/ground_truth/odom',
+            self._on_ground_truth_odom,
+            qos_profile_sensor_data,
+        )
+        self.create_subscription(
+            NavPath,
+            '/plan_smoothed',
+            self._on_navigation_path,
+            10,
+        )
         self.create_subscription(
             LaserScan,
             '/scan',
@@ -201,6 +426,18 @@ class RobotWebBridge(Node):
             String,
             '/patrol_manager/status',
             self._on_patrol_status,
+            10,
+        )
+        self.create_subscription(
+            Float32,
+            '/patrol_manager/speed_limit',
+            self._on_patrol_speed_limit,
+            10,
+        )
+        self.create_subscription(
+            String,
+            '/patrol/map_scenario_status',
+            self._on_map_scenario_status,
             10,
         )
         self.create_subscription(
@@ -221,7 +458,7 @@ class RobotWebBridge(Node):
         )
         self._patrol_clients = {
             name: self.create_client(Trigger, f'/patrol_manager/{name}')
-            for name in ('start', 'stop', 'reset')
+            for name in ('start', 'stop', 'reset', 'estop', 'clear_estop')
         }
         self._speed_limit_publisher = self.create_publisher(
             SpeedLimit,
@@ -282,7 +519,19 @@ class RobotWebBridge(Node):
         transform.header.stamp = self.get_clock().now().to_msg()
         transform.header.frame_id = 'map'
         transform.child_frame_id = 'odom'
-        transform.transform.rotation.w = 1.0
+        if self._odom_pose_is_world:
+            transform.transform.rotation.w = 1.0
+        else:
+            # The lightweight simulator integrates odometry from (0, 0), but
+            # spawns the robot at simulation_origin in map coordinates.
+            # Publish that fixed map->odom offset so Nav2 sees one consistent
+            # pose instead of alternating between AMCL's initial pose and the
+            # odometry origin.
+            origin_x, origin_y, origin_yaw = self._simulation_origin
+            transform.transform.translation.x = origin_x
+            transform.transform.translation.y = origin_y
+            transform.transform.rotation.z = math.sin(origin_yaw / 2.0)
+            transform.transform.rotation.w = math.cos(origin_yaw / 2.0)
         self._tf_broadcaster.sendTransform(transform)
 
     def _make_handler(self):
@@ -364,6 +613,15 @@ class RobotWebBridge(Node):
                 path = urlparse(self.path).path
                 if path == '/api/status':
                     self._send(200, bridge.status_snapshot())
+                elif path == '/api/maps/active':
+                    active_map = bridge.active_map_payload()
+                    if active_map is None:
+                        self._send(404, {
+                            'ok': False,
+                            'message': '当前地图来自旧版会话，请重新应用一次地图',
+                        })
+                    else:
+                        self._send(200, active_map)
                 elif path == '/api/health':
                     self._send(200, {'ok': True, 'service': 'patrol_robot_web_bridge'})
                 elif path == '/api/camera/stream':
@@ -398,10 +656,17 @@ class RobotWebBridge(Node):
             camera = dict(status.get('camera', {}))
             perception = dict(status.get('perception', {}))
             map_status = dict(status.get('map', {}))
+            navigation = dict(status.get('navigation', {}))
             last_frame = camera.pop('_last_frame', None)
             last_gimbal_state = camera.pop('_last_gimbal_state', None)
             last_camera_cloud = perception.pop('_last_camera_cloud', None)
             frame_times = tuple(self._camera_frame_times)
+        navigation_updated = navigation.pop('_updated_monotonic', None)
+        navigation['path_age'] = (
+            None
+            if navigation_updated is None
+            else round(time.monotonic() - navigation_updated, 2)
+        )
         status['last_scan_age'] = (
             None if last_scan is None else round(time.monotonic() - last_scan, 2)
         )
@@ -439,8 +704,9 @@ class RobotWebBridge(Node):
         perception['lidar_ok'] = status['lidar_ok']
         perception['camera_ok'] = bool(
             perception['last_camera_cloud_age'] is not None
-            and perception['last_camera_cloud_age'] < 1.5
+            and perception['last_camera_cloud_age'] < self._camera_cloud_timeout
         )
+        perception['camera_cloud_timeout'] = self._camera_cloud_timeout
         perception['active_sources'] = [
             source
             for source, enabled, healthy in (
@@ -461,8 +727,14 @@ class RobotWebBridge(Node):
             perception['safety_ok'] = False
         status['camera'] = camera
         status['perception'] = perception
+        status['navigation'] = navigation
         status['map'] = map_status
         return status
+
+    def active_map_payload(self):
+        with self._lock:
+            payload = self._active_map_payload
+            return None if payload is None else json.loads(json.dumps(payload))
 
     def camera_enabled(self):
         with self._lock:
@@ -501,6 +773,72 @@ class RobotWebBridge(Node):
                 'odom_y': round(message.pose.pose.position.y, 3),
             })
 
+    def _on_ground_truth_odom(self, message):
+        orientation = message.pose.pose.orientation
+        yaw = math.atan2(
+            2.0 * (orientation.w * orientation.z + orientation.x * orientation.y),
+            1.0 - 2.0 * (orientation.y * orientation.y + orientation.z * orientation.z),
+        )
+        with self._lock:
+            self._latest_ground_truth_pose = (
+                float(message.pose.pose.position.x),
+                float(message.pose.pose.position.y),
+                yaw,
+            )
+            self._last_ground_truth_pose_update = time.monotonic()
+
+    def _on_navigation_path(self, message):
+        poses = message.poses
+        if not poses:
+            return
+        stride = max(1, int(math.ceil(len(poses) / MAX_NAVIGATION_PATH_POINTS)))
+        selected = list(poses[::stride])
+        if selected[-1] is not poses[-1]:
+            selected.append(poses[-1])
+        points = [
+            {
+                'x': round(float(pose.pose.position.x), 3),
+                'y': round(float(pose.pose.position.y), 3),
+            }
+            for pose in selected
+        ]
+        with self._lock:
+            self._status['navigation'] = {
+                'path': points,
+                'frame_id': message.header.frame_id or 'map',
+                'source': 'plan_smoothed',
+                '_updated_monotonic': time.monotonic(),
+            }
+
+    def _clear_navigation_path(self):
+        with self._lock:
+            self._status['navigation'] = {
+                'path': [],
+                'frame_id': 'map',
+                'source': 'none',
+                '_updated_monotonic': None,
+            }
+
+    def _on_navigation_command(self, message):
+        """Relay smoothed Nav2 velocity only when manual control is released."""
+        if self._manual_override:
+            return
+        self._publish_base_command(message)
+
+    def _publish_base_command(self, command):
+        """Publish one REP-103 command through the single physical-base output."""
+        output = Twist()
+        output.linear.x = command.linear.x
+        output.linear.y = command.linear.y
+        output.linear.z = command.linear.z
+        output.angular.x = command.angular.x
+        output.angular.y = command.angular.y
+        # Gazebo DiffDrive already defines positive angular.z as counter-clockwise
+        # (left). Inverting it here makes both manual steering and Nav2 rotate
+        # away from their requested heading.
+        output.angular.z = command.angular.z
+        self._cmd_publisher.publish(output)
+
     def _update_map_pose(self):
         try:
             transform = self._tf_buffer.lookup_transform('map', 'base_footprint', Time())
@@ -531,8 +869,36 @@ class RobotWebBridge(Node):
             patrol = json.loads(message.data)
             with self._lock:
                 self._status['patrol'] = patrol
+                if not bool(patrol.get('running')):
+                    self._patrol_speed_limit = None
+            self._publish_speed_limit()
         except json.JSONDecodeError:
             pass
+
+    def _on_patrol_speed_limit(self, message):
+        limit = float(message.data)
+        if not math.isfinite(limit) or limit <= 0.0:
+            return
+        self._patrol_speed_limit = max(0.05, min(limit, 1.5))
+        self._publish_speed_limit()
+
+    def _on_map_scenario_status(self, message):
+        try:
+            status = json.loads(message.data)
+        except json.JSONDecodeError:
+            return
+        if str(status.get('map_id', '')) != self._expected_scene_map_id:
+            return
+        ok = bool(status.get('ok')) and bool(status.get('robot_home_ready'))
+        self._scene_ready = ok
+        self._scene_error = None if ok else str(
+            status.get('error') or 'Gazebo 场景或车辆基地重置失败'
+        )
+        if self._scene_error:
+            self._abort_map_transition(self._scene_error)
+            self.get_logger().error(self._scene_error)
+            return
+        self._finish_map_transition_if_ready()
 
     def _on_joint_state(self, message):
         positions = dict(zip(message.name, message.position))
@@ -559,12 +925,72 @@ class RobotWebBridge(Node):
             if path.startswith('/api/patrol/'):
                 action = path.rsplit('/', 1)[-1]
                 client = self._patrol_clients.get(action)
-                if client and client.service_is_ready():
+                if client and not client.service_is_ready():
+                    # Do not silently lose Start/Stop while patrol_manager is
+                    # restarting or completing an action cancellation. Keep
+                    # the command ordered at the back of the queue and retry
+                    # it on the next timer tick.
+                    self._commands.put((path, payload))
+                    return
+                if client:
+                    if action == 'start':
+                        perception = self.status_snapshot()['perception']
+                        if (
+                            perception.get('transitioning')
+                            or not perception.get('safety_ok')
+                        ):
+                            self.get_logger().warning(
+                                '感知数据尚未稳定，拒绝启动巡检'
+                            )
+                            continue
+                        if self._manual_override:
+                            self.get_logger().info(
+                                '人工控制已释放，自动导航重新取得底盘控制权'
+                            )
+                        self._perception_hold_active = False
+                        self._perception_stopped_patrol = False
+                        self._perception_resume_requested = False
+                        self._manual_override = False
+                    elif action in ('stop', 'reset'):
+                        # An explicit user stop always wins over automatic
+                        # recovery and must never be followed by an auto-resume.
+                        self._perception_hold_active = False
+                        self._perception_stopped_patrol = False
+                        self._perception_resume_requested = False
+                        # Keep late navigation commands blocked while the
+                        # asynchronous action cancellation is completing.
+                        self._publish_manual(0.0, 0.0)
+                        self._clear_navigation_path()
                     client.call_async(Trigger.Request())
             elif path == '/api/navigation/waypoints':
-                message = String()
-                message.data = json.dumps(payload, ensure_ascii=False)
-                self._waypoint_publisher.publish(message)
+                try:
+                    route = _with_route_headings(payload)
+                except ValueError as error:
+                    self.get_logger().error(f'拒绝无效巡检路线：{error}')
+                else:
+                    with self._lock:
+                        active_map_id = self._status['map'].get('active_id')
+                        active_revision = self._status['map'].get('active_revision')
+                    route_map_id = str(route.get('map_id', '')).strip()
+                    route_revision = str(route.get('map_revision', '')).strip() or None
+                    if route_map_id and route_map_id != active_map_id:
+                        self.get_logger().error(
+                            f'拒绝巡检路线：路线属于 {route_map_id}，'
+                            f'车辆当前地图为 {active_map_id}'
+                        )
+                        continue
+                    if (
+                        route_revision
+                        and active_revision
+                        and route_revision != active_revision
+                    ):
+                        self.get_logger().error(
+                            '拒绝巡检路线：路线版本与车辆当前地图不一致'
+                        )
+                        continue
+                    message = String()
+                    message.data = json.dumps(route, ensure_ascii=False)
+                    self._waypoint_publisher.publish(message)
             elif path == '/api/maps/activate':
                 self._activate_map(payload)
             elif path == '/api/config/speed':
@@ -578,10 +1004,21 @@ class RobotWebBridge(Node):
                     float(payload.get('angular', 0.0)),
                 )
             elif path == '/api/control/emergency-stop':
+                self._perception_hold_active = False
+                self._perception_stopped_patrol = False
+                self._perception_resume_requested = False
                 self._publish_manual(0.0, 0.0)
-                client = self._patrol_clients['stop']
-                if client.service_is_ready():
-                    client.call_async(Trigger.Request())
+                client = self._patrol_clients['estop']
+                if not client.service_is_ready():
+                    self._commands.put((path, payload))
+                    return
+                client.call_async(Trigger.Request())
+            elif path == '/api/control/emergency-reset':
+                client = self._patrol_clients['clear_estop']
+                if not client.service_is_ready():
+                    self._commands.put((path, payload))
+                    return
+                client.call_async(Trigger.Request())
             elif path == '/api/camera/enable':
                 self._set_camera_enabled(bool(payload.get('enabled', False)))
             elif path == '/api/camera/gimbal':
@@ -623,19 +1060,38 @@ class RobotWebBridge(Node):
                 bool((packed[index >> 3] >> (index & 7)) & 1)
                 for index in range(width * height)
             ]
+            resolution, width, height, occupied = _resample_occupancy(
+                occupied,
+                width,
+                height,
+                resolution,
+            )
         else:
             resolution = max(
-                requested_resolution,
-                world_width / 800.0,
-                world_height / 800.0,
+                min(requested_resolution, NAVIGATION_GRID_TARGET_RESOLUTION),
+                world_width / MAX_NAVIGATION_GRID_DIMENSION,
+                world_height / MAX_NAVIGATION_GRID_DIMENSION,
             )
             width = max(2, int(math.ceil(world_width / resolution)))
             height = max(2, int(math.ceil(world_height / resolution)))
             occupied = [False] * (width * height)
-            for row in range(height):
-                for column in range(width):
-                    if row in (0, height - 1) or column in (0, width - 1):
-                        occupied[row * width + column] = True
+
+        # The Gazebo perimeter walls extend 0.50 m inward from map bounds.
+        # Mark the same thickness in Nav2 instead of a single grid cell, or
+        # the global planner can legally create a path through physical wall.
+        perimeter_cells = max(
+            1,
+            int(math.ceil(GAZEBO_BOUNDARY_WALL_INSET / resolution)),
+        )
+        for row in range(height):
+            for column in range(width):
+                if (
+                    row < perimeter_cells
+                    or row >= height - perimeter_cells
+                    or column < perimeter_cells
+                    or column >= width - perimeter_cells
+                ):
+                    occupied[row * width + column] = True
 
         objects = payload.get('objects') or []
         if not isinstance(objects, list) or len(objects) > 500:
@@ -666,10 +1122,19 @@ class RobotWebBridge(Node):
 
         return origin_x, origin_y, resolution, width, height, occupied
 
-    def _write_scenario_map(self, payload):
+    def _validated_scenario_grid(self, payload):
+        grid = self._scenario_grid(payload)
+        waypoint_issues = _scenario_waypoint_issues(payload, grid)
+        if waypoint_issues:
+            raise ValueError('不安全巡检点：' + '；'.join(waypoint_issues))
+        return grid
+
+    def _write_scenario_map(self, payload, grid=None):
+        if grid is None:
+            grid = self._validated_scenario_grid(payload)
         (
             origin_x, origin_y, resolution, width, height, occupied,
-        ) = self._scenario_grid(payload)
+        ) = grid
         self._map_storage_dir.mkdir(parents=True, exist_ok=True)
         safe_id = re.sub(
             r'[^A-Za-z0-9_.-]+',
@@ -706,46 +1171,94 @@ class RobotWebBridge(Node):
     def _activate_map(self, payload):
         map_id = str(payload.get('id', '')).strip()
         map_name = str(payload.get('name', '')).strip()
+        map_revision = str(payload.get('revision', '')).strip() or None
         if not map_id or not map_name:
             with self._lock:
                 self._status['map'].update({
                     'transitioning': False,
                     'error': '地图 ID 或名称不能为空',
+                    'error_map_id': map_id or None,
                 })
             return
 
+        with self._lock:
+            if self._status['map'].get('transitioning'):
+                self.get_logger().warning('当前地图尚未完成切换，已忽略新的应用请求')
+                return
+
+        # Reject stale/direct API clients before stopping the current patrol or
+        # changing the active-map status. The UI performs the same validation.
+        try:
+            payload = _with_route_headings(payload)
+            scenario_grid = self._validated_scenario_grid(payload)
+            loop_count = max(1, min(1000, int(payload.get('loop_count', 1))))
+        except (ValueError, TypeError, binascii.Error) as error:
+            with self._lock:
+                self._status['map'].update({
+                    'transitioning': False,
+                    'localization_ready': True,
+                    'error': f'地图数据无效：{error}',
+                    'error_map_id': map_id,
+                })
+            self.get_logger().error(f'拒绝应用地图“{map_name}”：{error}')
+            return
+
+        occupancy = payload.get('occupancy') or {}
+        source_resolution = float(
+            occupancy.get('resolution', payload.get('resolution', 0.25))
+        )
+        navigation_resolution = float(scenario_grid[2])
+        was_resampled = navigation_resolution < source_resolution - 1.0e-9
+
         self._publish_manual(0.0, 0.0)
+        self._clear_navigation_path()
         stop_client = self._patrol_clients['stop']
         if stop_client.service_is_ready():
             stop_client.call_async(Trigger.Request())
+        self._expected_scene_map_id = map_id
+        self._scene_ready = False
+        self._scene_error = None
+        self._localization_pose_ready = False
+        self._last_map_initial_pose = None
+        self._pending_map_status = {
+            'id': map_id,
+            'name': map_name,
+            'revision': map_revision,
+            'source_resolution': source_resolution,
+            'navigation_resolution': navigation_resolution,
+            'resampled': was_resampled,
+        }
+        self._pending_map_route = {
+            'frame_id': str(payload.get('frame_id', 'map')),
+            'loop_count': loop_count,
+            'map_id': map_id,
+            'map_revision': map_revision,
+            'waypoints': payload['waypoints'],
+        }
+        self._pending_map_payload = payload
         with self._lock:
             self._status['map'].update({
-                'active_id': map_id,
-                'active_name': map_name,
+                'pending_id': map_id,
+                'pending_name': map_name,
+                'pending_revision': map_revision,
+                'pending_navigation_resolution': navigation_resolution,
                 'transitioning': True,
                 'localization_ready': False,
                 'error': None,
+                'error_map_id': None,
             })
 
         try:
-            yaml_path = self._write_scenario_map(payload)
+            yaml_path = self._write_scenario_map(payload, scenario_grid)
             scenario_message = String()
             scenario_message.data = json.dumps(payload, ensure_ascii=False)
             self._map_scenario_publisher.publish(scenario_message)
         except (ValueError, TypeError, OSError, binascii.Error) as error:
-            with self._lock:
-                self._status['map'].update({
-                    'transitioning': False,
-                    'error': f'地图数据无效：{error}',
-                })
+            self._abort_map_transition(f'地图数据无效：{error}')
             return
 
         if not self._map_load_client.service_is_ready():
-            with self._lock:
-                self._status['map'].update({
-                    'transitioning': False,
-                    'error': '地图已保存，但 Nav2 地图服务尚未就绪',
-                })
+            self._abort_map_transition('地图已保存，但 Nav2 地图服务尚未就绪')
             return
 
         request = LoadMap.Request()
@@ -764,6 +1277,9 @@ class RobotWebBridge(Node):
                 error = f'Nav2 返回错误码 {response.result}'
         except Exception as exception:
             error = str(exception)
+        error = error or self._scene_error
+        if self._pending_map_status is None:
+            return
         with self._lock:
             self._status['map'].update({
                 'transitioning': not bool(error),
@@ -771,6 +1287,7 @@ class RobotWebBridge(Node):
                 'error': error,
             })
         if error:
+            self._abort_map_transition(error)
             self.get_logger().error(f'地图切换失败：{error}')
         else:
             # AMCL keeps the old map->odom transform when map_server loads a
@@ -784,17 +1301,49 @@ class RobotWebBridge(Node):
             return
         with self._lock:
             odom_pose = self._latest_odom_pose
-        if odom_pose is None:
+            ground_truth_pose = self._latest_ground_truth_pose
+            ground_truth_updated = self._last_ground_truth_pose_update
+            pending_route = self._pending_map_route
+            scene_ready = self._scene_ready
+        # Map loading and Gazebo scene rebuilding run independently. Never
+        # consume the finite AMCL seed attempts before Gazebo confirms that the
+        # model has actually reached the new HOME pose.
+        if pending_route is not None and not scene_ready:
+            return
+        ground_truth_fresh = bool(
+            ground_truth_pose is not None
+            and ground_truth_updated is not None
+            and time.monotonic() - ground_truth_updated <= 1.0
+        )
+        route_waypoints = (
+            pending_route.get('waypoints', [])
+            if isinstance(pending_route, dict) else []
+        )
+        route_home = route_waypoints[0] if route_waypoints else None
+        if odom_pose is None and not ground_truth_fresh and route_home is None:
             return
 
-        odom_x, odom_y, odom_yaw = odom_pose
-        if self._odom_pose_is_world:
+        if isinstance(route_home, dict):
+            # gazebo_scene_sync teleports to this exact pose before publishing
+            # scene_ready. Using the shared HOME target also avoids a race with
+            # the first ground-truth odometry sample after teleportation.
+            map_x = float(route_home['x'])
+            map_y = float(route_home['y'])
+            map_yaw = float(route_home.get('yaw', 0.0))
+        elif ground_truth_fresh:
+            # The simulator has just teleported the model to the selected
+            # map's HOME pose. Seed AMCL from that exact pose once, then let
+            # wheel odometry + IMU + EKF drive all subsequent motion.
+            map_x, map_y, map_yaw = ground_truth_pose
+        elif self._odom_pose_is_world:
             # Gazebo OdometryPublisher reports the model's world pose even
             # though the message frame is named odom.
+            odom_x, odom_y, odom_yaw = odom_pose
             map_x, map_y, map_yaw = odom_x, odom_y, odom_yaw
         else:
             # The lightweight simulator integrates odometry from zero at its
             # configured initial map pose.
+            odom_x, odom_y, odom_yaw = odom_pose
             origin_x, origin_y, origin_yaw = self._simulation_origin
             cosine = math.cos(origin_yaw)
             sine = math.sin(origin_yaw)
@@ -813,20 +1362,83 @@ class RobotWebBridge(Node):
         message.pose.covariance[7] = 0.04
         message.pose.covariance[35] = 0.03
         self._initial_pose_publisher.publish(message)
+        self._last_map_initial_pose = (map_x, map_y, map_yaw)
         self._initial_pose_repeats -= 1
 
         if self._initial_pose_repeats == 0:
-            self._clear_costmaps()
-            with self._lock:
-                self._status['map'].update({
-                    'transitioning': False,
-                    'localization_ready': True,
-                    'error': None,
-                })
-            self.get_logger().info(
-                f'地图定位已重置：x={map_x:.2f}, y={map_y:.2f}, '
-                f'yaw={map_yaw:.2f}，代价地图已清除'
-            )
+            self._localization_pose_ready = True
+            self._finish_map_transition_if_ready()
+
+    def _finish_map_transition_if_ready(self):
+        if not self._scene_ready or not self._localization_pose_ready:
+            return
+        pending_status = self._pending_map_status
+        pending_route = self._pending_map_route
+        pending_payload = self._pending_map_payload
+        if pending_status is None or pending_route is None or pending_payload is None:
+            return
+        with self._lock:
+            map_status = self._status['map']
+            if not map_status.get('transitioning') or map_status.get('error'):
+                return
+            map_status.update({
+                'active_id': pending_status['id'],
+                'active_name': pending_status['name'],
+                'active_revision': pending_status['revision'],
+                'pending_id': None,
+                'pending_name': None,
+                'pending_revision': None,
+                'active_payload_available': True,
+                'source_resolution': pending_status['source_resolution'],
+                'navigation_resolution': pending_status['navigation_resolution'],
+                'resampled': pending_status['resampled'],
+                'pending_navigation_resolution': None,
+                'transitioning': False,
+                'localization_ready': True,
+                'error': None,
+                'error_map_id': None,
+            })
+            self._active_map_payload = pending_payload
+        message = String()
+        message.data = json.dumps(pending_route, ensure_ascii=False)
+        self._waypoint_publisher.publish(message)
+        self._pending_map_status = None
+        self._pending_map_route = None
+        self._pending_map_payload = None
+        self._expected_scene_map_id = None
+        self._clear_costmaps()
+        pose = self._last_map_initial_pose
+        if pose is None:
+            self.get_logger().info('Gazebo 场景和车辆基地已就绪，代价地图已清除')
+            return
+        map_x, map_y, map_yaw = pose
+        self.get_logger().info(
+            f'地图、Gazebo 场景和车辆基地已同步：x={map_x:.2f}, '
+            f'y={map_y:.2f}, yaw={map_yaw:.2f}，代价地图已清除'
+        )
+
+    def _abort_map_transition(self, error):
+        pending = self._pending_map_status
+        attempted_map_id = (
+            pending.get('id') if isinstance(pending, dict)
+            else self._expected_scene_map_id
+        )
+        self._pending_map_status = None
+        self._pending_map_route = None
+        self._pending_map_payload = None
+        self._expected_scene_map_id = None
+        self._initial_pose_repeats = 0
+        with self._lock:
+            self._status['map'].update({
+                'pending_id': None,
+                'pending_name': None,
+                'pending_revision': None,
+                'pending_navigation_resolution': None,
+                'transitioning': False,
+                'localization_ready': False,
+                'error': str(error),
+                'error_map_id': attempted_map_id,
+            })
 
     @staticmethod
     def _boolean_parameter(name, value):
@@ -846,10 +1458,13 @@ class RobotWebBridge(Node):
 
         lidar_enabled = mode in ('lidar', 'fusion')
         camera_enabled = mode in ('camera', 'fusion')
+        # Hold the base at zero while costmap layers are swapped, but keep the
+        # current NavigateToPose action alive. A healthy source will release the
+        # hold automatically, so switching modes does not lose task progress.
+        self._perception_hold_active = True
+        self._perception_unhealthy_since = None
+        self._perception_healthy_since = None
         self._publish_manual(0.0, 0.0)
-        stop_client = self._patrol_clients['stop']
-        if stop_client.service_is_ready():
-            stop_client.call_async(Trigger.Request())
 
         self._perception_generation += 1
         generation = self._perception_generation
@@ -867,13 +1482,16 @@ class RobotWebBridge(Node):
         if mode == 'camera':
             self._set_camera_gimbal(0.0, 0.0)
 
-        clients = (self._local_costmap_params, self._global_costmap_params)
+        # Live sensors belong to the local collision map only. The global map
+        # remains the audited static plant map, so NavFn cannot invent a detour
+        # into an unapproved area around a temporary obstacle.
+        clients = (self._local_costmap_params,)
         if not all(client.service_is_ready() for client in clients):
             with self._lock:
                 self._status['perception'].update({
                     'transitioning': False,
                     'safety_ok': False,
-                    'error': 'Nav2 本地或全局代价地图尚未就绪，车辆保持停车',
+                    'error': 'Nav2 本地代价地图尚未就绪，车辆保持停车',
                 })
             return
 
@@ -886,7 +1504,7 @@ class RobotWebBridge(Node):
                     lidar_enabled,
                 ),
                 self._boolean_parameter(
-                    'camera_voxel_layer.enabled',
+                    'camera_obstacle_layer.enabled',
                     camera_enabled,
                 ),
             ]
@@ -935,8 +1553,7 @@ class RobotWebBridge(Node):
                 client.call_async(ClearEntireCostmap.Request())
 
     def _perception_watchdog(self):
-        if time.monotonic() - self._perception_started_at < 5.0:
-            return
+        now = time.monotonic()
         snapshot = self.status_snapshot()
         perception = snapshot['perception']
         if perception.get('transitioning'):
@@ -944,18 +1561,72 @@ class RobotWebBridge(Node):
         safe = bool(perception.get('safety_ok'))
         with self._lock:
             self._status['perception']['safety_ok'] = safe
-        if not safe and not self._perception_fault_active:
-            self._perception_fault_active = True
-            self._publish_manual(0.0, 0.0)
+
+        if safe:
+            self._perception_unhealthy_since = None
+            if self._perception_healthy_since is None:
+                self._perception_healthy_since = now
+                return
+            if now - self._perception_healthy_since < self._perception_recovery_stable:
+                return
+            if self._perception_fault_active:
+                self._perception_fault_active = False
+                self.get_logger().info('感知数据已稳定恢复')
+            self._release_perception_hold_if_ready(snapshot)
+            return
+
+        self._perception_healthy_since = None
+        if self._perception_unhealthy_since is None:
+            self._perception_unhealthy_since = now
+            return
+        if now - self._perception_unhealthy_since < self._perception_fault_delay:
+            return
+        if self._perception_fault_active:
+            return
+
+        with self._lock:
+            was_running = bool(self._status.get('patrol', {}).get('running'))
+        self._perception_fault_active = True
+        # Preserve an earlier automatic-resume request if the recovered source
+        # drops again while NavigateToPose cancellation is still finishing.
+        self._perception_stopped_patrol = (
+            self._perception_stopped_patrol or was_running
+        )
+        self._perception_resume_requested = (
+            self._perception_resume_requested or was_running
+        )
+        self._publish_manual(0.0, 0.0)
+        if was_running:
             stop_client = self._patrol_clients['stop']
             if stop_client.service_is_ready():
                 stop_client.call_async(Trigger.Request())
-            self.get_logger().error(
-                f'感知模式 {perception.get("mode")} 无可用数据，已安全停车'
-            )
-        elif safe and self._perception_fault_active:
-            self._perception_fault_active = False
-            self.get_logger().info('感知数据已恢复，车辆保持停车等待人工恢复巡检')
+        self.get_logger().error(
+            f'感知模式 {perception.get("mode")} 连续 '
+            f'{self._perception_fault_delay:.1f} 秒无可用数据，已安全停车'
+        )
+
+    def _release_perception_hold_if_ready(self, snapshot):
+        if not self._perception_hold_active and not self._perception_resume_requested:
+            return
+        patrol = snapshot.get('patrol', {})
+        if self._perception_stopped_patrol:
+            # Wait until NavigateToPose cancellation has actually completed.
+            # Calling start while patrol_manager is still CANCELLING would be
+            # rejected and leave the UI looking active while the base is idle.
+            if patrol.get('running'):
+                return
+            start_client = self._patrol_clients['start']
+            if not start_client.service_is_ready():
+                return
+            self._manual_override = False
+            start_client.call_async(Trigger.Request())
+            self.get_logger().info('感知恢复，正在自动恢复原巡检任务')
+        else:
+            self._manual_override = False
+            self.get_logger().info('感知模式切换完成，继续当前巡检任务')
+        self._perception_hold_active = False
+        self._perception_stopped_patrol = False
+        self._perception_resume_requested = False
 
     def _set_camera_gimbal(self, pan_degrees, tilt_degrees):
         with self._lock:
@@ -1118,7 +1789,11 @@ class RobotWebBridge(Node):
     def _publish_speed_limit(self):
         message = SpeedLimit()
         message.percentage = False
-        message.speed_limit = self._max_linear
+        message.speed_limit = min(
+            self._max_linear,
+            self._patrol_speed_limit
+            if self._patrol_speed_limit is not None else self._max_linear,
+        )
         self._speed_limit_publisher.publish(message)
 
     def _set_hardware_config(self, payload):
@@ -1171,11 +1846,12 @@ class RobotWebBridge(Node):
             client = self._patrol_clients['stop']
             if client.service_is_ready():
                 client.call_async(Trigger.Request())
-            self._manual_override = True
             self.get_logger().warning('网页人工控制已接管，自动巡检正在暂停')
-        elif not nonzero:
-            self._manual_override = False
-        self._cmd_publisher.publish(command)
+        # A zero command also keeps the latch. Otherwise stale Nav2 output may
+        # move the robot again before asynchronous goal cancellation finishes.
+        # Patrol start or a successful perception transition releases this latch.
+        self._manual_override = True
+        self._publish_base_command(command)
         self._last_manual_command = time.monotonic()
         self._manual_active = nonzero
 
@@ -1202,6 +1878,12 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    except RuntimeError as error:
+        # During a launch-wide SIGINT, Jazzy's Python binding can wake a
+        # subscription after its DDS bridge has already been torn down. This
+        # exact conversion error is a shutdown race, not an application fault.
+        if 'Unable to convert call argument' not in str(error):
+            raise
     finally:
         node.destroy_node()
         if rclpy.ok():

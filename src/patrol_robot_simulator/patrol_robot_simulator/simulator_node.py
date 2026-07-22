@@ -49,7 +49,7 @@ class OccupancyMap:
         if abs(self.origin_yaw) > 1.0e-9:
             raise ValueError('轻量仿真器暂不支持旋转后的栅格地图原点')
 
-        self.width, self.height, maximum, pixels = self._read_p2_pgm(image_path)
+        self.width, self.height, maximum, pixels = self._read_pgm(image_path)
         self._occupied = []
         for pixel in pixels:
             normalized = pixel / maximum
@@ -57,21 +57,77 @@ class OccupancyMap:
             self._occupied.append(probability >= self.occupied_threshold)
 
     @staticmethod
-    def _read_p2_pgm(path: Path) -> tuple[int, int, int, list[int]]:
-        tokens = []
-        for line in path.read_text(encoding='ascii').splitlines():
-            content = line.split('#', 1)[0].strip()
-            if content:
-                tokens.extend(content.split())
+    def _read_pgm(path: Path) -> tuple[int, int, int, list[int]]:
+        """Read standard ASCII P2 and binary P5 grayscale maps."""
+        data = path.read_bytes()
+        cursor = 0
 
-        if not tokens or tokens[0] != 'P2':
-            raise ValueError(f'轻量仿真器当前只支持 ASCII P2 PGM地图: {path}')
-        width, height, maximum = map(int, tokens[1:4])
-        pixels = list(map(int, tokens[4:]))
+        def next_header_token() -> bytes:
+            nonlocal cursor
+            while cursor < len(data):
+                if data[cursor] in b' \t\r\n':
+                    cursor += 1
+                    continue
+                if data[cursor] == ord('#'):
+                    newline = data.find(b'\n', cursor)
+                    cursor = len(data) if newline < 0 else newline + 1
+                    continue
+                break
+            start = cursor
+            while cursor < len(data) and data[cursor] not in b' \t\r\n#':
+                cursor += 1
+            if start == cursor:
+                raise ValueError(f'PGM 文件头不完整: {path}')
+            return data[start:cursor]
+
+        magic = next_header_token()
+        try:
+            width = int(next_header_token())
+            height = int(next_header_token())
+            maximum = int(next_header_token())
+        except ValueError as exc:
+            raise ValueError(f'PGM 文件头数值无效: {path}') from exc
+
+        if magic not in (b'P2', b'P5'):
+            raise ValueError(f'轻量仿真器只支持 P2/P5 PGM 地图: {path}')
+        if width <= 0 or height <= 0 or not 0 < maximum <= 65535:
+            raise ValueError(f'PGM 尺寸或灰度范围无效: {path}')
+
+        if magic == b'P2':
+            tokens = []
+            while cursor < len(data):
+                try:
+                    tokens.append(next_header_token())
+                except ValueError:
+                    break
+            try:
+                pixels = [int(token) for token in tokens]
+            except ValueError as exc:
+                raise ValueError(f'PGM 像素值无效: {path}') from exc
+        else:
+            if cursor >= len(data) or data[cursor] not in b' \t\r\n':
+                raise ValueError(f'P5 PGM 文件头缺少像素分隔符: {path}')
+            if data[cursor:cursor + 2] == b'\r\n':
+                cursor += 2
+            else:
+                cursor += 1
+            raster = data[cursor:]
+            if maximum < 256:
+                pixels = list(raster)
+            else:
+                if len(raster) % 2:
+                    raise ValueError(f'16 位 P5 PGM 像素字节数无效: {path}')
+                pixels = [
+                    (raster[index] << 8) | raster[index + 1]
+                    for index in range(0, len(raster), 2)
+                ]
+
         if len(pixels) != width * height:
             raise ValueError(
                 f'地图像素数量错误: 期望 {width * height}，实际 {len(pixels)}'
             )
+        if any(pixel < 0 or pixel > maximum for pixel in pixels):
+            raise ValueError(f'PGM 像素超出灰度范围 0..{maximum}: {path}')
         return width, height, maximum, pixels
 
     def is_occupied(self, world_x: float, world_y: float) -> bool:

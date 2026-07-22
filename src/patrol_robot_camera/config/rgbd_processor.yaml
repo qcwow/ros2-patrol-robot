@@ -13,9 +13,12 @@ rgbd_processor:
     max_depth: 8.0
 
     # 先隔像素采样，再做体素降采样，控制车载计算量和网络带宽。
-    sampling_stride: 2
-    voxel_size: 0.04
-    max_points: 120000
+    # 导航避障不需要逐像素点云。四倍采样让投影像素数降为原来的
+    # 1/16，避免 RGB-D 处理抢占雷达、TF 和控制循环的计算时间。
+    sampling_stride: 4
+    voxel_size: 0.05
+    max_points: 30000
 
-    sync_queue_size: 10
-    sync_slop_seconds: 0.08
+    # 队列只用于轻微对齐，不允许积累旧图像。桥接端同样只保留最新帧。
+    sync_queue_size: 3
+    sync_slop_seconds: 0.05
