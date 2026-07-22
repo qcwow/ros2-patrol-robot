@@ -411,6 +411,12 @@ class RobotWebBridge(Node):
             10,
         )
         self.create_subscription(
+            NavPath,
+            '/plan',
+            self._on_raw_navigation_path,
+            10,
+        )
+        self.create_subscription(
             LaserScan,
             '/scan',
             self._on_scan,
@@ -788,6 +794,12 @@ class RobotWebBridge(Node):
             self._last_ground_truth_pose_update = time.monotonic()
 
     def _on_navigation_path(self, message):
+        self._store_navigation_path(message, 'plan_smoothed')
+
+    def _on_raw_navigation_path(self, message):
+        self._store_navigation_path(message, 'plan')
+
+    def _store_navigation_path(self, message, source):
         poses = message.poses
         if not poses:
             return
@@ -806,7 +818,7 @@ class RobotWebBridge(Node):
             self._status['navigation'] = {
                 'path': points,
                 'frame_id': message.header.frame_id or 'map',
-                'source': 'plan_smoothed',
+                'source': source,
                 '_updated_monotonic': time.monotonic(),
             }
 
@@ -869,6 +881,22 @@ class RobotWebBridge(Node):
             patrol = json.loads(message.data)
             with self._lock:
                 self._status['patrol'] = patrol
+                if (
+                    patrol.get('state') == 'RETRY_WAIT'
+                    and (
+                        int(patrol.get('retry_count') or 0) > 0
+                        or int(patrol.get('similar_path_replan_count') or 0) > 0
+                        or bool(patrol.get('route_replan_pending'))
+                    )
+                ):
+                    # Do not leave the rejected/failed blue path on screen while
+                    # the planner is selecting a genuinely different route.
+                    self._status['navigation'] = {
+                        'path': [],
+                        'frame_id': 'map',
+                        'source': 'none',
+                        '_updated_monotonic': None,
+                    }
                 if not bool(patrol.get('running')):
                     self._patrol_speed_limit = None
             self._publish_speed_limit()

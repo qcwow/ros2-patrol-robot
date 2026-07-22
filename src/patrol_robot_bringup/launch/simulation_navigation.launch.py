@@ -164,6 +164,20 @@ def generate_launch_description():
             'max_health_recoveries': 3,
             'health_recovery_reset_stable_seconds': 5.0,
             'health_recovery_reset_progress_meters': 0.5,
+            # Blacklist the complete remaining failed route while preserving
+            # safe start/goal merge zones. Near-duplicate candidates are also
+            # rejected before they can reach the local controller.
+            'failed_path_start_clearance': 0.80,
+            'failed_path_goal_clearance': 0.80,
+            'failed_path_band_radius': 0.18,
+            'failed_path_similarity_distance': 0.75,
+            'failed_path_similarity_ratio': 0.70,
+            'max_similar_path_replans': 6,
+            'similar_path_replan_delay_seconds': 1.25,
+            # A path/control feasibility failure immediately excludes that
+            # candidate. This bounds the number of distinct candidates, not
+            # repeated low-speed attempts of the same route.
+            'max_route_failures': 6,
             'lap_restart_delay_seconds': 1.5,
             'action_name': 'navigate_to_pose',
             'behavior_tree': PathJoinSubstitution([

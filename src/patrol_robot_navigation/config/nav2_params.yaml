@@ -65,6 +65,10 @@ bt_navigator:
     default_server_timeout: 1000
     wait_for_service_timeout: 1000
     action_server_result_timeout: 900.0
+    # Jazzy compares these blackboard error codes when NavigateToPose aborts.
+    # Keeping them explicit lets patrol_manager distinguish a rejected path
+    # from TF/plugin/timing faults instead of treating every abort identically.
+    error_code_names: [compute_path_error_code, follow_path_error_code]
     navigators: [navigate_to_pose, navigate_through_poses]
     navigate_to_pose:
       plugin: nav2_bt_navigator::NavigateToPoseNavigator
@@ -261,12 +265,34 @@ global_costmap:
       footprint: "[[0.29, 0.23], [0.29, -0.23], [-0.29, -0.23], [-0.29, 0.23]]"
       footprint_padding: 0.01
       track_unknown_space: true
-      # 全局规划只使用已审核的静态地图。实时雷达/相机障碍只进入局部
-      # 代价地图，使车辆在原路减速停车，而不是在化工区自行规划绕行。
-      plugins: [static_layer, inflation_layer]
+      # 雷达/相机的瞬时障碍仍只进入局部代价地图。只有局部控制器已经
+      # 证实无法通过的完整剩余路径，才会由巡检管理器写入独立的失败
+      # 路径层。路径预检还会拒绝与失败路线高度重合的局部平移路线，
+      # 让下一次 Dijkstra 规划选择真正不同的最短路线。
+      plugins: [static_layer, failed_path_layer, inflation_layer]
       static_layer:
         plugin: nav2_costmap_2d::StaticLayer
         map_subscribe_transient_local: true
+      failed_path_layer:
+        plugin: nav2_costmap_2d::ObstacleLayer
+        enabled: true
+        observation_sources: failed_paths
+        failed_paths:
+          topic: /patrol_manager/failed_path_points
+          # Keep the configured fallback frame consistent with the PointCloud2
+          # header: failed-route coordinates are published in the map frame.
+          sensor_frame: map
+          data_type: PointCloud2
+          marking: true
+          clearing: false
+          min_obstacle_height: 0.0
+          max_obstacle_height: 0.5
+          obstacle_min_range: 0.0
+          obstacle_max_range: 100.0
+          # The manager republishes active exclusions at 2 Hz. Keeping only
+          # the latest cloud also lets an empty cloud remove the old goal.
+          observation_persistence: 0.0
+          expected_update_rate: 0.0
       inflation_layer:
         plugin: nav2_costmap_2d::InflationLayer
         cost_scaling_factor: 5.0

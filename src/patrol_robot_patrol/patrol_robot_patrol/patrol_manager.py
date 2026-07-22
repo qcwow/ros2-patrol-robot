@@ -1,10 +1,12 @@
 import math
 import json
+import struct
 from typing import Optional
 
 import rclpy
 from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped
+from nav_msgs.msg import Path
 from nav2_msgs.action import ComputePathToPose, NavigateToPose
 from nav2_msgs.srv import ClearEntireCostmap
 from rcl_interfaces.srv import SetParameters
@@ -12,10 +14,16 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import PointCloud2, PointField
 from std_srvs.srv import Trigger
-from std_msgs.msg import Bool, Float32, String
+from std_msgs.msg import Bool, Float32, Header, String
 
+from patrol_robot_patrol.failed_path_memory import FailedPathMemory
 from patrol_robot_patrol.health_recovery_progress import HealthRecoveryProgress
+from patrol_robot_patrol.navigation_failure import (
+    is_route_failure,
+    navigation_error_label,
+)
 from patrol_robot_patrol.route_model import PatrolRoute, Waypoint, load_route, parse_route
 from patrol_robot_patrol.task_ledger import PatrolTaskLedger
 
@@ -47,6 +55,14 @@ class PatrolManager(Node):
         self.declare_parameter('max_health_recoveries', 3)
         self.declare_parameter('health_recovery_reset_stable_seconds', 5.0)
         self.declare_parameter('health_recovery_reset_progress_meters', 0.5)
+        self.declare_parameter('failed_path_start_clearance', 0.80)
+        self.declare_parameter('failed_path_goal_clearance', 0.80)
+        self.declare_parameter('failed_path_band_radius', 0.18)
+        self.declare_parameter('failed_path_similarity_distance', 0.75)
+        self.declare_parameter('failed_path_similarity_ratio', 0.70)
+        self.declare_parameter('max_similar_path_replans', 6)
+        self.declare_parameter('similar_path_replan_delay_seconds', 1.25)
+        self.declare_parameter('max_route_failures', 6)
 
         self._loop = self.get_parameter('loop').value
         self._loop_count = max(1, int(self.get_parameter('loop_count').value))
@@ -110,6 +126,35 @@ class PatrolManager(Node):
                 ).value
             ),
         )
+        self._failed_paths = FailedPathMemory(
+            start_clearance=float(
+                self.get_parameter('failed_path_start_clearance').value
+            ),
+            goal_clearance=float(
+                self.get_parameter('failed_path_goal_clearance').value
+            ),
+            band_radius=float(
+                self.get_parameter('failed_path_band_radius').value
+            ),
+            similarity_distance=float(
+                self.get_parameter('failed_path_similarity_distance').value
+            ),
+            similarity_ratio=float(
+                self.get_parameter('failed_path_similarity_ratio').value
+            ),
+        )
+        self._max_similar_path_replans = max(
+            1, int(self.get_parameter('max_similar_path_replans').value)
+        )
+        self._similar_path_replan_delay = max(
+            1.0,
+            float(
+                self.get_parameter('similar_path_replan_delay_seconds').value
+            ),
+        )
+        self._max_route_failures = max(
+            1, int(self.get_parameter('max_route_failures').value)
+        )
 
         waypoint_file = str(self.get_parameter('waypoint_file').value)
         if not waypoint_file:
@@ -155,7 +200,13 @@ class PatrolManager(Node):
             self._on_navigation_health_status,
             10,
         )
+        self.create_subscription(Path, '/plan', self._on_global_plan, 10)
         self._status_publisher = self.create_publisher(String, '~/status', 10)
+        self._failed_path_publisher = self.create_publisher(
+            PointCloud2,
+            '~/failed_path_points',
+            10,
+        )
         selector_qos = QoSProfile(depth=1)
         selector_qos.reliability = ReliabilityPolicy.RELIABLE
         selector_qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
@@ -191,6 +242,8 @@ class PatrolManager(Node):
         self._dwell_deadline = 0.0
         self._blocked_reason: Optional[str] = None
         self._last_failure_status: Optional[int] = None
+        self._last_failure_error_code: Optional[int] = None
+        self._last_failure_error_message: Optional[str] = None
         self._navigation_health_ready = not self._require_navigation_health
         self._navigation_health_reason: Optional[str] = None
         self._navigation_health_checks: dict[str, bool] = {}
@@ -201,9 +254,17 @@ class PatrolManager(Node):
             self._health_recovery_reset_stable,
             self._health_recovery_reset_progress,
         )
+        self._active_plan: list[tuple[float, float]] = []
+        self._last_robot_position: Optional[tuple[float, float]] = None
+        self._goal_received_feedback = False
+        self._similar_path_replan_count = 0
+        self._last_candidate_similarity = 0.0
+        self._route_failure_count = 0
+        self._route_replan_pending = False
 
         self.create_timer(0.25, self._tick)
         self.create_timer(0.5, self._publish_status)
+        self.create_timer(0.5, self._publish_failed_path_points)
         self.get_logger().info(
             f'已加载路线 {self._route.route_id}，共 {len(self._waypoints)} 个点，'
             f'巡检任务 {len(self._route.task_indices)} 个，坐标系={self._frame_id}，'
@@ -373,6 +434,8 @@ class PatrolManager(Node):
             return
         self._blocked_reason = None
         self._last_failure_status = None
+        self._last_failure_error_code = None
+        self._last_failure_error_message = None
         self._health_ready_since = None
         self._state = 'RETRY_WAIT'
         self._state_deadline = now + min(self._retry_delay, 1.0)
@@ -400,6 +463,8 @@ class PatrolManager(Node):
             self._dwell_deadline = 0.0
             self._blocked_reason = None
             self._last_failure_status = None
+            self._last_failure_error_code = None
+            self._last_failure_error_message = None
             self._state = 'PAUSED'
             self.get_logger().info(
                 f'网页已更新语义路线 {route.route_id}，'
@@ -523,6 +588,17 @@ class PatrolManager(Node):
             ),
             'blocked_reason': self._blocked_reason,
             'last_failure_status': self._last_failure_status,
+            'last_failure_error_code': self._last_failure_error_code,
+            'last_failure_error_message': self._last_failure_error_message,
+            'failed_route_count': self._failed_paths.route_count,
+            'failed_route_exclusion_points': len(self._failed_paths.points),
+            'route_failure_count': self._route_failure_count,
+            'max_route_failures': self._max_route_failures,
+            'route_replan_pending': self._route_replan_pending,
+            'similar_path_replan_count': self._similar_path_replan_count,
+            'last_candidate_similarity': round(
+                self._last_candidate_similarity, 3
+            ),
             'navigation_health_ready': self._navigation_health_ready,
             'navigation_health_reason': self._navigation_health_reason,
             'required_sensor_ready': (
@@ -582,6 +658,9 @@ class PatrolManager(Node):
         return pose
 
     def _check_current_path(self) -> None:
+        self._active_plan = []
+        self._last_robot_position = None
+        self._goal_received_feedback = False
         goal = ComputePathToPose.Goal()
         goal.goal = self._pose_for_waypoint(self._waypoints[self._index])
         goal.planner_id = 'GridBased'
@@ -635,13 +714,93 @@ class PatrolManager(Node):
         except Exception as error:
             self._block_preflight(f'读取路径预检结果失败: {error}')
             return
+        candidate = [
+            (pose.pose.position.x, pose.pose.position.y)
+            for pose in path.poses
+        ]
+        # Keep the preflight action's exact raw candidate so an immediate
+        # FollowPath rejection can still blacklist the complete route.
+        self._active_plan = candidate
+        # An immediate controller rejection may arrive before the first
+        # NavigateToPose feedback. Never crop the new path with a robot pose
+        # left over from the previous waypoint.
+        self._last_robot_position = candidate[0]
+        similar, similarity = self._failed_paths.is_similar(candidate)
+        self._last_candidate_similarity = similarity
+        if similar:
+            self._reject_similar_candidate(candidate, similarity)
+            return
+        if self._similar_path_replan_count:
+            self.get_logger().info(
+                f'已找到不同候选路线，与失败路线最大重合度 '
+                f'{similarity:.0%}；允许发送给局部控制器'
+            )
+        self._similar_path_replan_count = 0
+        self._route_replan_pending = False
         self._configure_current_goal()
+
+    def _reject_similar_candidate(
+        self,
+        candidate: list[tuple[float, float]],
+        similarity: float,
+    ) -> None:
+        if self._similar_path_replan_count >= self._max_similar_path_replans:
+            self._block_preflight(
+                '连续规划结果均与已失败路线高度重合，'
+                f'最后重合度={similarity:.0%}'
+            )
+            return
+
+        added = self._failed_paths.remember(candidate, candidate[0])
+        self._similar_path_replan_count += 1
+        self._route_replan_pending = True
+        self._publish_failed_path_points()
+        self._clear_global_costmap('拒绝高度相似的候选路线')
+        self._state = 'RETRY_WAIT'
+        self._state_deadline = self._now() + self._similar_path_replan_delay
+        self.get_logger().warning(
+            f'候选路线与失败路线重合 {similarity:.0%}，'
+            '已拒绝并加入黑名单；'
+            f'{self._similar_path_replan_delay:.2f} 秒后重新选择'
+            '未使用的最短路线 '
+            f'({self._similar_path_replan_count}/'
+            f'{self._max_similar_path_replans})；新增禁行栅格 {added}'
+        )
+
+    def _on_global_plan(self, message: Path) -> None:
+        if not message.poses or not self._waypoints:
+            return
+        waypoint = self._waypoints[self._index]
+        endpoint = message.poses[-1].pose.position
+        if math.hypot(endpoint.x - waypoint.x, endpoint.y - waypoint.y) > max(
+            0.50, waypoint.position_tolerance * 2.0
+        ):
+            return
+        self._active_plan = [
+            (pose.pose.position.x, pose.pose.position.y)
+            for pose in message.poses
+        ]
 
     def _block_preflight(self, reason: str) -> None:
         waypoint = self._waypoints[self._index]
         self.get_logger().warning(
             f'路线点“{waypoint.name}”路径预检失败：{reason}'
         )
+        if self._route_replan_pending or self._failed_paths.route_count > 0:
+            self._goal_handle = None
+            self._active_token = None
+            self._last_failure_status = GoalStatus.STATUS_ABORTED
+            self._route_replan_pending = False
+            self._blocked_reason = (
+                f'{waypoint.name}：已禁用 {self._failed_paths.route_count} 条'
+                f'失败路线后，没有找到未使用的可行替代路线（{reason}）'
+            )
+            self._state = 'BLOCKED'
+            self.get_logger().error(
+                f'路线点“{waypoint.name}”没有未使用的可行替代路线，'
+                '已进入 BLOCKED；不会再低速重复同一路线'
+            )
+            return
         self._handle_failure(
             status=GoalStatus.STATUS_ABORTED,
             failure_detail=f'路径预检失败：{reason}',
@@ -727,6 +886,7 @@ class PatrolManager(Node):
         self._goal_handle = None
         self._cancel_reason = None
         self._goal_started_at = self._now()
+        self._goal_received_feedback = False
         self._state = 'SENDING_GOAL'
 
         if self._returning_home:
@@ -794,6 +954,11 @@ class PatrolManager(Node):
         if token != self._active_token or self._state != 'NAVIGATING':
             return
         feedback = feedback_message.feedback
+        self._goal_received_feedback = True
+        self._last_robot_position = (
+            feedback.current_pose.pose.position.x,
+            feedback.current_pose.pose.position.y,
+        )
         now = self._now()
         self._observe_health_recovery_progress(
             now,
@@ -861,9 +1026,17 @@ class PatrolManager(Node):
     def _on_result(self, future, token: int) -> None:
         if token != self._active_token:
             return
+        error_code: Optional[int] = None
+        error_message: Optional[str] = None
         try:
             wrapped_result = future.result()
             status = wrapped_result.status
+            raw_error_code = getattr(wrapped_result.result, 'error_code', None)
+            if raw_error_code is not None:
+                error_code = int(raw_error_code)
+            raw_error_message = getattr(wrapped_result.result, 'error_msg', '')
+            if raw_error_message:
+                error_message = str(raw_error_message)
         except Exception as error:
             self.get_logger().error(f'读取导航结果失败: {error}')
             status = GoalStatus.STATUS_ABORTED
@@ -880,6 +1053,7 @@ class PatrolManager(Node):
             self.get_logger().info('巡航已停止')
             return
         if cancel_reason == 'reset':
+            self._clear_failed_paths('巡航复位')
             self._route_cursor = 0
             self._index = self._route.home_index
             self._retry_count = 0
@@ -890,6 +1064,8 @@ class PatrolManager(Node):
             self._dwell_deadline = 0.0
             self._blocked_reason = None
             self._last_failure_status = None
+            self._last_failure_error_code = None
+            self._last_failure_error_message = None
             self._state = 'PAUSED'
             self.get_logger().info('巡航已复位到基地')
             return
@@ -904,21 +1080,119 @@ class PatrolManager(Node):
             return
 
         if status == GoalStatus.STATUS_SUCCEEDED:
+            self._clear_failed_paths('已到达当前路线点')
             self._retry_count = 0
             self._reset_health_recovery_streak()
             self._blocked_reason = None
             self._last_failure_status = None
+            self._last_failure_error_code = None
+            self._last_failure_error_message = None
             self._complete_current_task()
             return
 
         waypoint = self._waypoints[self._index]
+        error_label = navigation_error_label(error_code)
+        error_detail = error_label
+        if error_message:
+            error_detail = f'{error_label}：{error_message}'
         if cancel_reason == 'timeout':
             self.get_logger().warning(f'巡航点“{waypoint.name}”因超时未到达')
         else:
             self.get_logger().warning(
-                f'巡航点“{waypoint.name}”导航失败，状态码={status}'
+                f'巡航点“{waypoint.name}”导航失败，状态码={status}，'
+                f'Nav2={error_code}（{error_detail}）'
             )
-        self._handle_failure(status=status, timed_out=cancel_reason == 'timeout')
+        self._last_failure_error_code = error_code
+        self._last_failure_error_message = error_message or error_label
+        if cancel_reason != 'timeout' and is_route_failure(error_code):
+            self._handle_route_failure(
+                status=status,
+                error_code=error_code,
+                error_detail=error_detail,
+            )
+            return
+        self._handle_failure(
+            status=status,
+            timed_out=cancel_reason == 'timeout',
+            failure_detail=(
+                None if cancel_reason == 'timeout' else error_detail
+            ),
+        )
+
+    def _remember_failed_path(self) -> int:
+        if not self._active_plan:
+            self.get_logger().warning(
+                '导航失败但没有捕获到全局路径，无法建立路线黑名单'
+            )
+            return 0
+        robot_position = self._last_robot_position or self._active_plan[0]
+        added = self._failed_paths.remember(
+            self._active_plan,
+            robot_position,
+        )
+        if not added:
+            self.get_logger().warning(
+                '导航失败路线过短或已经完全在黑名单中，未新增禁行栅格'
+            )
+            return 0
+        self._publish_failed_path_points()
+        self.get_logger().warning(
+            f'已记忆第 {self._failed_paths.route_count} 条受阻路线，'
+            f'新增 {added} 个临时禁行栅格；'
+            '下次将从其余路线中选择最短路'
+        )
+        return added
+
+    def _publish_failed_path_points(self, publish_empty: bool = False) -> None:
+        points = self._failed_paths.points
+        if not points and not publish_empty:
+            return
+        message = PointCloud2()
+        message.header = Header()
+        message.header.stamp = self.get_clock().now().to_msg()
+        message.header.frame_id = self._frame_id
+        message.height = 1
+        message.width = len(points)
+        message.fields = [
+            PointField(
+                name=name,
+                offset=offset,
+                datatype=PointField.FLOAT32,
+                count=1,
+            )
+            for name, offset in (('x', 0), ('y', 4), ('z', 8))
+        ]
+        message.is_bigendian = False
+        message.point_step = 12
+        message.row_step = message.point_step * message.width
+        message.data = b''.join(
+            struct.pack('<fff', x, y, 0.05) for x, y in points
+        )
+        message.is_dense = True
+        self._failed_path_publisher.publish(message)
+
+    def _clear_failed_paths(self, reason: str) -> None:
+        had_failed_paths = self._failed_paths.clear()
+        self._similar_path_replan_count = 0
+        self._last_candidate_similarity = 0.0
+        self._route_failure_count = 0
+        self._route_replan_pending = False
+        if not had_failed_paths:
+            return
+        # Replace the layer's buffered cloud before resetting its cells, so
+        # the previous goal's exclusion cannot be marked again after clearing.
+        self._publish_failed_path_points(publish_empty=True)
+        global_client = self._costmap_clear_clients[1]
+        if global_client.service_is_ready():
+            global_client.call_async(ClearEntireCostmap.Request())
+        self.get_logger().info(f'{reason}：已清除失败路线临时禁行记录')
+
+    def _clear_global_costmap(self, reason: str) -> None:
+        client = self._costmap_clear_clients[1]
+        if not client.service_is_ready():
+            return
+        client.call_async(ClearEntireCostmap.Request())
+        self.get_logger().info(f'{reason}：已请求清理全局代价地图')
 
     def _request_cancel(self, reason: str) -> None:
         if self._state == 'CANCELLING':
@@ -940,6 +1214,7 @@ class PatrolManager(Node):
         self._active_token = None
         self._cancel_reason = None
         if reason == 'reset':
+            self._clear_failed_paths('巡航复位')
             self._route_cursor = 0
             self._index = self._route.home_index
             self._retry_count = 0
@@ -950,6 +1225,8 @@ class PatrolManager(Node):
             self._dwell_deadline = 0.0
             self._blocked_reason = None
             self._last_failure_status = None
+            self._last_failure_error_code = None
+            self._last_failure_error_message = None
         elif reason == 'stop' and was_dwelling:
             # Arrival was already acknowledged and its counter was already
             # decremented, so resume from the following task after a stop.
@@ -972,6 +1249,7 @@ class PatrolManager(Node):
         self._goal_handle = None
         self._active_token = None
         self._last_failure_status = status
+        self._route_replan_pending = False
         waypoint = self._waypoints[self._index]
         # Clearing maps never moves the base, so this remains safe even for
         # restricted HOME/equipment points where reverse and spin are forbidden.
@@ -995,6 +1273,64 @@ class PatrolManager(Node):
         self.get_logger().error(
             f'路线点“{waypoint.name}”连续失败 {self._max_retries + 1} 次，'
             '已进入 BLOCKED 并保持停车；请检查现场后人工确认继续'
+        )
+
+    def _handle_route_failure(
+        self,
+        status: int,
+        error_code: int,
+        error_detail: str,
+    ) -> None:
+        """Exclude an infeasible candidate and request a genuinely new plan."""
+
+        self._goal_handle = None
+        self._active_token = None
+        self._last_failure_status = status
+        self._route_failure_count += 1
+        added = self._remember_failed_path()
+        waypoint = self._waypoints[self._index]
+
+        if added <= 0 and self._failed_paths.route_count == 0:
+            self._route_replan_pending = False
+            self._blocked_reason = (
+                f'{waypoint.name}：{error_detail}；未能捕获足够长的失败路线，'
+                '无法安全建立路线禁用区'
+            )
+            self._state = 'BLOCKED'
+            self.get_logger().error(
+                '局部控制器拒绝了路线，但没有可用于禁用的完整路径；'
+                '为避免重复同一路线，已停车等待检查'
+            )
+            return
+
+        if self._route_failure_count >= self._max_route_failures:
+            self._route_replan_pending = False
+            self._blocked_reason = (
+                f'{waypoint.name}：已经连续尝试并禁用 '
+                f'{self._route_failure_count} 条候选路线；最后失败为 '
+                f'{error_code}（{error_detail}）'
+            )
+            self._state = 'BLOCKED'
+            self.get_logger().error(
+                f'路线点“{waypoint.name}”已达到 '
+                f'{self._max_route_failures} 次不同路线执行上限，'
+                '已进入 BLOCKED；不会退回重复路线'
+            )
+            return
+
+        # Do not increment _retry_count: low-speed retry is reserved for
+        # transient transport/timing failures. The next action starts at the
+        # waypoint's configured speed and must use the failed-path layer.
+        self._retry_count = 0
+        self._route_replan_pending = True
+        self._clear_costmaps('局部控制器拒绝当前路线')
+        self._state = 'RETRY_WAIT'
+        self._state_deadline = self._now() + self._similar_path_replan_delay
+        self.get_logger().warning(
+            f'Nav2 错误 {error_code}（{error_detail}）：当前完整路线已禁用；'
+            f'{self._similar_path_replan_delay:.2f} 秒后规划未使用的最短路线 '
+            f'({self._route_failure_count}/{self._max_route_failures})，'
+            '不对原路线执行低速重试'
         )
 
     def _complete_current_task(self) -> None:
@@ -1108,11 +1444,17 @@ class PatrolManager(Node):
                 '收到人工确认，重新尝试路线点'
                 f'“{self._waypoints[self._index].name}”'
             )
+            # Manual confirmation means the physical obstruction has been
+            # inspected or removed, so a new recovery cycle may reconsider
+            # routes rejected before that confirmation.
+            self._clear_failed_paths('人工确认现场后')
             self._clear_costmaps('人工恢复')
         self._retry_count = 0
         self._reset_health_recovery_streak()
         self._blocked_reason = None
         self._last_failure_status = None
+        self._last_failure_error_code = None
+        self._last_failure_error_message = None
         self._state = self._ready_state()
         response.success = True
         if was_blocked and self._state == 'WAITING_HEALTH':
@@ -1166,6 +1508,8 @@ class PatrolManager(Node):
             return response
         self._blocked_reason = None
         self._last_failure_status = None
+        self._last_failure_error_code = None
+        self._last_failure_error_message = None
         self._state = 'PAUSED'
         response.success = True
         response.message = '急停已解除，巡检仍保持暂停'

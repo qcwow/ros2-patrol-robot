@@ -1,19 +1,17 @@
 <!-- Recovery policy near equipment and home: no autonomous displacement. -->
 <root BTCPP_format="4" main_tree_to_execute="MainTree">
   <BehaviorTree ID="MainTree">
-    <RecoveryNode number_of_retries="1" name="NavigateRestrictedRecovery">
-      <Sequence name="NavigateRestricted">
+    <!-- A new global plan is requested only after patrol_manager has
+         blacklisted the remaining failed route. -->
+    <Sequence name="NavigateRestricted">
         <ControllerSelector selected_controller="{selected_controller}" default_controller="FollowPath" topic_name="controller_selector"/>
         <PlannerSelector selected_planner="{selected_planner}" default_planner="GridBased" topic_name="planner_selector"/>
         <GoalCheckerSelector selected_goal_checker="{selected_goal_checker}" default_goal_checker="precise_goal_checker" topic_name="goal_checker_selector"/>
-        <ComputePathToPose goal="{goal}" path="{raw_path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
-        <SmoothPath unsmoothed_path="{raw_path}" smoothed_path="{path}" smoother_id="simple_smoother" max_smoothing_duration="0.20" check_for_collisions="true"/>
+        <ComputePathToPose goal="{goal}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+        <!-- Preserve and follow the collision-free raw NavFn path. Any local
+             rejection is returned to patrol_manager so this complete route is
+             excluded before another global plan is requested. -->
         <FollowPath path="{path}" controller_id="{selected_controller}" goal_checker_id="{selected_goal_checker}" error_code_id="{follow_path_error_code}"/>
-      </Sequence>
-      <Sequence name="StationaryRecovery">
-        <ClearEntireCostmap name="ClearLocalCostmap" service_name="local_costmap/clear_entirely_local_costmap"/>
-        <Wait wait_duration="2.0"/>
-      </Sequence>
-    </RecoveryNode>
+    </Sequence>
   </BehaviorTree>
 </root>
