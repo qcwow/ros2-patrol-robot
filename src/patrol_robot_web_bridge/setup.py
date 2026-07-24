@@ -16,5 +16,10 @@ setup(
     maintainer_email='maintainer@example.com',
     description='Safe HTTP gateway between the patrol web console and ROS 2.',
     license='Apache-2.0',
-    entry_points={'console_scripts': ['web_bridge = patrol_robot_web_bridge.bridge_node:main']},
+    entry_points={
+        'console_scripts': [
+            'web_bridge = patrol_robot_web_bridge.bridge_node:main',
+            'map_source_mux = patrol_robot_web_bridge.map_source_mux:main',
+        ],
+    },
 )

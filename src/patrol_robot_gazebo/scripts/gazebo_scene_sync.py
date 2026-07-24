@@ -43,6 +43,7 @@ class GazeboSceneSync(Node):
         self.declare_parameter('world_name', 'pipeline_inspection')
         self.declare_parameter('robot_name', 'patrol_robot')
         self.declare_parameter('scenario_topic', '/patrol/map_scenario')
+        self.declare_parameter('reset_pose_topic', '/patrol/reset_pose')
         self.declare_parameter('service_timeout_ms', 5000)
         self._world = safe_fragment(
             self.get_parameter('world_name').value,
@@ -65,6 +66,12 @@ class GazeboSceneSync(Node):
             String,
             str(self.get_parameter('scenario_topic').value),
             self._on_scenario,
+            10,
+        )
+        self.create_subscription(
+            String,
+            str(self.get_parameter('reset_pose_topic').value),
+            self._on_reset_pose,
             10,
         )
         self._status_publisher = self.create_publisher(
@@ -95,28 +102,51 @@ class GazeboSceneSync(Node):
             self.get_logger().error(f'拒绝无效 Gazebo 场景：{error}')
             return
 
-        # A rapid sequence of editor updates only needs the newest full scene.
+        self._queue_update('scenario', payload)
+
+    def _on_reset_pose(self, message):
         try:
-            self._updates.put_nowait(payload)
+            payload = json.loads(message.data)
+            if not isinstance(payload, dict):
+                raise ValueError('归位参数必须是对象')
+            for field in ('x', 'y', 'yaw'):
+                bounded_number(payload.get(field), 0.0, -10000.0, 10000.0)
+        except (json.JSONDecodeError, ValueError) as error:
+            self.get_logger().error(f'拒绝无效车辆归位命令：{error}')
+            return
+        self._queue_update('reset_pose', payload)
+
+    def _queue_update(self, kind, payload):
+        # A rapid sequence of editor updates only needs the newest full scene
+        # or pose reset.
+        try:
+            self._updates.put_nowait((kind, payload))
         except queue.Full:
             try:
                 self._updates.get_nowait()
             except queue.Empty:
                 pass
-            self._updates.put_nowait(payload)
+            self._updates.put_nowait((kind, payload))
 
     def _run(self):
         while not self._stop.is_set():
             try:
-                payload = self._updates.get(timeout=0.2)
+                kind, payload = self._updates.get(timeout=0.2)
             except queue.Empty:
                 continue
             try:
-                self._apply_scene(payload)
+                if kind == 'reset_pose':
+                    self._teleport_robot_pose(payload)
+                else:
+                    self._apply_scene(payload)
             except (OSError, RuntimeError, ValueError) as error:
-                self.get_logger().error(f'Gazebo 场景同步失败：{error}')
-                self._publish_status(payload, False, str(error))
+                label = '车辆归位' if kind == 'reset_pose' else 'Gazebo 场景同步'
+                self.get_logger().error(f'{label}失败：{error}')
+                if kind == 'scenario':
+                    self._publish_status(payload, False, str(error))
             else:
+                if kind != 'scenario':
+                    continue
                 self._publish_status(payload, True, None)
 
     def _publish_status(self, payload, ok, error):
@@ -224,6 +254,12 @@ class GazeboSceneSync(Node):
                 if math.hypot(target_x - x, target_y - y) > 1e-6:
                     yaw = math.atan2(target_y - y, target_x - x)
                     break
+        self._teleport_robot_pose({'x': x, 'y': y, 'yaw': yaw})
+
+    def _teleport_robot_pose(self, payload):
+        x = bounded_number(payload.get('x'), 0.0, -10000.0, 10000.0)
+        y = bounded_number(payload.get('y'), 0.0, -10000.0, 10000.0)
+        yaw = bounded_number(payload.get('yaw'), 0.0, -math.pi, math.pi)
         request = (
             f'name: "{self._robot}", '
             f'position {{x: {x:.6f}, y: {y:.6f}, z: 0.020000}}, '
@@ -242,7 +278,7 @@ class GazeboSceneSync(Node):
                 f'无法将车辆 {self._robot} 重置到第一个巡检点'
             )
         self.get_logger().warning(
-            f'车辆已重置到基地：x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}'
+            f'车辆已重置到原点：x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}'
         )
 
     def _apply_scene(self, payload):

@@ -6,6 +6,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Industrial3DMap } from "./Industrial3DMap";
 import { Industrial2DMap } from "./Industrial2DMap";
 import { MapManagement } from "./MapManagement";
+import { LiveMappingWorkspace } from "./LiveMappingWorkspace";
 import { DEFAULT_MAPS, mapToRobotPayload, validatePatrolWaypoints, withRouteHeadings, type PatrolMap } from "./mapTypes";
 
 type CameraStatus = {
@@ -30,6 +31,10 @@ type MapRuntimeStatus = {
   pending_navigation_resolution?: number | null; resampled?: boolean;
   error_map_id?: string | null;
   active_payload_available?: boolean;
+  static_map_service_ready?: boolean;
+  mapping_base_available?: boolean;
+  source_mode?: "slam" | "static" | "switching_slam" | "switching_static";
+  patrol_route_ready?: boolean;
   localization_ready?: boolean; error?: string | null;
 };
 type PatrolWaypointTask = {
@@ -48,6 +53,12 @@ type NavigationStatus = {
   frame_id: string;
   source: string;
   path_age: number | null;
+};
+type RobotOperation = {
+  owner: "idle" | "patrol" | "mapping" | "map";
+  state: string;
+  locked: boolean;
+  detail: string;
 };
 type Telemetry = {
   speed: number; max_linear_speed: number; x: number; y: number; yaw: number; lidar_ok: boolean;
@@ -77,6 +88,7 @@ type Telemetry = {
   perception: PerceptionStatus;
   navigation: NavigationStatus;
   map: MapRuntimeStatus;
+  operation: RobotOperation;
 };
 
 const CAMERA_LIMITS = { pan: 90, tiltUp: 25, tiltDown: 35 };
@@ -89,13 +101,16 @@ const mapFromRobotPayload = (payload: Partial<PatrolMap> & { revision?: string |
     id: payload.id,
     name: payload.name,
     description: payload.description || "车辆当前应用的地图",
-    source: payload.source === "preset" || payload.source === "imported" ? payload.source : "generated",
+    source: payload.source === "preset" || payload.source === "imported" || payload.source === "slam"
+      ? payload.source
+      : "generated",
     seed: payload.seed,
     bounds: payload.bounds,
     resolution: Number(payload.resolution) || 0.25,
     objects: payload.objects,
     waypoints: payload.waypoints,
     occupancy: payload.occupancy,
+    voxel: payload.voxel,
     createdAt: payload.createdAt || revision,
     updatedAt: revision,
   };
@@ -117,7 +132,7 @@ export default function Home() {
   const [maps, setMaps] = useState<PatrolMap[]>(DEFAULT_MAPS);
   const [activeMapId, setActiveMapId] = useState(DEFAULT_MAPS[0].id);
   const [mapStorageReady, setMapStorageReady] = useState(false);
-  const [activeSection, setActiveSection] = useState<"control" | "maps">("control");
+  const [activeSection, setActiveSection] = useState<"control" | "maps" | "mapping">("control");
   const activeMap = useMemo(() => maps.find((map) => map.id === activeMapId) ?? maps[0] ?? DEFAULT_MAPS[0], [activeMapId, maps]);
   const [vehicleMap, setVehicleMap] = useState<PatrolMap>(() => cloneMap(DEFAULT_MAPS[0]));
   const vehicleWaypoints = vehicleMap.waypoints;
@@ -141,6 +156,7 @@ export default function Home() {
     },
     navigation: { path: [], frame_id: "map", source: "none", path_age: null },
     map: { active_id: "pipeline-demo", active_name: "管廊综合测试区", transitioning: false, localization_ready: true, error: null },
+    operation: { owner: "idle", state: "IDLE", locked: false, detail: "车辆可选择开始巡检或开始建图" },
   });
   const hasPendingMapChanges = telemetry.map.active_id !== activeMap.id || telemetry.map.active_revision !== activeMap.updatedAt;
   const [apiBase, setApiBase] = useState("");
@@ -229,6 +245,48 @@ export default function Home() {
     window.localStorage.setItem(APPLIED_MAP_STORAGE_KEY, JSON.stringify(vehicleMap));
   }, [activeMapId, mapStorageReady, maps, vehicleMap]);
 
+  const syncSavedMappingMaps = useCallback((savedMaps: PatrolMap[]) => {
+    const incomingIds = new Set(savedMaps.map((map) => map.id));
+    setMaps((current) => {
+      let changed = false;
+      const next = current.filter((map) => {
+        const keep = map.source !== "slam" || incomingIds.has(map.id);
+        if (!keep) changed = true;
+        return keep;
+      });
+      savedMaps.forEach((savedMap) => {
+        const index = next.findIndex((map) => map.id === savedMap.id);
+        if (index === -1) {
+          next.push(savedMap);
+          changed = true;
+          return;
+        }
+        const existing = next[index];
+        if (
+          existing.voxel?.available !== savedMap.voxel?.available ||
+          existing.voxel?.sizeBytes !== savedMap.voxel?.sizeBytes
+        ) {
+          next[index] = {
+            ...existing,
+            description: savedMap.description,
+            voxel: savedMap.voxel,
+          };
+          changed = true;
+        }
+      });
+      return changed ? next : current;
+    });
+  }, []);
+
+  const editSavedMappingMap = useCallback((mapId: string) => {
+    setActiveMapId(mapId);
+    setSelected(0);
+    setMapMode("3d");
+    setActiveSection("maps");
+    setToast("已进入地图管理，请先设置基地点和巡检点");
+    setToastTone("normal");
+  }, []);
+
   useEffect(() => () => {
     clearManualTimer();
     if (gimbalTimer.current !== null) window.clearTimeout(gimbalTimer.current);
@@ -311,6 +369,7 @@ export default function Home() {
           perception,
           navigation: status.navigation ?? { path: [], frame_id: "map", source: "none", path_age: null },
           map: mapStatus,
+          operation: status.operation ?? { owner: "idle", state: "IDLE", locked: false, detail: "车辆可选择开始巡检或开始建图" },
         });
         setRunning(Boolean(status.patrol?.running));
       } catch {
@@ -388,29 +447,58 @@ export default function Home() {
     }
   }
 
+  function changeRobotGateway(value: string) {
+    const normalized = value.replace(/\/$/, "");
+    window.localStorage.setItem("robot_api_url", normalized);
+    const nextUrl = new URL(window.location.href);
+    nextUrl.searchParams.set("robot", normalized);
+    window.history.replaceState({}, "", nextUrl);
+    setApiBase(normalized);
+    setConnected(false);
+    notify("正在连接新的车辆网关");
+  }
+
   async function togglePatrol() {
     const next = !running;
     const retryingBlockedPoint = telemetry.patrol.state === "BLOCKED";
+    const canRestoreAppliedMap = Boolean(
+      telemetry.map.mapping_base_available
+      && telemetry.map.source_mode === "slam"
+      && !telemetry.operation.locked,
+    );
     if (next) {
-      if (!retryingBlockedPoint && (telemetry.map.transitioning || telemetry.map.localization_ready === false)) {
+      if (telemetry.operation.locked && telemetry.operation.owner !== "patrol") {
+        notify(telemetry.operation.detail || "其他车辆任务正在运行，请先中断或等待完成", "error");
+        return;
+      }
+      if (!retryingBlockedPoint && !canRestoreAppliedMap && (telemetry.map.transitioning || telemetry.map.localization_ready === false)) {
         notify("地图定位尚未稳定，请稍候再开始巡检");
+        return;
+      }
+      if (!retryingBlockedPoint && !canRestoreAppliedMap && telemetry.map.patrol_route_ready === false) {
+        notify("请先在地图管理中设置并应用巡检路线", "error");
         return;
       }
       if (!retryingBlockedPoint && (telemetry.perception.transitioning || !telemetry.perception.safety_ok)) {
         notify("感知数据尚未稳定，请先确认雷达或 RGB-D 点云正常", "error");
         return;
       }
-      if (!retryingBlockedPoint && telemetry.patrol.navigation_health_ready === false) {
+      if (!retryingBlockedPoint && !canRestoreAppliedMap && telemetry.patrol.navigation_health_ready === false) {
         notify(telemetry.patrol.navigation_health_reason || "导航健康检查尚未通过", "error");
         return;
       }
       // Applying a map already creates the task ledger. Do not recreate it on
       // every pause/resume, otherwise completed waypoint counters are lost.
-      if (!retryingBlockedPoint && telemetry.patrol.loop_count !== patrolLoops && !(await saveWaypoints(vehicleWaypoints, patrolLoops, vehicleMap))) return;
+      if (!retryingBlockedPoint && !canRestoreAppliedMap && telemetry.patrol.loop_count !== patrolLoops && !(await saveWaypoints(vehicleWaypoints, patrolLoops, vehicleMap))) return;
     }
-    if (await send(`/api/patrol/${next ? "start" : "stop"}`)) {
-      setRunning(next);
-      notify(next ? retryingBlockedPoint ? "正在重新检查并恢复当前路线" : "巡检启动命令已发送" : "巡检停止命令已发送");
+    if (await send(`/api/patrol/${next ? "start" : "stop"}`, next ? { loop_count: patrolLoops } : {})) {
+      setRunning(next && !canRestoreAppliedMap);
+      notify(next ? retryingBlockedPoint
+        ? "正在重新检查并恢复当前路线"
+        : canRestoreAppliedMap
+          ? "正在恢复建图测试前应用的地图；定位就绪后自动开始巡检"
+          : "巡检启动命令已发送"
+        : "巡检停止命令已发送");
     }
   }
 
@@ -487,9 +575,9 @@ export default function Home() {
       notify(`“${next.name}”无法应用：${describeSafetyIssues(next)}`, "error");
       return;
     }
-    if (running) {
-      await send("/api/patrol/stop");
-      setRunning(false);
+    if (telemetry.operation.locked) {
+      notify(`${telemetry.operation.detail}；请先中断或等待任务完成`, "error");
+      return;
     }
     if (connected) {
       const applied = await send("/api/maps/activate", {
@@ -499,7 +587,11 @@ export default function Home() {
       });
       if (applied) {
         const sourceResolution = next.occupancy?.resolution ?? next.resolution;
-        notify(sourceResolution > 0.1
+        notify(next.source === "slam" && telemetry.map.static_map_service_ready === false
+          ? `“${next.name}”的巡检路线正在应用；SLAM 实时地图将继续用于 Nav2 导航`
+          : telemetry.map.source_mode === "slam"
+          ? `“${next.name}”正在应用；系统将冻结实时建图并切换到同一套 Nav2 静态导航`
+          : sourceResolution > 0.1
           ? `“${next.name}”正在应用；栅格将转换为 0.05 m/格，但不会增加原图缺失的细节`
           : `“${next.name}”正在应用；地图、场景、基地和路线将在全部成功后一起生效`);
       }
@@ -609,6 +701,11 @@ export default function Home() {
   const cameraShowing = cameraReady || (telemetry.camera.ok && !cameraError);
   const displayedSpeed = connected ? Math.abs(telemetry.speed) : 0;
   const speedGaugePercent = Math.min(100, (displayedSpeed / Math.max(telemetry.max_linear_speed, 0.1)) * 100);
+  const canRestoreAppliedMapForPatrol = Boolean(
+    telemetry.map.mapping_base_available
+    && telemetry.map.source_mode === "slam"
+    && !telemetry.operation.locked,
+  );
 
   return (
     <main className="app-shell">
@@ -622,6 +719,7 @@ export default function Home() {
           <button className={`nav-item ${activeSection === "control" && mapMode !== "camera" ? "active" : ""}`} onClick={() => { setActiveSection("control"); setMapMode("2d"); }}><i>⌁</i> 车辆控制</button>
           <button className="nav-item"><i>⌖</i> 巡检任务 <b>{vehicleWaypoints.length}</b></button>
           <button className={`nav-item ${activeSection === "maps" ? "active" : ""}`} onClick={() => setActiveSection("maps")}><i>◫</i> 地图管理 <b>{maps.length}</b></button>
+          <button className={`nav-item ${activeSection === "mapping" ? "active" : ""}`} onClick={() => setActiveSection("mapping")}><i>⬡</i> 自主建图</button>
           <button className={`nav-item ${activeSection === "control" && mapMode === "camera" ? "active" : ""}`} onClick={() => { setActiveSection("control"); setMapMode("camera"); }}><i>◉</i> 设备监控</button>
           <button className="nav-item"><i>⚙</i> 系统设置</button>
         </nav>
@@ -635,7 +733,7 @@ export default function Home() {
 
       <section className="workspace">
         <header className="topbar">
-          <div><p>{activeSection === "maps" ? "地图场景工作台" : "车辆控制台"}</p><small>{activeSection === "maps" ? `正在编辑 · ${activeMap.name}` : `车辆当前地图 · ${telemetry.map.active_name || vehicleMap.name}`}</small></div>
+          <div><p>{activeSection === "maps" ? "地图场景工作台" : activeSection === "mapping" ? "自主 SLAM 建图中心" : "车辆控制台"}</p><small>{activeSection === "maps" ? `正在编辑 · ${activeMap.name}` : activeSection === "mapping" ? "实时 OccupancyGrid · RGB-D 相机 · 前沿自主探索" : `车辆当前地图 · ${telemetry.map.active_name || vehicleMap.name}`}</small></div>
           <div className="status-cluster">
             <span className={`status-pill ${connected ? telemetry.map.error || toastTone === "error" ? "alert" : "" : "offline"}`} title={connected ? telemetry.map.error || toast : apiBase}><i></i>{connected ? telemetry.map.error ? `地图无法应用：${telemetry.map.error}` : toast : "车辆网关未连接"}</span>
             <span className="clock">{timeText} <small>{dateText}</small></span>
@@ -644,7 +742,7 @@ export default function Home() {
           </div>
         </header>
 
-        <div className={`content ${activeSection === "maps" ? "map-content" : ""}`}>
+        <div className={`content ${activeSection === "maps" ? "map-content" : activeSection === "mapping" ? "mapping-content" : ""}`}>
           {activeSection === "maps" ? (
             <MapManagement
               maps={maps}
@@ -662,6 +760,17 @@ export default function Home() {
               connected={connected}
               hasPendingChanges={hasPendingMapChanges}
               runtimeMap={telemetry.map}
+              operation={telemetry.operation}
+            />
+          ) : activeSection === "mapping" ? (
+            <LiveMappingWorkspace
+              apiBase={apiBase}
+              connected={connected}
+              onGatewayChange={changeRobotGateway}
+              onSavedMapsChange={syncSavedMappingMaps}
+              onEditSavedMap={editSavedMappingMap}
+              operation={telemetry.operation}
+              onReturnToNavigation={() => { setActiveSection("control"); setMapMode("2d"); }}
             />
           ) : (<>
           <section className="hero-panel">
@@ -792,7 +901,7 @@ export default function Home() {
                 </svg>
                 <div className="speed-gauge-readout"><strong>{displayedSpeed.toFixed(1)}</strong><small>m/s</small></div>
               </div>
-              <p className="drive-state"><i></i>{telemetry.perception.transitioning ? "感知模式切换中 · 车辆短暂停车" : telemetry.patrol.state === "ESTOP" ? "急停已锁定 · 需要独立安全确认后解除" : telemetry.patrol.state === "BLOCKED" ? `导航受阻 · ${telemetry.patrol.blocked_reason || "等待人工确认"}` : telemetry.patrol.state === "HEALTH_RECOVERY" ? `安全停车检查中 · 健康稳定后自动续行（${telemetry.patrol.health_recovery_count ?? 1} / ${telemetry.patrol.max_health_recoveries ?? 3}）` : telemetry.patrol.route_replan_pending ? `当前路线已禁用 · 正在规划未使用的最短路线 · 已禁用 ${telemetry.patrol.failed_route_count ?? 0} 条${telemetry.patrol.last_failure_error_code ? ` · Nav2 ${telemetry.patrol.last_failure_error_code}` : ""}` : telemetry.patrol.state === "RETRY_WAIT" && (telemetry.patrol.similar_path_replan_count ?? 0) > 0 ? `正在排除重复路线 · 重合度 ${Math.round((telemetry.patrol.last_candidate_similarity ?? 0) * 100)}% · 已禁用 ${telemetry.patrol.failed_route_count ?? 0} 条` : telemetry.patrol.state === "RETRY_WAIT" && telemetry.patrol.automatic_retry ? `自动恢复中 · 第 ${telemetry.patrol.health_recovery_count ? telemetry.patrol.health_recovery_count : telemetry.patrol.retry_count || 1} / ${telemetry.patrol.health_recovery_count ? telemetry.patrol.max_health_recoveries ?? 3 : telemetry.patrol.max_retries ?? 2} 次低速重试` : telemetry.patrol.state === "NAVIGATING" && telemetry.patrol.health_recovery_reset_pending ? `低速安全验证中 · 已前进 ${(telemetry.patrol.health_recovery_safe_progress_meters ?? 0).toFixed(2)} / ${(telemetry.patrol.health_recovery_reset_progress_meters ?? 0.5).toFixed(2)} m · ${(telemetry.patrol.health_recovery_safe_seconds ?? 0).toFixed(1)} / ${(telemetry.patrol.health_recovery_reset_stable_seconds ?? 5).toFixed(1)} s` : telemetry.patrol.state === "WAITING_HEALTH" ? `重新检查中 · ${telemetry.patrol.navigation_health_reason || "等待导航链路"}` : telemetry.patrol.state === "WAITING_SENSOR" ? `等待任务传感器 · ${telemetry.patrol.current_waypoint}` : running ? telemetry.patrol.returning_home ? "本圈任务完成 · 正在返回基地" : telemetry.patrol.state === "DWELL" ? `正在巡检：${telemetry.patrol.current_waypoint}` : `前往任务：${telemetry.patrol.current_waypoint}` : telemetry.map.transitioning ? "地图定位校准中" : "车辆已就绪"}</p>
+              <p className="drive-state"><i></i>{telemetry.perception.transitioning ? "感知模式切换中 · 车辆短暂停车" : telemetry.patrol.state === "ESTOP" ? "急停已锁定 · 需要独立安全确认后解除" : telemetry.patrol.state === "BLOCKED" ? `导航受阻 · ${telemetry.patrol.blocked_reason || "等待人工确认"}` : telemetry.patrol.state === "HEALTH_RECOVERY" ? `安全停车检查中 · 健康稳定后自动续行（${telemetry.patrol.health_recovery_count ?? 1} / ${telemetry.patrol.max_health_recoveries ?? 3}）` : telemetry.patrol.route_replan_pending ? `当前路线已禁用 · 正在规划未使用的最短路线 · 已禁用 ${telemetry.patrol.failed_route_count ?? 0} 条${telemetry.patrol.last_failure_error_code ? ` · Nav2 ${telemetry.patrol.last_failure_error_code}` : ""}` : telemetry.patrol.state === "RETRY_WAIT" && (telemetry.patrol.similar_path_replan_count ?? 0) > 0 ? `正在排除重复路线 · 重合度 ${Math.round((telemetry.patrol.last_candidate_similarity ?? 0) * 100)}% · 已禁用 ${telemetry.patrol.failed_route_count ?? 0} 条` : telemetry.patrol.state === "RETRY_WAIT" && telemetry.patrol.automatic_retry ? `自动恢复中 · 第 ${telemetry.patrol.health_recovery_count ? telemetry.patrol.health_recovery_count : telemetry.patrol.retry_count || 1} / ${telemetry.patrol.health_recovery_count ? telemetry.patrol.max_health_recoveries ?? 3 : telemetry.patrol.max_retries ?? 2} 次低速重试` : telemetry.patrol.state === "NAVIGATING" && telemetry.patrol.health_recovery_reset_pending ? `低速安全验证中 · 已前进 ${(telemetry.patrol.health_recovery_safe_progress_meters ?? 0).toFixed(2)} / ${(telemetry.patrol.health_recovery_reset_progress_meters ?? 0.5).toFixed(2)} m · ${(telemetry.patrol.health_recovery_safe_seconds ?? 0).toFixed(1)} / ${(telemetry.patrol.health_recovery_reset_stable_seconds ?? 5).toFixed(1)} s` : telemetry.patrol.state === "WAITING_HEALTH" ? `重新检查中 · ${telemetry.patrol.navigation_health_reason || "等待导航链路"}` : telemetry.patrol.state === "WAITING_SENSOR" ? `等待任务传感器 · ${telemetry.patrol.current_waypoint}` : running ? telemetry.patrol.returning_home ? "本圈任务完成 · 正在返回基地" : telemetry.patrol.state === "DWELL" ? `正在巡检：${telemetry.patrol.current_waypoint}` : `前往任务：${telemetry.patrol.current_waypoint}` : telemetry.operation.owner === "mapping" ? "自主建图任务运行中 · 巡检入口已锁定" : telemetry.map.transitioning ? "地图定位校准中" : telemetry.map.patrol_route_ready === false ? "等待应用巡检路线" : "车辆已就绪"}</p>
               <div className="stat-grid">
                 <div><small>电池电量</small><strong>86<span>%</span></strong><progress value="86" max="100" /></div>
                 <div><small>激光雷达</small><strong>{telemetry.perception.lidar_enabled ? telemetry.lidar_ok ? "正常" : "无数据" : "未参与"}</strong><span className="signal">▂▄▆█</span></div>
@@ -806,8 +915,8 @@ export default function Home() {
                 <button type="button" onClick={() => setPatrolLoops((value) => Math.min(1000, value + 1))} disabled={running || patrolLoops >= 1000}>＋</button>
                 <small>第 {telemetry.patrol.current_loop ?? 1} 轮 · 已完成 {telemetry.patrol.completed_loops ?? 0} / {telemetry.patrol.loop_count ?? patrolLoops}</small>
               </label>
-              <button className={`primary-action ${running ? "stop" : ""}`} onClick={togglePatrol} disabled={telemetry.patrol.state === "ESTOP" || (!running && telemetry.patrol.state !== "BLOCKED" && (telemetry.map.transitioning || telemetry.map.localization_ready === false || telemetry.perception.transitioning || !telemetry.perception.safety_ok || telemetry.patrol.navigation_health_ready === false))}>
-                {running ? "■  停止巡检" : telemetry.patrol.state === "ESTOP" ? "■  急停锁定" : telemetry.patrol.state === "BLOCKED" ? "↻  重新检查并恢复" : "▶  开始巡检"}
+              <button className={`primary-action ${running ? "stop" : ""}`} onClick={togglePatrol} disabled={telemetry.patrol.state === "ESTOP" || (!running && telemetry.operation.locked && telemetry.operation.owner !== "patrol") || (!running && !canRestoreAppliedMapForPatrol && telemetry.patrol.state !== "BLOCKED" && (telemetry.map.transitioning || telemetry.map.localization_ready === false || telemetry.map.patrol_route_ready === false || telemetry.perception.transitioning || !telemetry.perception.safety_ok || telemetry.patrol.navigation_health_ready === false))}>
+                {running ? "■  停止巡检" : telemetry.patrol.state === "ESTOP" ? "■  急停锁定" : telemetry.operation.locked && telemetry.operation.owner === "mapping" ? "建图任务运行中" : telemetry.operation.locked && telemetry.operation.owner === "map" ? "地图切换中" : canRestoreAppliedMapForPatrol ? "↻  恢复应用地图并巡检" : telemetry.patrol.state === "BLOCKED" ? "↻  重新检查并恢复" : "▶  开始巡检"}
               </button>
             </aside>
           </section>

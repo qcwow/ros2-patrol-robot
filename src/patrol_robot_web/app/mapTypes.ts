@@ -1,4 +1,4 @@
-export type MapSource = "preset" | "generated" | "imported";
+export type MapSource = "preset" | "generated" | "imported" | "slam";
 export type SceneObjectType = "obstacle" | "device";
 
 export type Waypoint = {
@@ -16,6 +16,24 @@ export type Waypoint = {
   required_sensor?: string;
   count_as_task?: boolean;
 };
+
+export type WaypointType = NonNullable<Waypoint["type"]>;
+
+export function waypointType(waypoint: Waypoint, index: number): WaypointType {
+  if (index === 0) return "HOME";
+  return waypoint.type === "HOME" ? "INSPECTION" : waypoint.type ?? "INSPECTION";
+}
+
+/** Make route semantics explicit before data leaves the browser. */
+export function withWaypointSemantics(waypoints: Waypoint[]): Waypoint[] {
+  return waypoints.map((waypoint, index) => {
+    const type = waypointType(waypoint, index);
+    if (type === "HOME" || type === "TRANSIT") {
+      return { ...waypoint, type, dwell: 0, count_as_task: false };
+    }
+    return { ...waypoint, type, count_as_task: waypoint.count_as_task ?? true };
+  });
+}
 
 export type SceneObject = {
   id: string;
@@ -49,6 +67,11 @@ export type PatrolMap = {
   objects: SceneObject[];
   waypoints: Waypoint[];
   occupancy?: OccupancyLayer;
+  voxel?: {
+    available: boolean;
+    format: "octomap-ot";
+    sizeBytes: number;
+  };
   createdAt: string;
   updatedAt: string;
 };
@@ -300,10 +323,11 @@ export type RouteWaypoint = Waypoint & { yaw: number };
 
 /** Aim each task at the next distinct task, and the final task back at home. */
 export function withRouteHeadings(waypoints: Waypoint[]): RouteWaypoint[] {
-  return waypoints.map((waypoint, index) => {
+  const semanticWaypoints = withWaypointSemantics(waypoints);
+  return semanticWaypoints.map((waypoint, index) => {
     let target: Waypoint | undefined;
-    for (let offset = 1; offset < waypoints.length; offset += 1) {
-      const candidate = waypoints[(index + offset) % waypoints.length];
+    for (let offset = 1; offset < semanticWaypoints.length; offset += 1) {
+      const candidate = semanticWaypoints[(index + offset) % semanticWaypoints.length];
       if (Math.hypot(candidate.x - waypoint.x, candidate.y - waypoint.y) > 1e-6) {
         target = candidate;
         break;
@@ -360,6 +384,7 @@ function normalizeMap(raw: unknown, fallbackName = "导入地图"): PatrolMap {
     objects,
     waypoints,
     occupancy: input.occupancy,
+    voxel: input.voxel,
     createdAt: timestamp,
     updatedAt: timestamp,
   };
@@ -463,5 +488,6 @@ export function mapToRobotPayload(map: PatrolMap) {
     objects: map.objects,
     waypoints: withRouteHeadings(map.waypoints),
     occupancy: map.occupancy,
+    voxel: map.voxel,
   };
 }

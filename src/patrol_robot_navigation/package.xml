@@ -21,6 +21,7 @@
   <exec_depend>nav2_smoother</exec_depend>
   <exec_depend>nav2_velocity_smoother</exec_depend>
   <exec_depend>nav2_waypoint_follower</exec_depend>
+  <exec_depend>octomap_server</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>slam_toolbox</exec_depend>
 

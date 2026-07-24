@@ -2,7 +2,7 @@
 
 import { useMemo, useRef, useState } from "react";
 import { Industrial3DMap, type MapEditorTool } from "./Industrial3DMap";
-import { generatePatrolMap, importMapFiles, validatePatrolWaypoints, type PatrolMap, type SceneObject, type Waypoint } from "./mapTypes";
+import { generatePatrolMap, importMapFiles, validatePatrolWaypoints, waypointType, withWaypointSemantics, type PatrolMap, type SceneObject, type Waypoint } from "./mapTypes";
 
 type Props = {
   maps: PatrolMap[];
@@ -19,6 +19,11 @@ type Props = {
   onNotice: (message: string) => void;
   connected: boolean;
   hasPendingChanges: boolean;
+  operation: {
+    owner: "idle" | "patrol" | "mapping" | "map";
+    locked: boolean;
+    detail: string;
+  };
   runtimeMap: {
     active_id: string; active_name: string; active_revision?: string | null;
     pending_id?: string | null; pending_name?: string | null;
@@ -26,21 +31,30 @@ type Props = {
     pending_navigation_resolution?: number | null; resampled?: boolean;
     transitioning: boolean; localization_ready?: boolean;
     error?: string | null; error_map_id?: string | null;
+    static_map_service_ready?: boolean;
+    source_mode?: "slam" | "static" | "switching_slam" | "switching_static";
   };
 };
 
-const sourceLabels = { preset: "预置", generated: "种子", imported: "导入" } as const;
+const sourceLabels = {
+  preset: "预置",
+  generated: "种子",
+  imported: "导入",
+  slam: "SLAM 2D/3D",
+} as const;
 const toolOptions: Array<{ id: MapEditorTool; icon: string; label: string; help: string }> = [
   { id: "select", icon: "↖", label: "选择移动", help: "点选或拖动物体" },
   { id: "obstacle", icon: "◆", label: "障碍物", help: "在地图上放置障碍" },
   { id: "device", icon: "▣", label: "设备", help: "添加可巡检设备" },
   { id: "waypoint", icon: "⌖", label: "巡检点", help: "添加路线目标点" },
+  { id: "transit", icon: "◇", label: "过渡点", help: "引导全局规划路线，经过但不停车" },
 ];
 
 export function MapManagement({
   maps, activeMapId, robotX, robotY, robotYaw,
   onSelect, onApply, onChange, onAdd, onDuplicate, onDelete, onNotice,
   connected, hasPendingChanges, runtimeMap,
+  operation,
 }: Props) {
   const activeMap = maps.find((map) => map.id === activeMapId) ?? maps[0];
   const [tool, setTool] = useState<MapEditorTool>("select");
@@ -78,16 +92,42 @@ export function MapManagement({
     ? runtimeMap.navigation_resolution
     : Math.min(sourceResolution, 0.1);
   const resolutionWasRefined = effectiveNavigationResolution < sourceResolution - 0.0001;
+  const appliesLiveSlamRoute = activeMap.source === "slam" && runtimeMap.static_map_service_ready === false;
+  const staticMapServiceStarting = runtimeMap.static_map_service_ready === false && !appliesLiveSlamRoute;
+  const mapSourceLabel = runtimeMap.source_mode === "static"
+    ? "Nav2 静态地图 + AMCL"
+    : runtimeMap.source_mode === "switching_static"
+      ? "正在切换到 Nav2 静态定位"
+      : runtimeMap.source_mode === "switching_slam"
+        ? "正在切换到实时 SLAM"
+        : "实时 SLAM";
 
   if (!activeMap) return null;
+
+  const selectedWaypointIndex = selection?.kind === "waypoint"
+    ? activeMap.waypoints.findIndex((point) => point.id === selection.value.id)
+    : -1;
+  const selectedWaypointType = selection?.kind === "waypoint"
+    ? waypointType(selection.value, selectedWaypointIndex)
+    : null;
 
   const commit = (patch: Partial<PatrolMap>) => onChange({ ...activeMap, ...patch, updatedAt: new Date().toISOString() });
 
   const placeEntity = (kind: Exclude<MapEditorTool, "select">, x: number, y: number) => {
-    if (kind === "waypoint") {
+    if (kind === "waypoint" || kind === "transit") {
+      if (kind === "transit" && activeMap.waypoints.length === 0) {
+        onNotice("请先添加一个基地巡检点，再添加过渡点");
+        return;
+      }
       const id = Math.max(...activeMap.waypoints.map((point) => point.id), 0) + 1;
-      const waypoint: Waypoint = { id, name: `巡检点 ${id}`, x, y, dwell: 3 };
-      commit({ waypoints: [...activeMap.waypoints, waypoint] });
+      const transit = kind === "transit";
+      const home = activeMap.waypoints.length === 0;
+      const waypoint: Waypoint = transit
+        ? { id, name: `过渡点 ${id}`, type: "TRANSIT", x, y, dwell: 0, count_as_task: false }
+        : home
+          ? { id, name: `基地点 ${id}`, type: "HOME", x, y, dwell: 0, count_as_task: false }
+          : { id, name: `巡检点 ${id}`, type: "INSPECTION", x, y, dwell: 3, count_as_task: true };
+      commit({ waypoints: withWaypointSemantics([...activeMap.waypoints, waypoint]) });
       setSelectedEntity(`waypoint:${id}`);
       onNotice(`已添加 ${waypoint.name}`);
       return;
@@ -118,6 +158,13 @@ export function MapManagement({
   const updateWaypoint = (patch: Partial<Waypoint>) => {
     if (!selection || selection.kind !== "waypoint") return;
     commit({ waypoints: activeMap.waypoints.map((waypoint) => waypoint.id === selection.value.id ? { ...waypoint, ...patch } : waypoint) });
+  };
+
+  const updateWaypointType = (type: "INSPECTION" | "TRANSIT") => {
+    if (!selection || selection.kind !== "waypoint") return;
+    updateWaypoint(type === "TRANSIT"
+      ? { type, dwell: 0, count_as_task: false }
+      : { type, dwell: selection.value.dwell > 0 ? selection.value.dwell : 3, count_as_task: true });
   };
 
   const nudgeSelection = (deltaX: number, deltaY: number) => {
@@ -199,13 +246,13 @@ export function MapManagement({
         <div>
           <span className="map-kicker">SCENARIO LIBRARY</span>
           <h1>地图管理</h1>
-          <p>导入或生成场景，在三维地图中布置障碍物、设备与巡检点。</p>
+          <p>导入或生成场景，在三维地图中布置障碍物、设备、巡检点与过渡点。</p>
         </div>
         <div className="map-head-actions">
           <input ref={fileInput} type="file" accept=".json,.yaml,.yml,.pgm" multiple hidden onChange={(event) => void handleImport(event.target.files)} />
           <button className="secondary-map-action" onClick={() => fileInput.current?.click()} disabled={importing}>{importing ? "正在导入…" : "⇧ 导入地图"}</button>
           <button className="secondary-map-action" onClick={exportMap}>⇩ 导出当前地图</button>
-          <button className="primary-map-action" onClick={() => onApply(activeMap)} disabled={!connected || runtimeMap.transitioning || safetyIssues.length > 0}>{!connected ? "等待车辆连接" : safetyIssues.length ? `修复 ${safetyIssues.length} 个不安全巡检点后应用` : runtimeMap.transitioning ? runtimeMap.localization_ready === false ? "正在校准车辆定位…" : "正在切换地图…" : runtimeMap.active_id === activeMap.id && !hasPendingChanges && !backendError ? "✓ 已应用到车辆" : runtimeMap.active_id === activeMap.id ? "应用修改到车辆" : "应用到车辆"}</button>
+          <button className="primary-map-action" onClick={() => onApply(activeMap)} disabled={!connected || operation.locked || runtimeMap.transitioning || staticMapServiceStarting || safetyIssues.length > 0}>{!connected ? "等待车辆连接" : operation.locked ? operation.owner === "patrol" ? "巡检任务运行中" : operation.owner === "mapping" ? "建图任务运行中" : "地图切换中" : staticMapServiceStarting ? "静态地图组件启动中…" : safetyIssues.length ? `修复 ${safetyIssues.length} 个不安全巡检点后应用` : runtimeMap.transitioning ? runtimeMap.localization_ready === false ? "正在校准车辆定位…" : "正在切换地图…" : appliesLiveSlamRoute ? runtimeMap.active_id === activeMap.id && !hasPendingChanges && !backendError ? "✓ 巡检路线已应用" : "应用巡检路线" : runtimeMap.active_id === activeMap.id && !hasPendingChanges && !backendError ? "✓ 地图与路线已应用" : runtimeMap.active_id === activeMap.id ? "应用地图修改" : "应用地图与路线"}</button>
         </div>
       </div>
 
@@ -220,7 +267,10 @@ export function MapManagement({
                   <span className="map-card-copy">
                     <span><em>{sourceLabels[map.source]}</em>{runtimeMap.active_id === map.id && <b>车辆使用中</b>}{runtimeMap.pending_id === map.id && <b>应用中</b>}{map.id === activeMapId && runtimeMap.active_id !== map.id && <b>编辑中</b>}</span>
                     <strong>{map.name}</strong>
-                    <small>{map.objects.length} 个实体 · {map.waypoints.length} 个巡检点</small>
+                    <small>
+                      {map.voxel?.available ? "2D 栅格 + 3D 体素" : `${map.objects.length} 个实体`}
+                      {" · "}{map.waypoints.length} 个路线点
+                    </small>
                   </span>
                 </button>
                 <button
@@ -248,11 +298,17 @@ export function MapManagement({
           <div className="map-editor-topline">
             <div>
               <input aria-label="地图名称" value={activeMap.name} onChange={(event) => commit({ name: event.target.value })} />
-              <span><i className={backendError || safetyIssues.length ? "error" : ""}></i>{backendError ?? (safetyIssues.length ? `请先修复 ${safetyIssues.length} 个标红的不安全巡检点` : `${sourceLabels[activeMap.source]}地图 · ${activeMap.bounds.width.toFixed(1)} × ${activeMap.bounds.height.toFixed(1)} m · ${sourceResolution} m/格${resolutionWasRefined ? ` → Nav2 自动细化为 ${effectiveNavigationResolution.toFixed(2)} m/格` : ""}`)}</span>
+              <span><i className={backendError || safetyIssues.length ? "error" : ""}></i>{backendError ?? (safetyIssues.length ? `请先修复 ${safetyIssues.length} 个标红的不安全巡检点` : `${appliesLiveSlamRoute ? "实时 SLAM 地图已在车辆内存中" : `${sourceLabels[activeMap.source]}地图`} · ${mapSourceLabel} · ${activeMap.bounds.width.toFixed(1)} × ${activeMap.bounds.height.toFixed(1)} m · ${sourceResolution} m/格${resolutionWasRefined ? ` → Nav2 自动细化为 ${effectiveNavigationResolution.toFixed(2)} m/格` : ""}`)}</span>
             </div>
             <div className="editor-zoom"><button onClick={() => setZoom((value) => Math.max(0.7, value - 0.15))}>−</button><span>{Math.round(zoom * 100)}%</span><button onClick={() => setZoom((value) => Math.min(1.8, value + 0.15))}>＋</button></div>
           </div>
           <div className="map-editor-canvas">
+            {activeMap.source === "slam" && activeMap.waypoints.length === 0 && (
+              <div className="map-slam-onboarding" role="status">
+                <strong>新建 SLAM 地图已同步</strong>
+                <span>先选择“巡检点”，在已探索的自由区域放置第一个基地点，再继续添加巡检路线。</span>
+              </div>
+            )}
             <Industrial3DMap
               map={activeMap}
               robotX={robotX}
@@ -308,11 +364,12 @@ export function MapManagement({
             </div>
           ) : selection?.kind === "waypoint" ? (
             <div className="inspector-form">
-              <label>巡检点名称<input value={selection.value.name} onChange={(event) => updateWaypoint({ name: event.target.value })} /></label>
+              <label>路线点名称<input value={selection.value.name} onChange={(event) => updateWaypoint({ name: event.target.value })} /></label>
+              <label>点位类型<select value={selectedWaypointType ?? "INSPECTION"} disabled={selectedWaypointIndex === 0} onChange={(event) => updateWaypointType(event.target.value as "INSPECTION" | "TRANSIT")}><option value="HOME">基地点</option><option value="INSPECTION">巡检点（停车执行任务）</option><option value="TRANSIT">过渡点（仅引导路线）</option></select></label>
               <div className="inspector-pair"><label>X 坐标<input type="number" step={moveStep} value={selection.value.x} onChange={(event) => updateWaypoint({ x: Number(event.target.value) })} /></label><label>Y 坐标<input type="number" step={moveStep} value={selection.value.y} onChange={(event) => updateWaypoint({ y: Number(event.target.value) })} /></label></div>
               {positionNudge}
-              <label>到点停留时间<div className="dwell-input"><input type="number" min="0" max="3600" value={selection.value.dwell} onChange={(event) => updateWaypoint({ dwell: Number(event.target.value) })} /><span>秒</span></div></label>
-              <div className="waypoint-callout"><i>⌖</i><p><strong>{activeMap.waypoints.findIndex((point) => point.id === selection.value.id) === 0 ? "基地点 · 路线顺序 #1" : `巡检任务 · 路线顺序 #${activeMap.waypoints.findIndex((point) => point.id === selection.value.id) + 1}`}</strong><small>{activeMap.waypoints.findIndex((point) => point.id === selection.value.id) === 0 ? "应用地图时车辆会重置到这里；每轮从此出发并返回。" : "每轮成功到达并完成停留后，剩余次数减 1。"}</small></p></div>
+              {selectedWaypointType === "INSPECTION" && <label>到点停留时间<div className="dwell-input"><input type="number" min="0" max="3600" value={selection.value.dwell} onChange={(event) => updateWaypoint({ dwell: Number(event.target.value) })} /><span>秒</span></div></label>}
+              <div className={`waypoint-callout ${selectedWaypointType === "TRANSIT" ? "transit" : ""}`}><i>{selectedWaypointType === "TRANSIT" ? "◇" : "⌖"}</i><p><strong>{selectedWaypointIndex === 0 ? "基地点 · 路线顺序 #1" : selectedWaypointType === "TRANSIT" ? `路线过渡点 · 顺序 #${selectedWaypointIndex + 1}` : `巡检任务 · 路线顺序 #${selectedWaypointIndex + 1}`}</strong><small>{selectedWaypointIndex === 0 ? "应用地图时车辆会重置到这里；每轮从此出发并返回。" : selectedWaypointType === "TRANSIT" ? "强制全局路线依次经过此点；到达后不停留，也不计入巡检任务次数。" : "每轮成功到达并完成停留后，剩余次数减 1。"}</small></p></div>
             </div>
           ) : (
             <div className="empty-inspector"><span>↖</span><strong>选择一个场景元素</strong><p>可编辑名称、坐标与三维尺寸；也可以从左侧选择或生成另一张地图。</p></div>
@@ -320,7 +377,7 @@ export function MapManagement({
           <div className="map-summary">
             <span><b>{activeMap.objects.filter((object) => object.type === "obstacle").length}</b>障碍物</span>
             <span><b>{activeMap.objects.filter((object) => object.type === "device").length}</b>设备</span>
-            <span><b>{activeMap.waypoints.length}</b>巡检点</span>
+            <span><b>{activeMap.waypoints.length}</b>路线点</span>
           </div>
         </aside>
       </div>

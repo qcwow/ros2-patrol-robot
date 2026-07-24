@@ -28,6 +28,11 @@ class RgbdProcessor(Node):
         self.declare_parameter('depth_topic', '/camera/depth/image_rect_raw')
         self.declare_parameter('camera_info_topic', '/camera/depth/camera_info')
         self.declare_parameter('point_cloud_topic', '/camera/points/filtered')
+        self.declare_parameter(
+            'mapping_point_cloud_topic',
+            '/camera/points/mapping',
+        )
+        self.declare_parameter('mapping_publish_rate', 3.0)
         self.declare_parameter('use_color', True)
         self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('min_depth', 0.25)
@@ -47,6 +52,9 @@ class RgbdProcessor(Node):
         )
         self._voxel_size = float(self.get_parameter('voxel_size').value)
         self._max_points = int(self.get_parameter('max_points').value)
+        self._mapping_publish_rate = float(
+            self.get_parameter('mapping_publish_rate').value
+        )
         queue_size = int(self.get_parameter('sync_queue_size').value)
         sync_slop = float(self.get_parameter('sync_slop_seconds').value)
 
@@ -59,6 +67,29 @@ class RgbdProcessor(Node):
             PointCloud2,
             point_cloud_topic,
             qos_profile_sensor_data,
+        )
+        mapping_point_cloud_topic = str(
+            self.get_parameter('mapping_point_cloud_topic').value
+        )
+        self._mapping_publisher = (
+            self.create_publisher(
+                PointCloud2,
+                mapping_point_cloud_topic,
+                qos_profile_sensor_data,
+            )
+            if mapping_point_cloud_topic and self._mapping_publish_rate > 0.0
+            else None
+        )
+        self._mapping_publish_period = (
+            1.0 / self._mapping_publish_rate
+            if self._mapping_publisher is not None
+            else 0.0
+        )
+        self._last_mapping_publish = float('-inf')
+        mapping_status = (
+            f'{mapping_point_cloud_topic}@{self._mapping_publish_rate:g}Hz'
+            if self._mapping_publisher is not None
+            else '(关闭)'
         )
 
         depth_topic = str(self.get_parameter('depth_topic').value)
@@ -110,7 +141,8 @@ class RgbdProcessor(Node):
         self.get_logger().info(
             'RGB-D 处理器已启动：'
             f'彩色={color_topic}，深度={depth_topic}，内参={camera_info_topic}，'
-            f'点云={point_cloud_topic}'
+            f'避障点云={point_cloud_topic}，'
+            f'建图点云={mapping_status}'
         )
 
     def _validate_parameters(self, queue_size: int, sync_slop: float) -> None:
@@ -124,6 +156,8 @@ class RgbdProcessor(Node):
             raise ValueError('voxel_size 不能小于 0')
         if self._max_points < 1:
             raise ValueError('max_points 必须大于等于 1')
+        if self._mapping_publish_rate < 0.0:
+            raise ValueError('mapping_publish_rate 不能小于 0')
         if queue_size < 2:
             raise ValueError('sync_queue_size 必须大于等于 2')
         if sync_slop < 0.0:
@@ -169,6 +203,14 @@ class RgbdProcessor(Node):
             )
             cloud = self._make_cloud(depth_message, result.points, result.colors)
             self._publisher.publish(cloud)
+            now = time.monotonic()
+            if (
+                self._mapping_publisher is not None
+                and now - self._last_mapping_publish
+                >= self._mapping_publish_period
+            ):
+                self._mapping_publisher.publish(cloud)
+                self._last_mapping_publish = now
             self._processed_frames += 1
             self._log_status_if_due(result.points.shape[0])
         except (TypeError, ValueError) as error:

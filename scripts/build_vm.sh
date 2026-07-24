@@ -46,7 +46,8 @@ echo "正在虚拟机内安装工作空间依赖并编译。"
    colcon build --symlink-install --event-handlers console_direct+ && \
    test -f install/setup.bash && \
    source install/setup.bash && \
+   ros2 pkg prefix octomap_server && \
    ros2 pkg prefix patrol_robot_camera && \
    ros2 pkg prefix patrol_robot_simulator && \
    ros2 pkg prefix patrol_robot_bringup && \
-   echo '编译验证通过：相机处理器、轻量仿真器和总启动包均已安装。'"
+   echo '编译验证通过：OctoMap、相机处理器、轻量仿真器和总启动包均已安装。'"

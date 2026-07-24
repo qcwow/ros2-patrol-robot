@@ -7,7 +7,10 @@
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>nav2_amcl</exec_depend>
   <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>nav2_lifecycle_manager</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
   <exec_depend>patrol_robot_camera</exec_depend>
   <exec_depend>patrol_robot_gazebo</exec_depend>
   <exec_depend>patrol_robot_navigation</exec_depend>

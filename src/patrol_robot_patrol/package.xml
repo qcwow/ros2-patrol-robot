@@ -2,7 +2,7 @@
 <package format="3">
   <name>patrol_robot_patrol</name>
   <version>0.1.0</version>
-  <description>Auditable multi-waypoint patrol manager built from individual Nav2 NavigateToPose tasks.</description>
+  <description>Patrol management and autonomous frontier exploration for Nav2.</description>
   <maintainer email="maintainer@example.com">Patrol Robot Maintainer</maintainer>
   <license>Apache-2.0</license>
 

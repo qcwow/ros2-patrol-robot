@@ -1,9 +1,9 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { decodeOccupancy, type PatrolMap } from "./mapTypes";
+import { decodeOccupancy, waypointType, type PatrolMap } from "./mapTypes";
 
-export type MapEditorTool = "select" | "obstacle" | "device" | "waypoint";
+export type MapEditorTool = "select" | "obstacle" | "device" | "waypoint" | "transit";
 
 type Props = {
   map: PatrolMap;
@@ -215,6 +215,8 @@ export function Industrial3DMap({
 
       map.waypoints.forEach((waypoint, index) => {
         const point = project(waypoint.x, waypoint.y);
+        const semanticType = waypointType(waypoint, index);
+        const transit = semanticType === "TRANSIT";
         const active = selectedEntity === `waypoint:${waypoint.id}` || (!editing && waypoint.id === selected);
         const unsafe = unsafeWaypointIds?.has(waypoint.id) ?? false;
         if (unsafe) {
@@ -227,8 +229,17 @@ export function Industrial3DMap({
           context.stroke();
         }
         context.beginPath();
-        context.arc(point.x, point.y, active ? 12 : 10, 0, Math.PI * 2);
-        context.fillStyle = unsafe ? "#e32636" : active || index === 0 ? "#ff8a24" : "#71899b";
+        if (transit) {
+          const radius = active ? 13 : 11;
+          context.moveTo(point.x, point.y - radius);
+          context.lineTo(point.x + radius, point.y);
+          context.lineTo(point.x, point.y + radius);
+          context.lineTo(point.x - radius, point.y);
+          context.closePath();
+        } else {
+          context.arc(point.x, point.y, active ? 12 : 10, 0, Math.PI * 2);
+        }
+        context.fillStyle = unsafe ? "#e32636" : transit ? "#16a085" : active || semanticType === "HOME" ? "#ff8a24" : "#71899b";
         context.fill();
         context.strokeStyle = unsafe ? "#fff1f2" : "#ffffff";
         context.lineWidth = 3;
@@ -340,5 +351,5 @@ export function Industrial3DMap({
     };
   }, [editing, map, onMoveEntity, onPlace, onSelect, onSelectEntity, robotX, robotY, robotYaw, selected, selectedEntity, tool, unsafeWaypointIds, zoom]);
 
-  return <canvas ref={canvasRef} className="industrial-3d-map" role="img" aria-label={`${map.name} 三维地图，显示设备、障碍物、巡检点和车辆位置`} />;
+  return <canvas ref={canvasRef} className="industrial-3d-map" role="img" aria-label={`${map.name} 三维地图，显示设备、障碍物、巡检点、过渡点和车辆位置`} />;
 }

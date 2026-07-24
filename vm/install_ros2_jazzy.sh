@@ -39,6 +39,7 @@ sudo apt-get install -y \
   ros-jazzy-desktop \
   ros-jazzy-navigation2 \
   ros-jazzy-nav2-bringup \
+  ros-jazzy-octomap-server \
   ros-jazzy-ros-gz \
   ros-jazzy-slam-toolbox \
   ros-jazzy-teleop-twist-keyboard \

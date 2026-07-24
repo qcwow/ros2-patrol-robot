@@ -9,6 +9,11 @@ from launch_ros.substitutions import FindPackageShare
 def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     map_yaml = LaunchConfiguration('map')
+    initial_x = LaunchConfiguration('initial_x')
+    initial_y = LaunchConfiguration('initial_y')
+    initial_yaw = LaunchConfiguration('initial_yaw')
+    scan_samples = LaunchConfiguration('scan_samples')
+    scan_rate = LaunchConfiguration('scan_rate')
 
     description_share = FindPackageShare('patrol_robot_description')
     navigation_share = FindPackageShare('patrol_robot_navigation')
@@ -40,11 +45,11 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'map_yaml': map_yaml,
-            'initial_x': -6.0,
-            'initial_y': -4.0,
-            'initial_yaw': 0.0,
-            'scan_samples': 240,
-            'scan_rate': 10.0,
+            'initial_x': ParameterValue(initial_x, value_type=float),
+            'initial_y': ParameterValue(initial_y, value_type=float),
+            'initial_yaw': ParameterValue(initial_yaw, value_type=float),
+            'scan_samples': ParameterValue(scan_samples, value_type=int),
+            'scan_rate': ParameterValue(scan_rate, value_type=float),
             'linear_speed_limit': 1.5,
         }],
     )
@@ -52,6 +57,11 @@ def generate_launch_description():
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('map', default_value=default_map),
+        DeclareLaunchArgument('initial_x', default_value='-6.0'),
+        DeclareLaunchArgument('initial_y', default_value='-4.0'),
+        DeclareLaunchArgument('initial_yaw', default_value='0.0'),
+        DeclareLaunchArgument('scan_samples', default_value='240'),
+        DeclareLaunchArgument('scan_rate', default_value='10.0'),
         state_publisher,
         simulator,
     ])

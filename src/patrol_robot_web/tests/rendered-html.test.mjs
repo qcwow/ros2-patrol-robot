@@ -42,16 +42,20 @@ test("server-renders the patrol robot control console", async () => {
   assert.match(html, /前进/);
   assert.match(html, /后退/);
   assert.match(html, /地图管理/);
+  assert.match(html, /自主建图/);
 });
 
 test("includes live ROS controls and both map implementations", async () => {
-  const [page, map2d, map3d, mapManagement, mapTypes, bridge, simulator, nav2, navLaunch, gazeboSync, gazeboLaunch, robotDescription, bringup, patrolManager, navigationHealth, footprintGeometry, taskLedger, patrolTree] = await Promise.all([
+  const [page, map2d, map3d, autonomousMapping, liveMapping, mapManagement, mapTypes, bridge, mapSourceMux, simulator, nav2, navLaunch, gazeboSync, gazeboLaunch, robotDescription, bringup, mappingBringup, patrolManager, navigationHealth, footprintGeometry, taskLedger, patrolTree] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/Industrial2DMap.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/Industrial3DMap.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/AutonomousMappingWorkspace.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/LiveMappingWorkspace.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/MapManagement.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/mapTypes.ts", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_web_bridge/patrol_robot_web_bridge/bridge_node.py", import.meta.url), "utf8"),
+    readFile(new URL("../../patrol_robot_web_bridge/patrol_robot_web_bridge/map_source_mux.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_simulator/patrol_robot_simulator/simulator_node.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_navigation/config/nav2_params.yaml", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_navigation/launch/navigation.launch.py", import.meta.url), "utf8"),
@@ -59,6 +63,7 @@ test("includes live ROS controls and both map implementations", async () => {
     readFile(new URL("../../patrol_robot_gazebo/launch/simulation.launch.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_description/urdf/patrol_robot.urdf.xacro", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_bringup/launch/simulation_navigation.launch.py", import.meta.url), "utf8"),
+    readFile(new URL("../../patrol_robot_bringup/launch/simulation_mapping.launch.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_patrol/patrol_robot_patrol/patrol_manager.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_patrol/patrol_robot_patrol/navigation_health_monitor.py", import.meta.url), "utf8"),
     readFile(new URL("../../patrol_robot_patrol/patrol_robot_patrol/footprint_geometry.py", import.meta.url), "utf8"),
@@ -93,16 +98,57 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(map3d, /industrial-3d-map/);
   assert.match(map3d, /onMoveEntity/);
   assert.match(map3d, /dragStateRef/);
+  assert.match(autonomousMapping, /OrbitControls/);
+  assert.match(autonomousMapping, /InstancedMesh/);
+  assert.match(autonomousMapping, /开始自主探索建图/);
+  assert.match(autonomousMapping, /结束并保存地图/);
+  assert.match(autonomousMapping, /放弃当前建图/);
+  assert.match(autonomousMapping, /显示机器人视场角 FOV/);
+  assert.match(autonomousMapping, /显示激光雷达射线/);
+  assert.match(autonomousMapping, /\/api\/mapping\/start/);
+  assert.match(autonomousMapping, /\/api\/mapping\/finish/);
+  assert.match(autonomousMapping, /\/api\/mapping\/discard/);
+  assert.match(autonomousMapping, /应用此地图 \/ 部署/);
+  assert.match(liveMapping, /\/api\/mapping\/map/);
+  assert.match(liveMapping, /\/api\/mapping\/explore/);
+  assert.match(liveMapping, /\/api\/mapping\/finish/);
+  assert.match(liveMapping, /\/api\/mapping\/deploy/);
+  assert.match(liveMapping, /\/api\/control\/manual/);
+  assert.match(liveMapping, /decodeRuns/);
+  assert.match(liveMapping, /实时二维 SLAM 栅格地图/);
+  assert.match(liveMapping, /相机实时画面/);
+  assert.match(liveMapping, /人工方向控制/);
+  assert.match(liveMapping, /按住方向键移动/);
+  assert.match(liveMapping, /mapping-drive-forward/);
+  assert.match(liveMapping, /mapping-drive-left/);
+  assert.match(liveMapping, /mapping-drive-stop/);
+  assert.match(liveMapping, /mapping-drive-right/);
+  assert.match(liveMapping, /mapping-drive-reverse/);
+  assert.match(liveMapping, /一键自主探路/);
+  assert.match(liveMapping, /blockedByOtherTask/);
+  assert.match(liveMapping, /巡检任务运行中/);
+  assert.match(liveMapping, /应用此地图 \/ 部署/);
+  assert.match(liveMapping, /设置巡检点/);
+  assert.match(liveMapping, /2D 栅格 \+ 3D OctoMap/);
+  assert.match(liveMapping, /车辆网关未连接/);
+  assert.match(liveMapping, /连接车辆/);
+  assert.match(page, /changeRobotGateway/);
+  assert.match(page, /telemetry\.operation\.locked/);
+  assert.match(page, /建图任务运行中/);
+  assert.match(page, /恢复应用地图并巡检/);
   assert.match(mapManagement, /导入地图/);
   assert.match(mapManagement, /onSelect/);
   assert.match(mapManagement, /onApply/);
-  assert.match(mapManagement, /应用修改到车辆/);
+  assert.match(mapManagement, /应用巡检路线/);
+  assert.match(mapManagement, /地图与路线已应用/);
+  assert.match(mapManagement, /实时 SLAM 地图已在车辆内存中/);
   assert.match(mapManagement, /map-card-delete/);
   assert.match(mapManagement, /不安全巡检点/);
   assert.match(mapManagement, /随机地图种子/);
   assert.match(mapManagement, /障碍物/);
   assert.match(mapManagement, /设备/);
   assert.match(mapManagement, /巡检点/);
+  assert.match(mapManagement, /新建 SLAM 地图已同步/);
   assert.match(mapManagement, /过渡点/);
   assert.match(mapManagement, /TRANSIT/);
   assert.match(mapManagement, /count_as_task: false/);
@@ -116,6 +162,30 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(mapTypes, /validatePatrolWaypoints/);
   assert.match(mapTypes, /WAYPOINT_SAFETY_RADIUS = 0\.45/);
   assert.match(mapTypes, /GAZEBO_BOUNDARY_WALL_INSET = 0\.50/);
+  assert.match(mappingBringup, /executable='patrol_manager'/);
+  assert.match(mappingBringup, /executable='navigation_health_monitor'/);
+  assert.match(mappingBringup, /executable='map_source_mux'/);
+  assert.match(mappingBringup, /executable='map_server'/);
+  assert.match(mappingBringup, /executable='amcl'/);
+  assert.match(mappingBringup, /'tf_broadcast': False/);
+  assert.match(mappingBringup, /'patrol_route_ready_at_start': False/);
+  assert.match(mappingBringup, /'autonomous_exploration_available'/);
+  assert.match(mappingBringup, /'scan_samples': '360'/);
+  assert.match(mapSourceMux, /\/slam_map/);
+  assert.match(mapSourceMux, /\/static_map/);
+  assert.match(mapSourceMux, /\/patrol\/map_source\/select/);
+  assert.match(mapSourceMux, /clear_slam/);
+  assert.match(bridge, /patrol_route_ready/);
+  assert.match(bridge, /MAPPING_OPERATION_STATES/);
+  assert.match(bridge, /拒绝同时启动巡检/);
+  assert.match(bridge, /拒绝同时启动建图/);
+  assert.match(bridge, /_mapping_base_payload/);
+  assert.match(bridge, /_pending_patrol_start/);
+  assert.match(bridge, /_scenario_route_connectivity_issues/);
+  assert.match(bridge, /cv2\.distanceTransform/);
+  assert.match(bridge, /_prepare_slam_mapping_mode/);
+  assert.match(bridge, /TRANSITION_DEACTIVATE/);
+  assert.match(bridge, /TRANSITION_ACTIVATE/);
   assert.match(mapTypes, /WAYPOINT_BOUNDARY_CLEARANCE/);
   assert.match(mapTypes, /withRouteHeadings/);
   assert.match(mapTypes, /withWaypointSemantics/);
@@ -127,6 +197,14 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(bridge, /\/api\/perception\/mode/);
   assert.match(bridge, /\/api\/maps\/activate/);
   assert.match(bridge, /\/api\/maps\/active/);
+  assert.match(bridge, /\/api\/mapping\/map/);
+  assert.match(bridge, /\/api\/mapping\/maps/);
+  assert.match(bridge, /path\.startswith\('\/api\/mapping\/'\)/);
+  assert.match(bridge, /_save_mapping_map/);
+  assert.match(bridge, /_deploy_mapping_map/);
+  assert.match(bridge, /OccupancyGrid/);
+  assert.match(bridge, /rle-int8/);
+  assert.match(bridge, /SaveMap/);
   assert.match(bridge, /_pending_map_payload/);
   assert.match(bridge, /LoadMap/);
   assert.match(bridge, /\/patrol\/map_scenario/);
@@ -169,6 +247,9 @@ test("includes live ROS controls and both map implementations", async () => {
   assert.match(page, /当前视野没有障碍不会停车/);
   assert.match(simulator, /OccupancyMap\.from_scenario/);
   assert.match(simulator, /\/patrol\/map_scenario/);
+  assert.match(simulator, /\/patrol\/map_scenario_status/);
+  assert.match(simulator, /_publish_scenario_status/);
+  assert.match(simulator, /_pose_is_free_on_map/);
   assert.match(gazeboSync, /OWNED_PREFIX = 'patrol_scene_'/);
   assert.match(gazeboSync, /gz\.msgs\.EntityFactory/);
   assert.match(gazeboSync, /gz\.msgs\.Pose/);

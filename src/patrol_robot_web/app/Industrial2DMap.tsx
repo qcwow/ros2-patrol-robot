@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef } from "react";
-import { decodeOccupancy, type PatrolMap } from "./mapTypes";
+import { decodeOccupancy, waypointType, type PatrolMap } from "./mapTypes";
 
 type Props = {
   map: PatrolMap;
@@ -169,9 +169,20 @@ export function Industrial2DMap({ map, robotX, robotY, robotYaw, navigationPath 
       }
       map.waypoints.forEach((waypoint, index) => {
         const point = project(waypoint.x, waypoint.y);
+        const semanticType = waypointType(waypoint, index);
+        const transit = semanticType === "TRANSIT";
         context.beginPath();
-        context.arc(point.x, point.y, waypoint.id === selected ? 12 : 10, 0, Math.PI * 2);
-        context.fillStyle = waypoint.id === selected || index === 0 ? "#e9822b" : "#637b89";
+        if (transit) {
+          const radius = waypoint.id === selected ? 13 : 11;
+          context.moveTo(point.x, point.y - radius);
+          context.lineTo(point.x + radius, point.y);
+          context.lineTo(point.x, point.y + radius);
+          context.lineTo(point.x - radius, point.y);
+          context.closePath();
+        } else {
+          context.arc(point.x, point.y, waypoint.id === selected ? 12 : 10, 0, Math.PI * 2);
+        }
+        context.fillStyle = transit ? "#16a085" : waypoint.id === selected || semanticType === "HOME" ? "#e9822b" : "#637b89";
         context.fill();
         context.strokeStyle = "#ffffff";
         context.lineWidth = 3;

@@ -1,0 +1,45 @@
+octomap_server:
+  ros__parameters:
+    # SLAM Toolbox owns map -> odom. OctoMap looks up the stamped camera pose
+    # through map -> odom -> base -> gimbal -> camera before every insertion.
+    frame_id: map
+    base_frame_id: base_footprint
+
+    # The RGB-D processor already downsamples at 5 cm. An 8 cm persistent map
+    # keeps pipe and valve geometry useful without overwhelming the VM CPU.
+    resolution: 0.08
+    max_depth: 16
+
+    # Keep the useful plant volume and reject stray simulated depth returns.
+    # These limits are evaluated after transforming points into the map frame.
+    point_cloud_min_z: -0.20
+    point_cloud_max_z: 3.50
+    occupancy_min_z: -0.20
+    occupancy_max_z: 3.50
+
+    # Ray tracing records both occupied endpoints and observed free space.
+    # The camera itself reaches 8 m, but limiting insertion to 6 m reduces
+    # depth noise and bounds the cost of every scan.
+    sensor_model.max_range: 6.0
+    sensor_model.hit: 0.70
+    sensor_model.miss: 0.40
+    sensor_model.min: 0.12
+    sensor_model.max: 0.97
+
+    # Ground fitting is intentionally disabled for the first version. The
+    # camera does not always see enough floor while the gimbal is raised, so a
+    # per-frame RANSAC ground filter would intermittently reject valid scans.
+    filter_ground_plane: false
+    filter_speckles: true
+    compress_map: true
+
+    # color_octomap_server_node preserves the RGB field already present in the
+    # filtered cloud. Free cells stay internal unless explicitly requested.
+    colored_map: true
+    use_height_map: false
+    publish_free_space: false
+    latch: true
+
+    # Nav2 continues to use SLAM Toolbox's /map. Publish this diagnostic
+    # projection as /octomap/projected_map so it cannot replace the SLAM map.
+    incremental_2D_projection: false

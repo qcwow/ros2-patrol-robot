@@ -294,12 +294,23 @@ class LightweightSimulator(Node):
         self._scan_publisher = self.create_publisher(
             LaserScan, '/scan', qos_profile_sensor_data
         )
+        self._scenario_status_publisher = self.create_publisher(
+            String,
+            '/patrol/map_scenario_status',
+            10,
+        )
         self._tf_broadcaster = TransformBroadcaster(self)
         self.create_subscription(Twist, '/cmd_vel', self._on_command, 10)
         self.create_subscription(
             String,
             '/patrol/map_scenario',
             self._on_map_scenario,
+            10,
+        )
+        self.create_subscription(
+            String,
+            '/patrol/reset_pose',
+            self._on_reset_pose,
             10,
         )
 
@@ -330,20 +341,104 @@ class LightweightSimulator(Node):
         self._last_command = time.monotonic()
 
     def _on_map_scenario(self, message: String) -> None:
+        payload = {}
         try:
             payload = json.loads(message.data)
             next_map = OccupancyMap.from_scenario(payload)
-            if not next_map.is_occupied(*self._map_pose()[:2]):
-                self._map = next_map
-                self._ray_step = min(0.10, self._map.resolution / 2.0)
-                self.get_logger().warning(
-                    f'仿真场景已切换：{payload.get("name", "未命名地图")}，'
-                    f'{next_map.width}x{next_map.height} 栅格'
-                )
+            waypoints = payload.get('waypoints') or []
+            if not waypoints or not isinstance(waypoints[0], dict):
+                raise ValueError('地图缺少作为基地的第一个巡检点')
+            home = waypoints[0]
+            home_x = float(home.get('x'))
+            home_y = float(home.get('y'))
+            if home.get('yaw') is not None:
+                home_yaw = normalize_angle(float(home.get('yaw')))
             else:
-                self.get_logger().error('新地图中车辆当前位置被占用，拒绝切换仿真场景')
+                home_yaw = 0.0
+                for candidate in waypoints[1:]:
+                    if not isinstance(candidate, dict):
+                        continue
+                    target_x = float(candidate.get('x', home_x))
+                    target_y = float(candidate.get('y', home_y))
+                    if math.hypot(target_x - home_x, target_y - home_y) > 1e-6:
+                        home_yaw = math.atan2(
+                            target_y - home_y,
+                            target_x - home_x,
+                        )
+                        break
+            if not all(
+                math.isfinite(value)
+                for value in (home_x, home_y, home_yaw)
+            ):
+                raise ValueError('基地坐标不是有限数字')
+            if not self._pose_is_free_on_map(next_map, home_x, home_y):
+                raise ValueError('新地图的基地巡检点无法容纳车体')
+
+            # Scene replacement and teleportation are one transaction. This
+            # mirrors gazebo_scene_sync and gives AMCL, Nav2, and the browser
+            # one unambiguous readiness acknowledgement.
+            self._map = next_map
+            self._ray_step = min(0.10, self._map.resolution / 2.0)
+            self._set_pose_origin(home_x, home_y, home_yaw)
+            self.get_logger().warning(
+                f'仿真场景已切换：{payload.get("name", "未命名地图")}，'
+                f'{next_map.width}x{next_map.height} 栅格；'
+                f'车辆已归位 ({home_x:.2f}, {home_y:.2f})'
+            )
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
             self.get_logger().error(f'地图场景数据无效：{error}')
+            self._publish_scenario_status(payload, False, str(error))
+            return
+        self._publish_scenario_status(payload, True, None)
+
+    def _publish_scenario_status(
+        self,
+        payload: dict,
+        ok: bool,
+        error: str | None,
+    ) -> None:
+        message = String()
+        message.data = json.dumps({
+            'map_id': str(payload.get('id', '')),
+            'ok': bool(ok),
+            'robot_home_ready': bool(ok),
+            'error': error,
+        }, ensure_ascii=False)
+        self._scenario_status_publisher.publish(message)
+
+    def _on_reset_pose(self, message: String) -> None:
+        try:
+            payload = json.loads(message.data)
+            x = float(payload.get('x', self._initial_x))
+            y = float(payload.get('y', self._initial_y))
+            yaw = normalize_angle(float(payload.get('yaw', self._initial_yaw)))
+            if not all(math.isfinite(value) for value in (x, y, yaw)):
+                raise ValueError('归位坐标不是有限数字')
+            if not self._pose_is_free(x, y):
+                raise ValueError('原点位于障碍物内，拒绝归位')
+        except (json.JSONDecodeError, TypeError, ValueError) as error:
+            self.get_logger().error(f'车辆归位命令无效：{error}')
+            return
+
+        self._set_pose_origin(x, y, yaw)
+        self.get_logger().warning(
+            f'车辆已归位：x={x:.2f}, y={y:.2f}, yaw={yaw:.2f}'
+        )
+
+    def _set_pose_origin(self, x: float, y: float, yaw: float) -> None:
+        self._initial_x = x
+        self._initial_y = y
+        self._initial_yaw = normalize_angle(yaw)
+        self._odom_x = 0.0
+        self._odom_y = 0.0
+        self._odom_yaw = 0.0
+        self._linear_command = 0.0
+        self._angular_command = 0.0
+        self._actual_linear = 0.0
+        self._actual_angular = 0.0
+        self._left_wheel_position = 0.0
+        self._right_wheel_position = 0.0
+        self._last_command = time.monotonic()
 
     @staticmethod
     def _stamp(simulation_time: float) -> TimeMessage:
@@ -364,13 +459,21 @@ class LightweightSimulator(Node):
         )
 
     def _pose_is_free(self, map_x: float, map_y: float) -> bool:
-        if self._map.is_occupied(map_x, map_y):
+        return self._pose_is_free_on_map(self._map, map_x, map_y)
+
+    def _pose_is_free_on_map(
+        self,
+        occupancy_map: OccupancyMap,
+        map_x: float,
+        map_y: float,
+    ) -> bool:
+        if occupancy_map.is_occupied(map_x, map_y):
             return False
         for index in range(16):
             angle = index * math.pi / 8.0
             check_x = map_x + self._robot_radius * math.cos(angle)
             check_y = map_y + self._robot_radius * math.sin(angle)
-            if self._map.is_occupied(check_x, check_y):
+            if occupancy_map.is_occupied(check_x, check_y):
                 return False
         return True
 

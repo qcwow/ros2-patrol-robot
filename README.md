@@ -8,6 +8,7 @@
 当前版本已经完成多点自动巡航、网页人工控制、实时摄像画面、RGB-D 点云处理，
 以及激光雷达、纯视觉点云和二者融合三种避障感知模式。当前“纯视觉”指不使用
 激光障碍层、只使用 RGB-D 深度点云进行避障；AMCL 定位仍依赖激光 `/scan`。
+建图模式还可把 RGB-D 点云持续融合为可保存的彩色 OctoMap 三维体素地图。
 漏液、漏气、仪表读数等业务识别，以及完全无激光的视觉定位仍属于后续阶段。
 
 ## 已包含的功能
@@ -17,6 +18,7 @@
 - 可水平、俯仰转动的 RGB-D 云台相机仿真
 - RGB 与深度帧同步、相机内参解析和校准投影
 - 深度范围过滤、像素抽样、体素降采样和 XYZRGB 点云发布
+- 独立 3 Hz 建图点云、彩色 OctoMap 增量融合和 `.ot` 地图保存
 - 无 OpenGL 依赖的二维运动与激光仿真
 - 简化管廊 Gazebo 场景
 - Gazebo 3D 自动循环巡检，以及雷达、RGB-D 视觉或二者融合避障
@@ -51,6 +53,9 @@ RGB-D 彩色图 + 深度图 → 点云过滤 → 相机 ObstacleLayer ├→ 本
 轮速里程计 + IMU → EKF → odom/base_footprint TF
 静态地图 + /scan + /odom → AMCL → map/odom TF
 
+建图模式：/scan + /odom → SLAM Toolbox → map/odom TF + 实时二维地图
+          RGB-D 点云 + map/camera TF → OctoMap → 彩色三维占据体素
+
 导航健康监控 → 巡检管理器 → 停车 / 有限低速恢复 / BLOCKED
 
 浏览器控制台 ←HTTP 8765→ ROS 2 Web 网关
@@ -68,7 +73,8 @@ RGB-D 彩色图 + 深度图 → 点云过滤 → 相机 ObstacleLayer ├→ 本
 | 感知切换 | 已完成雷达、视觉、融合三种模式和失效停车保护 |
 | 摄像监控 | 已完成网页低延迟画面、开关和两轴云台控制 |
 | 视觉定位 | 未完成；当前 AMCL 仍使用激光 `/scan` |
-| 长期 3D 地图 | 未完成；当前体素层用于实时导航避障，不是持久化三维重建 |
+| 长期 3D 地图 | 已完成第一阶段；可增量构建、显示并保存彩色 OctoMap，回环后离线重建待后续实现 |
+| 语义 3D 地图 | 未完成；下一阶段把识别掩膜、置信度和时间信息融合到体素或语义地标 |
 | Depth Anything | 当前未使用；现阶段优先使用真实 RGB-D 深度，降低车载推理算力需求 |
 | 化工业务识别 | 漏液、漏气、烟雾、仪表读数和设备异常识别待后续实现 |
 
@@ -385,6 +391,7 @@ RGB-D 相机会同时发布：
 /camera/depth/image_rect_raw     已对齐深度图
 /camera/depth/camera_info        深度相机内参
 /camera/points/filtered          经过滤的 XYZRGB 点云
+/camera/points/mapping           限制为 3 Hz 的持久建图点云
 /camera/gimbal/pan/command       云台水平目标（弧度）
 /camera/gimbal/tilt/command      云台俯仰目标（弧度）
 ```
@@ -634,6 +641,122 @@ ros2 launch patrol_robot_bringup simulation_navigation.launch.py \
 
 `map` 参数会由统一启动文件传递给 Nav2，因此无需修改源代码即可切换地图。
 
+### 10.1 边定位边建立彩色 3D 体素地图
+
+3D 建图必须使用 Gazebo RGB-D 模式，轻量二维仿真器不生成相机数据。第一次使用
+前先同步、安装 OctoMap 依赖并编译：
+
+```bash
+./scripts/setup_vm.sh
+./scripts/build_vm.sh
+```
+
+推荐使用 Ubuntu 图形桌面。该入口会同时打开 Gazebo 和配置好的 RViz，并使用
+轮速里程计与 IMU 的 EKF 结果，而不是 Gazebo 真值。Nav2 与前沿探索服务会提前
+就绪，但车辆默认保持人工模式；只有点击网页“一键自主探路”后，机器人才会从
+实时二维 SLAM 地图中寻找“已知自由区与未知区的边界”，通过 Nav2 逐个接近安全
+可达的前沿，并同步扩展彩色 OctoMap：
+
+```bash
+cd ~/robot_patrol_ws
+./vm/run_mapping_3d_gui.sh
+```
+
+如果 VMware 没有可用的 OpenGL 3.3，先登录 Ubuntu 桌面，再从 Mac 用 CPU 软件
+渲染启动同一套图形仿真：
+
+```bash
+./scripts/run_mapping_3d_gui_vm.sh
+```
+
+只有虚拟机具备可用的 EGL / OpenGL 设备时，才使用无界面入口。该脚本会强制
+Mesa 软件 OpenGL，以规避 VMware 将不可用虚拟显卡选作 EGL 渲染设备的问题：
+
+```bash
+./scripts/run_mapping_3d_vm.sh
+```
+
+若日志中 `gazebo` 以 `exit code 139` 退出，说明当前虚拟机的 EGL 无界面渲染仍不
+兼容；随后出现的 `controller_server exit code -6` 只是全局关闭时的次生错误。
+此时不要修改 Nav2 参数，登录 Ubuntu 图形桌面后改用
+`./scripts/run_mapping_3d_gui_vm.sh`。
+
+自主探索会避开占据栅格、拒绝穿越未知区，并将导航失败点暂时加入黑名单。连续
+多轮没有前沿时状态为 `COMPLETED`；仅剩不满足安全间距的残留前沿时状态为
+`COMPLETED_WITH_UNREACHABLE`，车辆会停车而不会强行接近障碍。
+
+建图启动文件同时运行车辆 Web 网关。按照第 6.1 节启动网页后，点击侧栏
+“自主建图”，即可在浏览器中：
+
+- 实时查看 `/map` 逐步展开的二维栅格和 `map -> base_footprint` 机器人位姿
+- 查看 RGB-D 相机画面，并用带速度限制和松手看门狗的方向按钮手动扫图
+- 一键调用 Frontier Explorer 自主探路，查看前沿数量、到达次数和建图覆盖率
+- 输入地图名称，将 YAML + PGM 保存到 `~/.ros/patrol_robot/maps`
+- 在地图仓库中删除历史地图，或直接切换到静态定位并部署到机器人内存
+
+建图启动入口同时保留原有静态地图导航能力，不需要为了巡检旧地图再启动另一套
+仿真。实时建图时由 SLAM Toolbox 发布定位变换；应用自主建图、预置、导入或随机
+种子地图时，系统会先停止车辆，暂停 SLAM，加载静态栅格，再启用 AMCL。两种模式
+共用原来的 Nav2 planner、controller、行为树、避障层和巡检管理器。`/map` 由地图
+源选择器统一发布，因此不会出现 SLAM 与 map_server 同时抢占地图话题的问题。
+
+“应用地图”还会在切换前检查所有巡检点的车体安全距离和整条路线的连通性。检查
+未通过时地图不会生效，巡检按钮也不会放行；运行前 PatrolManager 仍会执行原有的
+Nav2 路径预检，作为第二道动态安全检查。
+
+应用导入、随机生成或已保存地图后，可以选择运行巡检，也可以用同一物理场景重新
+进行自主建图测试。两类任务互斥：一类运行时另一类入口锁定，只有显式停车/暂停或
+任务完成才释放。建图暂停后启动巡检时，系统会自动恢复测试前应用的静态地图和
+AMCL 定位；巡检停止后开始建图时，则恢复实时 SLAM 并创建新的建图会话。
+
+从 Mac 使用三个 `run_mapping*_vm.sh` 入口启动时，同一条 SSH 会话会自动把
+Ubuntu 的车辆网关转发到 Mac 的 `127.0.0.1:8765`，不依赖 VMware 开放额外端口。
+保持启动仿真的终端开启，并使用：
+
+```text
+http://localhost:3000/?robot=http%3A%2F%2F127.0.0.1%3A8765
+```
+
+若仿真直接在 Ubuntu 桌面终端启动，则可继续使用
+`http://Ubuntu虚拟机IP:8765`；也可以在 Mac 另开终端运行
+`./scripts/start_web_mapping_tunnel.sh`。
+
+需要手动控制探索流程时，可在 Ubuntu 的另一个终端调用：
+
+```bash
+ros2 service call /frontier_explorer/stop std_srvs/srv/Trigger {}
+ros2 service call /frontier_explorer/start std_srvs/srv/Trigger {}
+ros2 service call /frontier_explorer/reset std_srvs/srv/Trigger {}
+ros2 topic echo /frontier_explorer/status
+```
+
+如需对照手动建图，先停止自主探索，再缓慢遥控车辆，尽量走出闭环，让 SLAM
+Toolbox 能执行回环检测：
+
+```bash
+ros2 service call /frontier_explorer/stop std_srvs/srv/Trigger {}
+./scripts/teleop_vm.sh
+```
+
+RViz 默认同时显示 `/map`、实时 RGB-D 点云和 `/occupied_cells_vis_array` 三维占据
+体素。确认已经形成有效体素地图后，在另一个 Mac 终端保存：
+
+```bash
+./scripts/save_map_vm.sh my_pipeline_map
+./scripts/save_3d_map_vm.sh my_pipeline_map_3d
+```
+
+二维导航地图仍保存为 YAML+PGM；彩色三维地图使用能够保留树类型和颜色的 `.ot`
+格式，保存位置为：
+
+```text
+src/patrol_robot_navigation/maps/3d/my_pipeline_map_3d.ot
+```
+
+当前 3D 地图按相机帧到达时的 SLAM 位姿增量融合。若闭环修正幅度很大，已插入
+的旧体素不会自动变形，可能看到轻微双墙；后续阶段会记录关键帧并按优化后的轨迹
+重建最终地图。移动人员等动态目标也不应写入长期地图，语义阶段会按类别增加衰减。
+
 仓库自带地图由 Gazebo 碰撞几何直接生成，分辨率为 `0.05 m/格`。修改默认世界
 中的墙体或设备后应重新生成并校验配套图像：
 
@@ -678,6 +801,8 @@ ros2 topic echo /odom --once
 ros2 topic echo /scan --once
 ros2 topic hz /camera/color/image_raw
 ros2 topic hz /camera/points/filtered
+ros2 topic hz /camera/points/mapping
+ros2 topic echo /octomap_binary --once
 ros2 action list
 ros2 node list
 ros2 run tf2_ros tf2_echo odom base_footprint

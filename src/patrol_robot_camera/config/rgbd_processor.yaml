@@ -5,6 +5,10 @@ rgbd_processor:
     depth_topic: /camera/depth/image_rect_raw
     camera_info_topic: /camera/depth/camera_info
     point_cloud_topic: /camera/points/filtered
+    # OctoMap performs ray tracing for every point. Give persistent mapping a
+    # separate bounded-rate stream while keeping the 10 Hz avoidance stream.
+    mapping_point_cloud_topic: /camera/points/mapping
+    mapping_publish_rate: 3.0
     use_color: true
 
     # 16UC1 深度图通常以毫米为单位；32FC1 按 ROS 约定已是米。
