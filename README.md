@@ -103,6 +103,45 @@ vm/                             # 虚拟机初始化脚本
 真车版本不修改或复制厂家驱动，而是复用车端已有的 `controller`、`peripherals`
 和 `slam` 包。仿真继续使用 `/scan` 与 `/cmd_vel`；真车 profile 使用：
 
+### 当前真车硬件配置（2026-08-05 实机确认）
+
+| 部件 | 当前硬件/驱动 | ROS 2 接口与说明 |
+| --- | --- | --- |
+| 车载计算机 | NVIDIA Jetson Orin NX，Ubuntu 22.04，ROS 2 Humble | 项目 overlay：`/home/ubuntu/patrol_robot_ws`；厂家 underlay：`/home/ubuntu/ros2_ws` |
+| 移动底盘 | ROSOrin 四轮麦克纳姆轮底盘，厂家 `controller` 驱动 | 编码器原始里程计 `/odom_raw`；最终速度命令 `/controller/cmd_vel` |
+| IMU | 厂家 IMU，经过 `imu_calib`/厂家滤波标定 | `/imu`；与 `/odom_raw` 由 `robot_localization` EKF 融合为 `/odom` |
+| 二维激光雷达 | LD LiDAR，`ldlidar_stl_ros2` + 厂家 `peripherals` 启动 | `/scan_raw`，实测约 10 Hz；当前资料未记录具体 LD LiDAR 子型号 |
+| RGB-D 相机 | Aurora 930 RGB-D，厂家 `depth_camera.launch.py` | RGB `/depth_cam/rgb0/image_raw`；深度 `/depth_cam/depth0/image_raw`；内参 `/depth_cam/rgb0/camera_info` |
+| 相机点云 | 使用项目节点根据对齐后的 RGB/Depth 生成 | 厂家原始点云关闭；输出 `/camera/points/filtered`、`/camera/points/mapping` 和 `/camera/obstacles` |
+| 网络接口 | 当前车端地址 `192.168.101.200` | SSH 和可信内网 Web API `8765`；地址变化时以 `hostname -I` 为准 |
+
+厂家相机启动时启用深度到 RGB 对齐和深度修正。RTAB-Map 直接使用 Aurora 930 的
+RGB、深度、内参、`/scan_raw` 以及轮速/IMU 融合后的里程计。AMCL 静态地图导航仍以
+二维激光雷达为主要定位传感器，RGB-D 主要承担局部三维障碍感知和建图补充。
+
+当前安全几何参数来自厂家 CAD/机身网格与实车校核，不等同于允许贴墙行驶的尺寸：
+
+| 几何项 | 当前值 |
+| --- | ---: |
+| 机身网格外廓参考 | 约 `0.276 × 0.212 m` |
+| 前向安全外廓 | `0.16 m` |
+| 后向安全外廓 | `0.15 m` |
+| 半宽安全外廓 | `0.13 m` |
+| 雷达 X 方向偏移 | `0.0115 m` |
+| RGB-D 车体自过滤体积 | `0.31 × 0.26 × 0.35 m` |
+
+软件还会叠加 footprint padding、硬安全余量和动态制动距离。不得为了通过狭窄区域而
+直接缩小上述外廓。二维雷达无法可靠检测玻璃、低矮物体或高于扫描平面的障碍。
+
+以下硬件信息尚未在仓库资料中得到可靠确认，现场确认后再补充，禁止猜测：
+
+- Orin NX 的内存容量、JetPack/L4T 精确版本和功耗模式；
+- LD LiDAR 的具体子型号、扫描范围和串口设备名；
+- IMU 芯片型号、量程和安装方向标定值；
+- 电机、减速器、编码器、轮径、电池和电机控制器的具体型号；
+- Aurora 930 的安装高度、俯仰角及激光—相机最终标定外参；
+- 实体急停、触边和电源安全控制器的型号与接线。
+
 ```text
 /scan_raw → 车体外廓/制动距离检查
 
@@ -131,10 +170,10 @@ cd /你的工作区/Ros2
 真车启动后，在同一可信网络中的 Mac 打开另一个终端运行：
 
 ```bash
-./scripts/run_web_real_car.sh 192.168.100.137
+./scripts/run_web_real_car.sh 192.168.101.200
 ```
 
-该脚本先检查车端 `http://192.168.100.137:8765/api/health`，然后启动你现有的网页并
+该脚本先检查车端 `http://192.168.101.200:8765/api/health`，然后启动你现有的网页并
 自动写入真车网关地址。网页人工方向按钮以 10 Hz 连续发送命令；松开按钮、浏览器
 断连、雷达失联或上层速度源超时都会进入零速。真车建图默认以网页为主要人工控制，
 厂家手柄节点关闭；只有显式设置 `REAL_CAR_START_JOYSTICK=true` 才启用备用手柄。
