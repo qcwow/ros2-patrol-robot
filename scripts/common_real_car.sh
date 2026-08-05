@@ -106,3 +106,32 @@ require_rtabmap_packages() {
     fi
   done
 }
+
+acquire_real_car_stack_guard() {
+  local running_stacks
+  local lock_path="${REAL_CAR_STACK_LOCK:-/tmp/patrol_robot_real_car_stack.lock}"
+
+  running_stacks="$(
+    ps -eo pid=,ppid=,etime=,comm=,args= \
+      | awk '
+        $5 ~ /\/(python[0-9.]*|Python|ros2)$/ &&
+        /\/opt\/ros\/humble\/bin\/ros2 launch patrol_robot_bringup real_car_(mapping|navigation)\.launch\.py/ {
+          print
+        }
+      '
+  )"
+  if [[ -n "${running_stacks}" ]]; then
+    echo "错误：检测到真车建图或导航栈已经运行，拒绝重复启动同名 ROS 节点："
+    printf '%s\n' "${running_stacks}"
+    echo "请先在原终端按 Ctrl-C，并确认旧进程退出后再启动。"
+    exit 10
+  fi
+
+  if command -v flock >/dev/null 2>&1; then
+    exec 9>"${lock_path}"
+    if ! flock -n 9; then
+      echo "错误：另一真车建图或导航启动正在进行，拒绝并发启动。"
+      exit 10
+    fi
+  fi
+}

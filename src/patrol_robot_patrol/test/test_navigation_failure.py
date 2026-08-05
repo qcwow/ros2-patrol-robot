@@ -3,6 +3,7 @@ import unittest
 from patrol_robot_patrol.navigation_failure import (
     is_route_failure,
     navigation_error_label,
+    should_blacklist_health_failure,
     should_blacklist_route,
 )
 
@@ -51,6 +52,46 @@ class NavigationFailureTest(unittest.TestCase):
                 has_candidate_path=True,
             )
         )
+
+    def test_confirmed_footprint_collision_blacklists_frontier(self):
+        checks = {
+            'nav2_active': True,
+            'scan_ok': True,
+            'odom_ok': True,
+            'map_to_odom_tf_ok': True,
+            'odom_to_base_tf_ok': True,
+            'localization_ok': True,
+            'costmap_fresh': True,
+            'footprint_raw_clear': False,
+            'footprint_clear': False,
+        }
+        self.assertTrue(should_blacklist_health_failure(checks))
+
+    def test_infrastructure_health_failure_never_blacklists_frontier(self):
+        base = {
+            'nav2_active': True,
+            'scan_ok': True,
+            'odom_ok': True,
+            'map_to_odom_tf_ok': True,
+            'odom_to_base_tf_ok': True,
+            'localization_ok': True,
+            'costmap_fresh': True,
+            'footprint_raw_clear': False,
+            'footprint_clear': False,
+        }
+        for key in (
+            'nav2_active',
+            'scan_ok',
+            'odom_ok',
+            'map_to_odom_tf_ok',
+            'odom_to_base_tf_ok',
+            'localization_ok',
+            'costmap_fresh',
+        ):
+            checks = dict(base)
+            checks[key] = False
+            self.assertFalse(should_blacklist_health_failure(checks), key)
+        self.assertFalse(should_blacklist_health_failure(None))
 
 
 if __name__ == '__main__':

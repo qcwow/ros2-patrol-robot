@@ -59,3 +59,30 @@ def should_blacklist_route(
         and action_aborted
         and has_candidate_path
     )
+
+
+def should_blacklist_health_failure(checks: dict | None) -> bool:
+    """Blacklist only a path-local collision, never infrastructure faults.
+
+    The health monitor confirms footprint overlap for a bounded interval before
+    closing the gate.  A fresh costmap plus otherwise healthy navigation makes
+    that a route feasibility signal.  Missing TF, stale sensors, localization
+    loss, or an inactive Nav2 stack must not poison frontier selection.
+    """
+
+    if not isinstance(checks, dict):
+        return False
+    infrastructure_keys = (
+        'nav2_active',
+        'scan_ok',
+        'odom_ok',
+        'map_to_odom_tf_ok',
+        'odom_to_base_tf_ok',
+        'localization_ok',
+        'costmap_fresh',
+    )
+    return (
+        all(checks.get(key) is True for key in infrastructure_keys)
+        and checks.get('footprint_raw_clear') is False
+        and checks.get('footprint_clear') is False
+    )

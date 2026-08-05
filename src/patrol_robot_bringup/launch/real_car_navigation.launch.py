@@ -23,10 +23,14 @@ def generate_launch_description():
     start_rviz = LaunchConfiguration('start_rviz')
     start_web_bridge = LaunchConfiguration('start_web_bridge')
     start_patrol_manager = LaunchConfiguration('start_patrol_manager')
+    start_rotation_diagnostics = LaunchConfiguration(
+        'start_rotation_diagnostics')
     map_yaml = LaunchConfiguration('map')
     waypoints = LaunchConfiguration('waypoints')
     patrol_autostart = LaunchConfiguration('patrol_autostart')
     web_port = LaunchConfiguration('web_port')
+    max_linear_speed = LaunchConfiguration('max_linear_speed')
+    max_angular_speed = LaunchConfiguration('max_angular_speed')
     navigation_share = FindPackageShare('patrol_robot_navigation')
     patrol_share = FindPackageShare('patrol_robot_patrol')
     camera_share = FindPackageShare('patrol_robot_camera')
@@ -58,6 +62,19 @@ def generate_launch_description():
                 'nav2_params_real_car.yaml',
             ]),
             'ground_truth_localization': 'false',
+            # The physical car intentionally provides only the non-displacing
+            # wait behavior. Its navigator defaults must therefore never load
+            # trees containing Spin, BackUp, or DriveOnHeading nodes.
+            'default_nav_to_pose_bt_xml': PathJoinSubstitution([
+                patrol_share,
+                'behavior_trees',
+                'navigate_to_pose_no_spin.xml',
+            ]),
+            'default_nav_through_poses_bt_xml': PathJoinSubstitution([
+                patrol_share,
+                'behavior_trees',
+                'navigate_through_poses_no_recovery.xml',
+            ]),
         }.items(),
     )
 
@@ -73,11 +90,15 @@ def generate_launch_description():
             'use_sim_time': False,
             'http_host': '0.0.0.0',
             'http_port': ParameterValue(web_port, value_type=int),
-            'max_linear_speed': 0.15,
-            'max_angular_speed': 0.45,
+            'max_linear_speed': ParameterValue(
+                max_linear_speed, value_type=float),
+            'max_angular_speed': ParameterValue(
+                max_angular_speed, value_type=float),
             'speed_control_min_linear': 0.05,
-            'speed_control_max_linear': 0.15,
-            'speed_control_max_angular': 0.45,
+            'speed_control_max_linear': ParameterValue(
+                max_linear_speed, value_type=float),
+            'speed_control_max_angular': ParameterValue(
+                max_angular_speed, value_type=float),
             'use_patrol_speed_limits': False,
             'manual_command_timeout': 0.35,
             'base_command_topic': '/cmd_vel_base_raw',
@@ -150,8 +171,10 @@ def generate_launch_description():
             'input_cmd_vel_topic': '/cmd_vel_safety_checked',
             'output_cmd_vel_topic': '/controller/cmd_vel',
             'command_timeout': 0.25,
-            'max_linear_speed': 0.15,
-            'max_angular_speed': 0.45,
+            'max_linear_speed': ParameterValue(
+                max_linear_speed, value_type=float),
+            'max_angular_speed': ParameterValue(
+                max_angular_speed, value_type=float),
         }],
     )
 
@@ -176,6 +199,20 @@ def generate_launch_description():
             'require_estop_released': False,
         }],
         remappings=[('/scan', '/scan_raw')],
+    )
+
+    rotation_diagnostics = Node(
+        package='patrol_robot_patrol',
+        executable='rotation_diagnostic_recorder',
+        name='rotation_diagnostic_recorder',
+        output='screen',
+        condition=IfCondition(start_rotation_diagnostics),
+        parameters=[{
+            'use_sim_time': False,
+            'pre_event_seconds': 10.0,
+            'post_event_seconds': 2.0,
+            'sample_period_seconds': 0.1,
+        }],
     )
 
     patrol_manager = Node(
@@ -259,8 +296,18 @@ def generate_launch_description():
         DeclareLaunchArgument('start_rviz', default_value='true'),
         DeclareLaunchArgument('start_web_bridge', default_value='true'),
         DeclareLaunchArgument('start_patrol_manager', default_value='true'),
+        DeclareLaunchArgument(
+            'start_rotation_diagnostics',
+            default_value='false',
+            description=(
+                'Enable the resource-intensive rotation evidence recorder '
+                'only during a targeted diagnostic run'
+            ),
+        ),
         DeclareLaunchArgument('patrol_autostart', default_value='false'),
         DeclareLaunchArgument('web_port', default_value='8765'),
+        DeclareLaunchArgument('max_linear_speed', default_value='0.15'),
+        DeclareLaunchArgument('max_angular_speed', default_value='0.45'),
         DeclareLaunchArgument('map', default_value=default_map),
         DeclareLaunchArgument('waypoints', default_value=default_waypoints),
         hardware_adapter,
@@ -271,6 +318,7 @@ def generate_launch_description():
         camera_processing,
         rgbd_obstacles,
         navigation_health,
+        rotation_diagnostics,
         patrol_manager,
         rviz,
     ])

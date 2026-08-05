@@ -25,6 +25,16 @@ if [[ ! -f "${WAYPOINTS}" ]]; then
   exit 6
 fi
 
+if [[ "${REAL_CAR_ALLOW_UNMANIFESTED_MAP:-false}" == "true" ]]; then
+  echo "警告：正在使用未验证来源的地图；仅允许迁移旧地图时临时使用。"
+  ros2 run patrol_robot_patrol map_artifact_validator "${MAP_YAML}"
+else
+  ros2 run patrol_robot_patrol map_artifact_validator "${MAP_YAML}" \
+    --require-manifest-profile real_car
+fi
+
+acquire_real_car_stack_guard
+
 echo "启动真车 AMCL/Nav2；巡检不会自动开始。"
 echo "必须先在 RViz 使用 2D Pose Estimate 确认车辆实际初始位姿。"
 exec ros2 launch patrol_robot_bringup real_car_navigation.launch.py \
@@ -33,4 +43,7 @@ exec ros2 launch patrol_robot_bringup real_car_navigation.launch.py \
   patrol_autostart:=false \
   start_hardware:="${REAL_CAR_START_HARDWARE:-true}" \
   start_rviz:="${REAL_CAR_START_RVIZ:-true}" \
-  start_web_bridge:="${REAL_CAR_START_WEB_BRIDGE:-true}"
+  start_web_bridge:="${REAL_CAR_START_WEB_BRIDGE:-true}" \
+  start_rotation_diagnostics:="${REAL_CAR_START_ROTATION_DIAGNOSTICS:-false}" \
+  max_linear_speed:="${REAL_CAR_NAV_LINEAR_LIMIT:-0.15}" \
+  max_angular_speed:="${REAL_CAR_NAV_ANGULAR_LIMIT:-0.45}"

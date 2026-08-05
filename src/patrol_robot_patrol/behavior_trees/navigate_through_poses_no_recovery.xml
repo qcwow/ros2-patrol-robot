@@ -1,0 +1,29 @@
+<!-- Physical-car default: plan once and never rotate or reverse blindly. -->
+<root BTCPP_format="4" main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <Sequence name="NavigateThroughPosesNoRecovery">
+      <ControllerSelector
+        selected_controller="{selected_controller}"
+        default_controller="FollowPath"
+        topic_name="controller_selector"/>
+      <PlannerSelector
+        selected_planner="{selected_planner}"
+        default_planner="GridBased"
+        topic_name="planner_selector"/>
+      <ReactiveSequence>
+        <RemovePassedGoals
+          input_goals="{goals}"
+          output_goals="{goals}"
+          radius="0.25"/>
+        <ComputePathThroughPoses
+          goals="{goals}"
+          path="{path}"
+          planner_id="{selected_planner}"/>
+      </ReactiveSequence>
+      <FollowPath
+        path="{path}"
+        controller_id="{selected_controller}"
+        goal_checker_id="transit_goal_checker"/>
+    </Sequence>
+  </BehaviorTree>
+</root>

@@ -11,6 +11,7 @@ from geometry_msgs.msg import PoseWithCovarianceStamped
 from lifecycle_msgs.msg import State
 from lifecycle_msgs.srv import GetState
 from nav_msgs.msg import OccupancyGrid, Odometry
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from rclpy.time import Time
@@ -21,6 +22,9 @@ from tf2_ros import Buffer, TransformException, TransformListener
 from patrol_robot_patrol.footprint_geometry import (
     quaternion_to_yaw,
     rectangle_overlaps_lethal_cell,
+)
+from patrol_robot_patrol.localization_health import (
+    localization_covariance_is_acceptable,
 )
 from patrol_robot_patrol.navigation_motion_guard import (
     PoseStabilityGate,
@@ -58,6 +62,7 @@ class NavigationHealthMonitor(Node):
         self.declare_parameter('global_pose_stable_seconds', 5.0)
         self.declare_parameter('global_pose_max_translation_delta', 0.08)
         self.declare_parameter('global_pose_max_yaw_delta_degrees', 5.0)
+        self.declare_parameter('lifecycle_request_timeout_seconds', 2.5)
         self.declare_parameter('lifecycle_nodes', [
             'map_server',
             'amcl',
@@ -144,6 +149,14 @@ class NavigationHealthMonitor(Node):
         self._lifecycle_nodes = tuple(
             str(name) for name in self.get_parameter('lifecycle_nodes').value
         )
+        self._lifecycle_request_timeout = max(
+            0.5,
+            float(
+                self.get_parameter(
+                    'lifecycle_request_timeout_seconds'
+                ).value
+            ),
+        )
 
         sensor_qos = QoSProfile(depth=5)
         sensor_qos.reliability = ReliabilityPolicy.BEST_EFFORT
@@ -198,7 +211,14 @@ class NavigationHealthMonitor(Node):
         self._lifecycle_states = {
             name: None for name in self._lifecycle_nodes
         }
-        self._lifecycle_pending: set[str] = set()
+        # A lifecycle service request can remain unresolved indefinitely when
+        # the loaded real-car DDS graph drops a reply.  Track a generation and
+        # wall-clock deadline so one stale request cannot pin a node in its
+        # startup state for the rest of the run.
+        self._lifecycle_pending: dict[str, tuple[object, float, int]] = {}
+        self._lifecycle_generation = {
+            name: 0 for name in self._lifecycle_nodes
+        }
         self._lifecycle_clients = {
             name: self.create_client(GetState, f'/{name}/get_state')
             for name in self._lifecycle_nodes
@@ -244,19 +264,36 @@ class NavigationHealthMonitor(Node):
         self._estop_released = bool(message.data)
 
     def _poll_lifecycle_states(self) -> None:
+        now = time.monotonic()
         for name, client in self._lifecycle_clients.items():
-            if name in self._lifecycle_pending or not client.service_is_ready():
+            pending = self._lifecycle_pending.get(name)
+            if pending is not None:
+                future, started, _generation = pending
+                if now - started <= self._lifecycle_request_timeout:
+                    continue
+                future.cancel()
+                self._lifecycle_pending.pop(name, None)
+                self.get_logger().warning(
+                    f'读取 {name} 生命周期超时，正在重试'
+                )
+            if not client.service_is_ready():
                 continue
-            self._lifecycle_pending.add(name)
+            generation = self._lifecycle_generation[name] + 1
+            self._lifecycle_generation[name] = generation
             future = client.call_async(GetState.Request())
+            self._lifecycle_pending[name] = (future, now, generation)
             future.add_done_callback(
-                lambda result, node_name=name: self._on_lifecycle_state(
-                    node_name, result
+                lambda result, node_name=name, request_generation=generation:
+                self._on_lifecycle_state(
+                    node_name, request_generation, result
                 )
             )
 
-    def _on_lifecycle_state(self, name: str, future) -> None:
-        self._lifecycle_pending.discard(name)
+    def _on_lifecycle_state(self, name: str, generation: int, future) -> None:
+        pending = self._lifecycle_pending.get(name)
+        if pending is None or pending[2] != generation:
+            return
+        self._lifecycle_pending.pop(name, None)
         try:
             self._lifecycle_states[name] = int(future.result().current_state.id)
         except Exception as error:  # Service transport errors are health data.
@@ -377,14 +414,13 @@ class NavigationHealthMonitor(Node):
         nav2_active = not inactive_nodes
 
         amcl_received = self._last_amcl is not None
-        localization_ok = bool(
-            not self._require_amcl
-            or (
-                amcl_received
-                and amcl_fresh
-                and self._position_variance <= self._max_position_variance
-                and self._yaw_variance <= self._max_yaw_variance
-            )
+        localization_ok = localization_covariance_is_acceptable(
+            required=self._require_amcl,
+            pose_received=amcl_received,
+            position_variance=self._position_variance,
+            yaw_variance=self._yaw_variance,
+            max_position_variance=self._max_position_variance,
+            max_yaw_variance=self._max_yaw_variance,
         )
         raw_footprint_clear = bool(
             costmap_fresh and self._footprint_is_clear()
@@ -421,7 +457,7 @@ class NavigationHealthMonitor(Node):
         if not odom_tf_ok:
             reasons.append(f'{self._odom_frame}→{self._base_frame} TF 缺失')
         if not localization_ok:
-            reasons.append('AMCL 未收敛或定位数据过期')
+            reasons.append('AMCL 尚未收到已收敛的定位结果')
         if not costmap_fresh:
             reasons.append('全局代价地图未就绪或数据过期')
         elif not footprint_clear:
@@ -498,7 +534,7 @@ def main(args=None) -> None:
     node = NavigationHealthMonitor()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()

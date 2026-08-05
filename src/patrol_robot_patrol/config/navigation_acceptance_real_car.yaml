@@ -1,0 +1,32 @@
+# Real-car acceptance scenarios.  Route coordinates remain in the separate
+# waypoint YAML and must be surveyed on site before the runner is armed.
+scenarios:
+  - id: normal_route_low_speed
+    description: 低速完成一圈已核对路线并返回 HOME
+    expected_terminal_state: COMPLETE
+    # Set this after creating the surveyed waypoint file. Empty accepts the
+    # route currently loaded by patrol_manager, but does not validate geometry.
+    expected_route_id: ''
+    readiness_stable_seconds: 5.0
+    timeout_seconds: 600.0
+    maximum_linear_speed: 0.08
+    maximum_angular_speed: 0.20
+    maximum_retry_count: 1
+    maximum_health_false_events: 0
+    maximum_map_correction_translation: 0.08
+    maximum_map_correction_yaw_degrees: 5.0
+    minimum_completed_inspections: 0
+
+  - id: persistent_obstacle_blocked
+    description: 人工放置持续障碍，有限恢复耗尽后进入 BLOCKED
+    expected_terminal_state: BLOCKED
+    expected_route_id: ''
+    readiness_stable_seconds: 5.0
+    timeout_seconds: 180.0
+    maximum_linear_speed: 0.08
+    maximum_angular_speed: 0.20
+    maximum_retry_count: 1
+    maximum_health_false_events: 0
+    maximum_map_correction_translation: 0.08
+    maximum_map_correction_yaw_degrees: 5.0
+    minimum_completed_inspections: 0

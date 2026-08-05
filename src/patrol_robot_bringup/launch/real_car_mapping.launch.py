@@ -24,10 +24,14 @@ def generate_launch_description():
     start_web_bridge = LaunchConfiguration('start_web_bridge')
     start_rviz = LaunchConfiguration('start_rviz')
     start_local_grid = LaunchConfiguration('start_local_grid')
+    start_rotation_diagnostics = LaunchConfiguration(
+        'start_rotation_diagnostics')
     start_octomap = LaunchConfiguration('start_octomap')
     mapping_backend = LaunchConfiguration('mapping_backend')
     reset_rtabmap_database = LaunchConfiguration('reset_rtabmap_database')
     rtabmap_database_path = LaunchConfiguration('rtabmap_database_path')
+    rtabmap_params_file = LaunchConfiguration('rtabmap_params_file')
+    rtabmap_imu_topic = LaunchConfiguration('rtabmap_imu_topic')
     rtabmap_rgb_topic = LaunchConfiguration('rtabmap_rgb_topic')
     rtabmap_depth_topic = LaunchConfiguration('rtabmap_depth_topic')
     rtabmap_camera_info_topic = LaunchConfiguration(
@@ -120,7 +124,17 @@ def generate_launch_description():
                 'manual_lidar_safety_real_car.yaml',
             ]),
             {
-                'input_cmd_vel_topic': '/cmd_vel_base_raw',
+                # With the web bridge running, it arbitrates Nav2/manual input
+                # onto /cmd_vel_base_raw.  Headless mapping has no bridge, so
+                # feed the smoothed Nav2 channel into the same lidar filter.
+                'input_cmd_vel_topic': ParameterValue(
+                    PythonExpression([
+                        "'/cmd_vel_base_raw' if '",
+                        start_web_bridge,
+                        "' == 'true' else '/cmd_vel_nav'",
+                    ]),
+                    value_type=str,
+                ),
                 'max_linear_speed': ParameterValue(
                     max_linear, value_type=float),
                 'max_angular_speed': ParameterValue(
@@ -179,11 +193,13 @@ def generate_launch_description():
             'use_sim_time': 'false',
             'reset_database': reset_rtabmap_database,
             'database_path': rtabmap_database_path,
+            'rtabmap_params_file': rtabmap_params_file,
             'rgb_topic': rtabmap_rgb_topic,
             'depth_topic': rtabmap_depth_topic,
             'camera_info_topic': rtabmap_camera_info_topic,
             'scan_topic': '/scan_raw',
             'odom_topic': '/odom',
+            'imu_topic': rtabmap_imu_topic,
             'map_topic': '/map',
         }.items(),
     )
@@ -330,6 +346,20 @@ def generate_launch_description():
         remappings=[('/scan', '/scan_raw')],
     )
 
+    rotation_diagnostics = Node(
+        package='patrol_robot_patrol',
+        executable='rotation_diagnostic_recorder',
+        name='rotation_diagnostic_recorder',
+        output='screen',
+        condition=IfCondition(start_rotation_diagnostics),
+        parameters=[{
+            'use_sim_time': False,
+            'pre_event_seconds': 10.0,
+            'post_event_seconds': 2.0,
+            'sample_period_seconds': 0.1,
+        }],
+    )
+
     patrol_manager = Node(
         package='patrol_robot_patrol',
         executable='patrol_manager',
@@ -410,6 +440,14 @@ def generate_launch_description():
             ),
         ),
         DeclareLaunchArgument(
+            'start_rotation_diagnostics',
+            default_value='false',
+            description=(
+                'Enable the resource-intensive rotation evidence recorder '
+                'only during a targeted diagnostic run'
+            ),
+        ),
+        DeclareLaunchArgument(
             'mapping_backend',
             default_value='rtabmap',
             choices=['rtabmap', 'slam_toolbox'],
@@ -423,6 +461,21 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'rtabmap_database_path',
             default_value='~/.ros/rtabmap.db',
+        ),
+        DeclareLaunchArgument(
+            'rtabmap_params_file',
+            default_value=PathJoinSubstitution([
+                navigation_share,
+                'config',
+                'rtabmap_real_car.yaml',
+            ]),
+        ),
+        DeclareLaunchArgument(
+            'rtabmap_imu_topic',
+            default_value='/rtabmap/imu_disabled',
+            description=(
+                'RTAB-Map direct IMU input; fused /odom remains enabled'
+            ),
         ),
         DeclareLaunchArgument(
             'rtabmap_rgb_topic',
@@ -474,6 +527,7 @@ def generate_launch_description():
         live_navigation,
         frontier_explorer,
         navigation_health,
+        rotation_diagnostics,
         patrol_manager,
         rviz,
     ])

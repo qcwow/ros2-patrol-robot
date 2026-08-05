@@ -9,6 +9,7 @@ from geometry_msgs.msg import PoseArray, PoseStamped, Twist
 from nav2_msgs.action import NavigateToPose
 from nav_msgs.msg import OccupancyGrid
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.action import ActionClient
 from rclpy.duration import Duration
 from rclpy.node import Node
@@ -28,6 +29,7 @@ from .frontier_geometry import (
     extract_frontier_clusters,
     select_frontier_goal,
 )
+from .navigation_failure import should_blacklist_health_failure
 from .navigation_motion_guard import NavigationMotionGuard
 
 
@@ -185,12 +187,17 @@ class FrontierExplorer(Node):
             and not ready
             and (self._goal_handle is not None or self._pending_goal)
         ):
+            blacklist = should_blacklist_health_failure(
+                self._navigation_health_checks
+            )
+            if blacklist:
+                self._goals_failed += 1
             self._cancel_goal(
                 (
                     self._navigation_health_reason
                     or '导航健康失效，已取消前沿目标并停车'
                 ),
-                blacklist=False,
+                blacklist=blacklist,
             )
             self._state = 'WAITING_FOR_HEALTH'
 
@@ -656,7 +663,7 @@ def main(args=None):
     node = FrontierExplorer()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         node.destroy_node()

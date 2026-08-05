@@ -22,4 +22,8 @@ ros2 run nav2_map_server map_saver_cli \
   -p map_subscribe_transient_local:=true \
   -p save_map_timeout:=10.0
 
-echo "真车地图已保存：${MAP_PREFIX}.yaml / ${MAP_PREFIX}.pgm"
+ros2 run patrol_robot_patrol map_artifact_validator \
+  "${MAP_PREFIX}.yaml" --write-manifest --profile real_car
+
+echo "真车地图已保存并校验：${MAP_PREFIX}.yaml / ${MAP_PREFIX}.pgm"
+echo "校验清单：${MAP_PREFIX}.manifest.json"

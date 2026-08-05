@@ -27,6 +27,10 @@ def generate_launch_description():
     map_yaml = LaunchConfiguration('map')
     params_file = LaunchConfiguration('params_file')
     ground_truth_localization = LaunchConfiguration('ground_truth_localization')
+    default_nav_to_pose_bt_xml = LaunchConfiguration(
+        'default_nav_to_pose_bt_xml')
+    default_nav_through_poses_bt_xml = LaunchConfiguration(
+        'default_nav_through_poses_bt_xml')
 
     navigation_share = FindPackageShare('patrol_robot_navigation')
     default_map = PathJoinSubstitution(
@@ -35,6 +39,17 @@ def generate_launch_description():
     default_params = PathJoinSubstitution(
         [navigation_share, 'config', 'nav2_params.yaml']
     )
+    nav2_bt_share = FindPackageShare('nav2_bt_navigator')
+    default_nav_to_pose_bt = PathJoinSubstitution([
+        nav2_bt_share,
+        'behavior_trees',
+        'navigate_to_pose_w_replanning_and_recovery.xml',
+    ])
+    default_nav_through_poses_bt = PathJoinSubstitution([
+        nav2_bt_share,
+        'behavior_trees',
+        'navigate_through_poses_w_replanning_and_recovery.xml',
+    ])
 
     tf_remappings = [('/tf', 'tf'), ('/tf_static', 'tf_static')]
 
@@ -121,6 +136,12 @@ def generate_launch_description():
         params_file,
         use_sim_time,
         tf_remappings,
+        {
+            'default_nav_to_pose_bt_xml': default_nav_to_pose_bt_xml,
+            'default_nav_through_poses_bt_xml': (
+                default_nav_through_poses_bt_xml
+            ),
+        },
     )
     waypoint_follower = nav2_node(
         'nav2_waypoint_follower',
@@ -168,6 +189,14 @@ def generate_launch_description():
         DeclareLaunchArgument('map', default_value=default_map),
         DeclareLaunchArgument('params_file', default_value=default_params),
         DeclareLaunchArgument('ground_truth_localization', default_value='true'),
+        DeclareLaunchArgument(
+            'default_nav_to_pose_bt_xml',
+            default_value=default_nav_to_pose_bt,
+        ),
+        DeclareLaunchArgument(
+            'default_nav_through_poses_bt_xml',
+            default_value=default_nav_through_poses_bt,
+        ),
         map_server,
         amcl,
         localization_manager,

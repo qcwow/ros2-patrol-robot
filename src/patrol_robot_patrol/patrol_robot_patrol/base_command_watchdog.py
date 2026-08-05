@@ -5,6 +5,7 @@ import time
 
 from geometry_msgs.msg import Twist
 import rclpy
+from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
 
 
@@ -88,7 +89,7 @@ def main(args=None):
     node = BaseCommandWatchdog()
     try:
         rclpy.spin(node)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, ExternalShutdownException):
         pass
     finally:
         if rclpy.ok():

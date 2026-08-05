@@ -26,6 +26,7 @@ def rtabmap_node(condition, arguments):
             ('rgbd_image', '/rtabmap/rgbd_image'),
             ('scan', LaunchConfiguration('scan_topic')),
             ('odom', LaunchConfiguration('odom_topic')),
+            ('imu', LaunchConfiguration('imu_topic')),
             ('map', LaunchConfiguration('map_topic')),
             ('cloud_map', '/rtabmap/cloud_map'),
             ('cloud_obstacles', '/rtabmap/cloud_obstacles'),
@@ -91,6 +92,14 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument('scan_topic', default_value='/scan_raw'),
         DeclareLaunchArgument('odom_topic', default_value='/odom'),
+        DeclareLaunchArgument(
+            'imu_topic',
+            default_value='/rtabmap/imu_disabled',
+            description=(
+                'Direct RTAB-Map IMU input. Disabled by default because the '
+                'real-car EKF already fuses IMU into /odom.'
+            ),
+        ),
         DeclareLaunchArgument('map_topic', default_value='/map'),
         rgbd_sync,
         clean_start,

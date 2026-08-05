@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "valid": true,
+  "yaml_path": "/home/ubuntu/patrol_robot_ws/src/patrol_robot_navigation/maps/office_mapping_progress_20260805_v2.yaml",
+  "image_path": "/home/ubuntu/patrol_robot_ws/src/patrol_robot_navigation/maps/office_mapping_progress_20260805_v2.pgm",
+  "yaml_sha256": "504ff4c50510cb549e74ef571b0e4eda8651e30ca019fd6d88a44c4f5593f393",
+  "image_sha256": "5ff41ef48da8e7a92eba7cb9e3d2145f8042dab225938ed85d7df5ef233a14fb",
+  "resolution": 0.05,
+  "origin": [
+    -7.05,
+    -5.08,
+    0.0
+  ],
+  "occupied_thresh": 0.65,
+  "free_thresh": 0.25,
+  "negate": 0,
+  "mode": "trinary",
+  "image_width": 215,
+  "image_height": 220,
+  "image_maximum": 255,
+  "map_width_meters": 10.75,
+  "map_height_meters": 11.0,
+  "profile": "real_car"
+}

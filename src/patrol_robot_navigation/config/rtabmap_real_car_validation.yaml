@@ -1,0 +1,63 @@
+rtabmap:
+  ros__parameters:
+    use_sim_time: false
+    frame_id: base_footprint
+    map_frame_id: map
+    odom_frame_id: odom
+    publish_tf: true
+    subscribe_rgbd: true
+    subscribe_depth: false
+    subscribe_rgb: false
+    subscribe_scan: true
+    approx_sync: true
+    approx_sync_max_interval: 0.10
+    topic_queue_size: 10
+    sync_queue_size: 20
+    qos_image: 2
+    qos_camera_info: 2
+    qos_scan: 2
+    qos_odom: 2
+    qos_imu: 2
+    wait_for_transform: 0.30
+    map_always_update: true
+    map_empty_ray_tracing: true
+    map_cleanup: true
+    cloud_output_voxelized: true
+    cloud_subtract_filtering: true
+    cloud_subtract_filtering_min_neighbors: 2
+    latch: true
+
+    # Validation profile: trust the wheel/IMU EKF odometry chain and prevent
+    # graph corrections from changing map->odom during the first short runs.
+    # Re-enable each closure source separately only after recorded evidence
+    # shows odometry direction/scale and sensor timestamps are consistent.
+    "Reg/Strategy": "1"
+    "Reg/Force3DoF": "true"
+    "Rtabmap/DetectionRate": "2"
+    "Rtabmap/LoopThr": "1.0"
+    "RGBD/NeighborLinkRefining": "false"
+    "RGBD/ProximityBySpace": "false"
+    "RGBD/ProximityPathMaxNeighbors": "0"
+    "RGBD/OptimizeFromGraphEnd": "false"
+    "RGBD/LinearUpdate": "0.08"
+    "RGBD/AngularUpdate": "0.10"
+    "RGBD/CreateOccupancyGrid": "true"
+    "Mem/IncrementalMemory": "true"
+    "Optimizer/GravitySigma": "0"
+
+    "Grid/Sensor": "2"
+    "Grid/3D": "true"
+    "Grid/FromDepth": "true"
+    "Grid/RayTracing": "true"
+    "Grid/NormalsSegmentation": "false"
+    "Grid/RangeMin": "0.20"
+    "Grid/RangeMax": "3.00"
+    "Grid/CellSize": "0.05"
+    "Grid/DepthDecimation": "4"
+    "Grid/FootprintLength": "0.31"
+    "Grid/FootprintWidth": "0.26"
+    "Grid/FootprintHeight": "0.35"
+    "Grid/MaxGroundHeight": "0.06"
+    "Grid/MaxObstacleHeight": "1.50"
+    "Grid/NoiseFilteringRadius": "0.08"
+    "Grid/NoiseFilteringMinNeighbors": "3"

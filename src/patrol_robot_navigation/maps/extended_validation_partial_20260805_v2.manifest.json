@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "valid": true,
+  "yaml_path": "/home/ubuntu/patrol_robot_ws/src/patrol_robot_navigation/maps/extended_validation_partial_20260805_v2.yaml",
+  "image_path": "/home/ubuntu/patrol_robot_ws/src/patrol_robot_navigation/maps/extended_validation_partial_20260805_v2.pgm",
+  "yaml_sha256": "7a9e987b3eb7df2224d9c80776ea9083bcb1300ef2eacbb1544dad003fc80488",
+  "image_sha256": "f7b9c36c8a14a9992d5955b4151559a789b3e1db5a2374a66d32ec3e139559cc",
+  "resolution": 0.05,
+  "origin": [
+    -3.58,
+    -3.58,
+    0.0
+  ],
+  "occupied_thresh": 0.65,
+  "free_thresh": 0.25,
+  "negate": 0,
+  "mode": "trinary",
+  "image_width": 144,
+  "image_height": 143,
+  "image_maximum": 255,
+  "map_width_meters": 7.2,
+  "map_height_meters": 7.15,
+  "profile": "real_car"
+}
