@@ -16,13 +16,11 @@
       <ComputePathToPose
         goal="{goal}"
         path="{path}"
-        planner_id="{selected_planner}"
-        error_code_id="{compute_path_error_code}"/>
+        planner_id="{selected_planner}"/>
       <FollowPath
         path="{path}"
         controller_id="{selected_controller}"
-        goal_checker_id="{selected_goal_checker}"
-        error_code_id="{follow_path_error_code}"/>
+        goal_checker_id="{selected_goal_checker}"/>
     </Sequence>
   </BehaviorTree>
 </root>

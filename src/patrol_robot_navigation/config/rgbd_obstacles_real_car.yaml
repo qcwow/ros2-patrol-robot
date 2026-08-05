@@ -1,0 +1,20 @@
+obstacles_detection:
+  ros__parameters:
+    use_sim_time: false
+    frame_id: base_footprint
+    wait_for_transform: 0.30
+    qos: 2
+
+    # Transform the cloud to base_footprint before applying height limits.
+    # This keeps the floor out of Nav2 even when the camera is pitched.
+    "Grid/NormalsSegmentation": "false"
+    "Grid/RangeMin": "0.20"
+    "Grid/RangeMax": "3.00"
+    "Grid/CellSize": "0.04"
+    "Grid/FootprintLength": "0.31"
+    "Grid/FootprintWidth": "0.26"
+    "Grid/FootprintHeight": "0.35"
+    "Grid/MaxGroundHeight": "0.06"
+    "Grid/MaxObstacleHeight": "1.50"
+    "Grid/NoiseFilteringRadius": "0.08"
+    "Grid/NoiseFilteringMinNeighbors": "3"

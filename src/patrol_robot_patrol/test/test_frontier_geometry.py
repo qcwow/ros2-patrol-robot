@@ -117,3 +117,37 @@ def test_blacklist_rejects_only_available_goal():
     )
 
     assert rejected is None
+
+
+def test_ring_frontier_ignores_cells_too_close_to_robot():
+    width = 40
+    height = 40
+    data = [-1] * (width * height)
+    # An elongated connected free area creates one frontier ring. Its top and
+    # bottom edges are close to the robot, while its ends provide valid goals.
+    for row in range(14, 27):
+        for column in range(5, 36):
+            data[row * width + column] = 0
+    clusters = extract_frontier_clusters(
+        width, height, data, min_cluster_size=4
+    )
+
+    goal = select_frontier_goal(
+        width,
+        height,
+        0.1,
+        0.0,
+        0.0,
+        data,
+        2.05,
+        2.05,
+        clusters,
+        goal_offset=0.45,
+        goal_search_radius=0.80,
+        robot_clearance=0.10,
+        min_goal_distance=0.65,
+        max_goal_distance=10.0,
+    )
+
+    assert goal is not None
+    assert goal.distance >= 0.65

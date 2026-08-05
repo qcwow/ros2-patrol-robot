@@ -24,6 +24,8 @@ setup(
     entry_points={
         'console_scripts': [
             'rgbd_processor = patrol_robot_camera.rgbd_processor_node:main',
+            'local_voxel_mapper = '
+            'patrol_robot_camera.local_voxel_mapper_node:main',
         ],
     },
 )

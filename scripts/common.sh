@@ -20,6 +20,7 @@ source "${ENV_FILE}"
 : "${VM_WORKSPACE:?请在 .vm.env 中设置 VM_WORKSPACE}"
 : "${VM_DISPLAY:=:0}"
 : "${VM_SSH_KEY:=}"
+: "${ROS_DISTRO:=humble}"
 
 if [[ ! "${VM_PORT}" =~ ^[0-9]+$ ]]; then
   echo "VM_PORT 必须是数字。"
@@ -33,6 +34,11 @@ fi
 
 VM_TARGET="${VM_USER}@${VM_HOST}"
 SSH=(ssh -p "${VM_PORT}")
+
+if [[ "${ROS_DISTRO}" != "humble" ]]; then
+  echo "本项目迁移版本固定为 ROS 2 Humble；当前 ROS_DISTRO=${ROS_DISTRO}。"
+  exit 1
+fi
 
 if [[ -n "${VM_SSH_KEY}" ]]; then
   if [[ ! -r "${VM_SSH_KEY}" ]]; then

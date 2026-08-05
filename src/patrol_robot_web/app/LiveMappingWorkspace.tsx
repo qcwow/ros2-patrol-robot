@@ -87,11 +87,15 @@ type Props = {
     detail: string;
   };
   onReturnToNavigation?: () => void;
+  linearSpeed: number;
+  angularSpeed: number;
 };
 
 type ManualDrivePadProps = {
   disabled: boolean;
   onDrive: (linear: number, angular: number) => void;
+  linearSpeed: number;
+  angularSpeed: number;
 };
 
 const EMPTY_MAPPING: MappingRuntime = {
@@ -291,7 +295,7 @@ function LiveOccupancyCanvas({
   );
 }
 
-function ManualDrivePad({ disabled, onDrive }: ManualDrivePadProps) {
+function ManualDrivePad({ disabled, onDrive, linearSpeed, angularSpeed }: ManualDrivePadProps) {
   const repeatTimer = useRef<number | null>(null);
   const [activeDirection, setActiveDirection] = useState("");
 
@@ -338,7 +342,7 @@ function ManualDrivePad({ disabled, onDrive }: ManualDrivePadProps) {
         type="button"
         disabled={disabled}
         className={`mapping-drive-forward${activeDirection === "forward" ? " active" : ""}`}
-        onPointerDown={(event) => begin(event, "forward", 0.24, 0)}
+        onPointerDown={(event) => begin(event, "forward", linearSpeed, 0)}
         onPointerUp={release}
         onPointerCancel={release}
         onContextMenu={(event: ReactMouseEvent<HTMLButtonElement>) => event.preventDefault()}
@@ -349,7 +353,7 @@ function ManualDrivePad({ disabled, onDrive }: ManualDrivePadProps) {
         type="button"
         disabled={disabled}
         className={`mapping-drive-left${activeDirection === "left" ? " active" : ""}`}
-        onPointerDown={(event) => begin(event, "left", 0, 0.6)}
+        onPointerDown={(event) => begin(event, "left", 0, angularSpeed)}
         onPointerUp={release}
         onPointerCancel={release}
         onContextMenu={(event: ReactMouseEvent<HTMLButtonElement>) => event.preventDefault()}
@@ -369,7 +373,7 @@ function ManualDrivePad({ disabled, onDrive }: ManualDrivePadProps) {
         type="button"
         disabled={disabled}
         className={`mapping-drive-right${activeDirection === "right" ? " active" : ""}`}
-        onPointerDown={(event) => begin(event, "right", 0, -0.6)}
+        onPointerDown={(event) => begin(event, "right", 0, -angularSpeed)}
         onPointerUp={release}
         onPointerCancel={release}
         onContextMenu={(event: ReactMouseEvent<HTMLButtonElement>) => event.preventDefault()}
@@ -380,7 +384,7 @@ function ManualDrivePad({ disabled, onDrive }: ManualDrivePadProps) {
         type="button"
         disabled={disabled}
         className={`mapping-drive-reverse${activeDirection === "reverse" ? " active" : ""}`}
-        onPointerDown={(event) => begin(event, "reverse", -0.24, 0)}
+        onPointerDown={(event) => begin(event, "reverse", -linearSpeed, 0)}
         onPointerUp={release}
         onPointerCancel={release}
         onContextMenu={(event: ReactMouseEvent<HTMLButtonElement>) => event.preventDefault()}
@@ -399,6 +403,8 @@ export function LiveMappingWorkspace({
   onEditSavedMap,
   operation,
   onReturnToNavigation,
+  linearSpeed,
+  angularSpeed,
 }: Props) {
   const mapCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const voxelCanvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -422,6 +428,8 @@ export function LiveMappingWorkspace({
   const driveRef = useRef({ linear: 0, angular: 0 });
   const lastControlAt = useRef(0);
   const controlTimer = useRef<number | null>(null);
+  const controlSession = useRef("");
+  const controlSequence = useRef(0);
   const lastSavedId = useRef<string | null>(null);
 
   const post = useCallback(async (path: string, payload: object = {}) => {
@@ -549,14 +557,31 @@ export function LiveMappingWorkspace({
 
   useEffect(() => () => {
     if (controlTimer.current !== null) window.clearTimeout(controlTimer.current);
-    void post("/api/control/manual", { linear: 0, angular: 0 });
+    if (!controlSession.current) {
+      controlSession.current = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    }
+    controlSequence.current += 1;
+    void post("/api/control/manual", {
+      linear: 0,
+      angular: 0,
+      control_session: controlSession.current,
+      control_sequence: controlSequence.current,
+    });
   }, [post]);
 
   const transmitControl = useCallback((immediate = false) => {
     const sendNow = () => {
       lastControlAt.current = performance.now();
       controlTimer.current = null;
-      void post("/api/control/manual", driveRef.current);
+      if (!controlSession.current) {
+        controlSession.current = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+      }
+      controlSequence.current += 1;
+      void post("/api/control/manual", {
+        ...driveRef.current,
+        control_session: controlSession.current,
+        control_sequence: controlSequence.current,
+      });
     };
     const remaining = 90 - (performance.now() - lastControlAt.current);
     if (immediate || remaining <= 0) {
@@ -752,6 +777,8 @@ export function LiveMappingWorkspace({
             <ManualDrivePad
               disabled={!connected || !activeMapping || blockedByOtherTask}
               onDrive={setDrive}
+              linearSpeed={linearSpeed}
+              angularSpeed={angularSpeed}
             />
             <p className="mapping-manual-note">
               按住方向按钮会自动暂停自主探索并接管底盘；松手后立即发送零速度。

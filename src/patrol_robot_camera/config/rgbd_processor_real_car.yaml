@@ -1,0 +1,27 @@
+rgbd_processor:
+  ros__parameters:
+    use_sim_time: false
+    # Aurora930 publishes registered depth and intrinsics under depth_cam.
+    # Avoid synchronizing the RGB stream for collision sensing: depth alone
+    # is cheaper and does not wait for a colour frame.
+    use_color: false
+    depth_topic: /depth_cam/depth0/image_raw
+    camera_info_topic: /depth_cam/depth0/camera_info
+    point_cloud_topic: /camera/points/filtered
+    point_cloud_publish_rate: 8.0
+    mapping_point_cloud_topic: /camera/points/mapping
+    # One 8 cm OctoMap insertion per second is sufficient at the 0.15 m/s
+    # chassis limit and prevents the persistent 3D mapper from queuing old TF.
+    mapping_publish_rate: 1.0
+
+    depth_scale: 0.001
+    min_depth: 0.20
+    max_depth: 3.0
+
+    # The raw Aurora cloud contains 256000 points. This profile keeps roughly
+    # 2000-4000 near-field points at 12 Hz on the real Orin.
+    sampling_stride: 4
+    voxel_size: 0.04
+    max_points: 30000
+    sync_queue_size: 3
+    sync_slop_seconds: 0.05

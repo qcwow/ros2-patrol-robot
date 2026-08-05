@@ -16,7 +16,7 @@ LOCAL_MAP_DIR="${PROJECT_ROOT}/src/patrol_robot_navigation/maps"
 
 "${SSH[@]}" "${VM_TARGET}" \
   "mkdir -p '${REMOTE_MAP_DIR}' && \
-   source /opt/ros/jazzy/setup.bash && \
+   source /opt/ros/humble/setup.bash && \
    source '${VM_WORKSPACE}/install/setup.bash' && \
    ros2 run nav2_map_server map_saver_cli \
      -f '${REMOTE_MAP_DIR}/${MAP_NAME}' --ros-args -p save_map_timeout:=10.0"

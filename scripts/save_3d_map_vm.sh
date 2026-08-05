@@ -16,7 +16,7 @@ LOCAL_MAP_DIR="${PROJECT_ROOT}/src/patrol_robot_navigation/maps/3d"
 
 "${SSH[@]}" "${VM_TARGET}" \
   "mkdir -p '${REMOTE_MAP_DIR}' && \
-   source /opt/ros/jazzy/setup.bash && \
+   source /opt/ros/humble/setup.bash && \
    source '${VM_WORKSPACE}/install/setup.bash' && \
    if ! ros2 node list | grep -qx '/octomap_server'; then \
      echo '错误：OctoMap 未运行。请先启动 3D 建图。'; \

@@ -9,6 +9,7 @@ import yaml
 from builtin_interfaces.msg import Time as TimeMessage
 from geometry_msgs.msg import TransformStamped, Twist
 from nav_msgs.msg import Odometry
+from rclpy.clock import Clock as RclpyClock, ClockType
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rosgraph_msgs.msg import Clock
@@ -263,6 +264,7 @@ class LightweightSimulator(Node):
             self.get_parameter('angular_speed_limit').value
         )
         self._command_timeout = float(self.get_parameter('command_timeout').value)
+        self._use_sim_time = bool(self.get_parameter('use_sim_time').value)
 
         self._odom_x = 0.0
         self._odom_y = 0.0
@@ -322,7 +324,11 @@ class LightweightSimulator(Node):
         self._angle_increment = angle_increment
         self._ray_step = min(0.10, self._map.resolution / 2.0)
 
-        self.create_timer(0.02, self._update)
+        # This node is the source of /clock. Its update loop must therefore
+        # use a wall clock; using the node's simulated clock here creates a
+        # bootstrap deadlock where /clock can never publish its first sample.
+        self._update_clock = RclpyClock(clock_type=ClockType.SYSTEM_TIME)
+        self.create_timer(0.02, self._update, clock=self._update_clock)
         self.get_logger().info(
             f'轻量二维仿真器已启动：地图={self._map.width}x{self._map.height}，'
             f'初始位姿=({self._initial_x:.2f}, {self._initial_y:.2f}, '
@@ -519,11 +525,16 @@ class LightweightSimulator(Node):
         delta_time = min(0.1, max(0.0, now_wall - self._last_update))
         self._last_update = now_wall
         simulation_time = now_wall - self._wall_start
-        stamp = self._stamp(simulation_time)
+        stamp = (
+            self._stamp(simulation_time)
+            if self._use_sim_time
+            else self.get_clock().now().to_msg()
+        )
 
-        clock = Clock()
-        clock.clock = stamp
-        self._clock_publisher.publish(clock)
+        if self._use_sim_time:
+            clock = Clock()
+            clock.clock = stamp
+            self._clock_publisher.publish(clock)
 
         self._integrate(delta_time, now_wall)
         self._publish_motion(stamp)

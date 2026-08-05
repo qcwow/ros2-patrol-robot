@@ -27,6 +27,7 @@ from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap, LoadMap
 from rcl_interfaces.msg import Parameter, ParameterType, ParameterValue
 from rcl_interfaces.srv import SetParameters
+from rclpy.clock import Clock as RclpyClock, ClockType
 from rclpy.node import Node
 from rclpy.qos import (
     DurabilityPolicy,
@@ -37,7 +38,7 @@ from rclpy.qos import (
 )
 from rclpy.time import Time
 from sensor_msgs.msg import Image, JointState, LaserScan, PointCloud2
-from slam_toolbox.srv import Reset, SaveMap
+from slam_toolbox.srv import SaveMap
 from std_msgs.msg import Float32, Float64, String
 from std_srvs.srv import Empty, Trigger
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
@@ -299,10 +300,19 @@ class RobotWebBridge(Node):
         self.declare_parameter('http_port', 8765)
         self.declare_parameter('max_linear_speed', 0.6)
         self.declare_parameter('max_angular_speed', 0.8)
+        self.declare_parameter('speed_control_min_linear', 0.05)
+        self.declare_parameter('speed_control_max_linear', 1.5)
+        self.declare_parameter('speed_control_max_angular', 2.0)
+        self.declare_parameter('use_patrol_speed_limits', True)
         self.declare_parameter('manual_command_timeout', 0.5)
+        # Simulation keeps /cmd_vel.  The real-car profile points this at a
+        # raw channel which must pass through manual_lidar_safety first.
+        self.declare_parameter('base_command_topic', '/cmd_vel')
+        self.declare_parameter('scan_topic', '/scan')
         self.declare_parameter('hardware_config_file', '~/.ros/patrol_robot/hardware.json')
         self.declare_parameter('map_storage_dir', '~/.ros/patrol_robot/maps')
         self.declare_parameter('require_3d_map_on_save', False)
+        self.declare_parameter('mapping_backend', 'slam_toolbox')
         self.declare_parameter('camera_topic', '/camera/color/image_raw')
         self.declare_parameter('camera_stream_fps', 12.0)
         self.declare_parameter('camera_jpeg_quality', 65)
@@ -327,6 +337,21 @@ class RobotWebBridge(Node):
 
         self._max_linear = float(self.get_parameter('max_linear_speed').value)
         self._max_angular = float(self.get_parameter('max_angular_speed').value)
+        self._speed_control_min_linear = max(
+            0.01,
+            float(self.get_parameter('speed_control_min_linear').value),
+        )
+        self._speed_control_max_linear = max(
+            self._speed_control_min_linear,
+            float(self.get_parameter('speed_control_max_linear').value),
+        )
+        self._speed_control_max_angular = max(
+            0.1,
+            float(self.get_parameter('speed_control_max_angular').value),
+        )
+        self._use_patrol_speed_limits = bool(
+            self.get_parameter('use_patrol_speed_limits').value
+        )
         self._command_timeout = float(self.get_parameter('manual_command_timeout').value)
         self._simulation_origin = (
             float(self.get_parameter('simulation_origin_x').value),
@@ -377,6 +402,9 @@ class RobotWebBridge(Node):
         self._require_3d_map_on_save = bool(
             self.get_parameter('require_3d_map_on_save').value
         )
+        self._mapping_backend = str(
+            self.get_parameter('mapping_backend').value
+        ).strip().lower()
         self._mapping_map = None
         self._mapping_started_at = None
         self._mapping_mode = 'idle'
@@ -442,6 +470,7 @@ class RobotWebBridge(Node):
         self._perception_resume_requested = False
         self._patrol_speed_limit = None
         self._commands = queue.Queue()
+        self._manual_control_sequences = {}
         self._lock = threading.Condition()
         self._last_manual_command = 0.0
         self._manual_active = False
@@ -462,10 +491,24 @@ class RobotWebBridge(Node):
         )
         self._camera_encoder_thread.start()
         self._status = {
-            'connected': True, 'patrol': {'state': 'UNKNOWN', 'running': False},
+            'connected': True,
+            'patrol': {
+                'state': 'UNKNOWN',
+                'running': False,
+                'current_index': 0,
+                'current_waypoint': '等待巡检管理器',
+                'waypoint_count': 0,
+                'navigation_health_ready': False,
+                'navigation_health_reason': '等待巡检管理器状态',
+                'waypoint_tasks': [],
+            },
             'speed': 0.0, 'angular_speed': 0.0, 'x': 0.0, 'y': 0.0,
             'battery': None, 'lidar_ok': False, 'last_scan_age': None,
             'max_linear_speed': self._max_linear,
+            'max_angular_speed': self._max_angular,
+            'speed_control_min_linear': self._speed_control_min_linear,
+            'speed_control_max_linear': self._speed_control_max_linear,
+            'speed_control_max_angular': self._speed_control_max_angular,
             'navigation': {
                 'path': [],
                 'frame_id': 'map',
@@ -539,7 +582,10 @@ class RobotWebBridge(Node):
 
         # This node is the only publisher allowed on the physical base topic.
         # It arbitrates smoothed Nav2 output and high-priority manual commands.
-        self._cmd_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        base_command_topic = str(
+            self.get_parameter('base_command_topic').value)
+        self._cmd_publisher = self.create_publisher(
+            Twist, base_command_topic, 10)
         self.create_subscription(
             Twist,
             '/cmd_vel_nav',
@@ -599,9 +645,10 @@ class RobotWebBridge(Node):
             self._on_raw_navigation_path,
             10,
         )
+        scan_topic = str(self.get_parameter('scan_topic').value)
         self.create_subscription(
             LaserScan,
-            '/scan',
+            scan_topic,
             self._on_scan,
             qos_profile_sensor_data,
         )
@@ -700,6 +747,9 @@ class RobotWebBridge(Node):
             LoadMap,
             '/map_server/load_map',
         )
+        # Humble's async SLAM node is supervised by slam_session_manager,
+        # which provides real stop/start lifecycle semantics and fresh-session
+        # reset instead of merely pausing incoming scans.
         self._slam_lifecycle_client = self.create_client(
             ChangeState,
             '/slam_toolbox/change_state',
@@ -724,26 +774,45 @@ class RobotWebBridge(Node):
             '/slam_toolbox/save_map',
         )
         self._slam_reset_client = self.create_client(
-            Reset,
-            '/slam_toolbox/reset',
+            Trigger,
+            '/slam_toolbox/reset_session',
+        )
+        self._rtabmap_reset_client = self.create_client(
+            Empty,
+            '/rtabmap/reset',
         )
         self._octomap_reset_client = self.create_client(
             Empty,
             '/octomap_server/reset',
         )
-        self.create_timer(0.05, self._process_commands)
-        self.create_timer(0.1, self._continue_mapping_mode_switch)
-        self.create_timer(0.1, self._continue_slam_reset_when_ready)
-        self.create_timer(0.1, self._manual_watchdog)
-        self.create_timer(1.0, self._publish_speed_limit)
-        self.create_timer(1.0, self._publish_map_source_state)
-        self.create_timer(0.5, self._perception_watchdog)
+        # The lightweight simulator starts /clock at zero. If these timers are
+        # created during DDS discovery, Humble can schedule them against wall
+        # time and then strand them when simulated time becomes active.
+        # Drive control-state timers from a dedicated wall clock while keeping
+        # the node's ROS clock for stamped messages and TF.
+        self._wall_timer_clock = RclpyClock(clock_type=ClockType.SYSTEM_TIME)
+        wall_clock = self._wall_timer_clock
+        self.create_timer(0.05, self._process_commands, clock=wall_clock)
+        self.create_timer(
+            0.1, self._continue_mapping_mode_switch, clock=wall_clock
+        )
+        self.create_timer(
+            0.1, self._continue_slam_reset_when_ready, clock=wall_clock
+        )
+        self.create_timer(0.1, self._manual_watchdog, clock=wall_clock)
+        self.create_timer(1.0, self._publish_speed_limit, clock=wall_clock)
+        self.create_timer(1.0, self._publish_map_source_state, clock=wall_clock)
+        self.create_timer(0.5, self._perception_watchdog, clock=wall_clock)
         self._tf_buffer = Buffer()
         self._tf_listener = TransformListener(self._tf_buffer, self)
         self._tf_broadcaster = TransformBroadcaster(self)
-        self.create_timer(0.2, self._update_map_pose)
-        self.create_timer(0.25, self._publish_map_initial_pose)
-        self.create_timer(0.05, self._publish_ground_truth_map_transform)
+        self.create_timer(0.2, self._update_map_pose, clock=wall_clock)
+        self.create_timer(
+            0.25, self._publish_map_initial_pose, clock=wall_clock
+        )
+        self.create_timer(
+            0.05, self._publish_ground_truth_map_transform, clock=wall_clock
+        )
 
         host = str(self.get_parameter('http_host').value)
         port = int(self.get_parameter('http_port').value)
@@ -756,6 +825,9 @@ class RobotWebBridge(Node):
         )
         self._http_thread.start()
         self.get_logger().info(f'车辆 Web 网关已监听 http://{host}:{port}')
+        self.get_logger().info(
+            f'底盘命令输出={base_command_topic}，雷达输入={scan_topic}'
+        )
         if bool(self.get_parameter('camera_enabled_at_start').value):
             self._set_camera_enabled(True)
 
@@ -785,6 +857,16 @@ class RobotWebBridge(Node):
         bridge = self
 
         class Handler(BaseHTTPRequestHandler):
+            protocol_version = 'HTTP/1.1'
+
+            def setup(self):
+                super().setup()
+                self.connection.setsockopt(
+                    socket.IPPROTO_TCP,
+                    socket.TCP_NODELAY,
+                    1,
+                )
+
             def _send(self, status, payload):
                 body = json.dumps(payload, ensure_ascii=False).encode('utf-8')
                 self.send_response(status)
@@ -795,7 +877,10 @@ class RobotWebBridge(Node):
                 self.send_header('Access-Control-Allow-Headers', 'Content-Type')
                 self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
 
             def _send_binary(self, status, content_type, body):
                 self.send_response(status)
@@ -805,7 +890,10 @@ class RobotWebBridge(Node):
                 self.send_header('Access-Control-Allow-Origin', '*')
                 self.send_header('Access-Control-Allow-Private-Network', 'true')
                 self.end_headers()
-                self.wfile.write(body)
+                try:
+                    self.wfile.write(body)
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    return
 
             def _stream_camera(self):
                 # The enable command is processed on the ROS thread. Allow a
@@ -908,7 +996,12 @@ class RobotWebBridge(Node):
                     payload = json.loads(self.rfile.read(length) or b'{}')
                     if not isinstance(payload, dict):
                         raise ValueError('请求正文必须是 JSON 对象')
-                    bridge._commands.put((urlparse(self.path).path, payload))
+                    path = urlparse(self.path).path
+                    bridge._commands.put((path, payload))
+                    if path == '/api/maps/activate':
+                        bridge.get_logger().info(
+                            f'已接收地图应用请求：{payload.get("name", "未命名地图")}'
+                        )
                     self._send(202, {'ok': True, 'message': '命令已接收'})
                 except (ValueError, json.JSONDecodeError) as error:
                     self._send(400, {'ok': False, 'message': str(error)})
@@ -1477,6 +1570,8 @@ class RobotWebBridge(Node):
             pass
 
     def _on_patrol_speed_limit(self, message):
+        if not self._use_patrol_speed_limits:
+            return
         limit = float(message.data)
         if not math.isfinite(limit) or limit <= 0.0:
             return
@@ -1671,6 +1766,9 @@ class RobotWebBridge(Node):
                     with self._lock:
                         self._status['map']['patrol_route_ready'] = True
             elif path == '/api/maps/activate':
+                self.get_logger().info(
+                    f'开始处理地图应用请求：{payload.get("name", "未命名地图")}'
+                )
                 self._activate_map(payload)
             elif path == '/api/config/speed':
                 self._set_speed_limit(
@@ -1678,6 +1776,23 @@ class RobotWebBridge(Node):
                     float(payload.get('angular', self._max_angular)),
                 )
             elif path == '/api/control/manual':
+                control_session = str(payload.get('control_session', '')).strip()
+                control_sequence = payload.get('control_sequence')
+                if control_session and control_sequence is not None:
+                    try:
+                        control_sequence = int(control_sequence)
+                    except (TypeError, ValueError):
+                        continue
+                    previous_sequence = self._manual_control_sequences.get(
+                        control_session,
+                        -1,
+                    )
+                    if control_sequence <= previous_sequence:
+                        continue
+                    self._manual_control_sequences[control_session] = control_sequence
+                    if len(self._manual_control_sequences) > 32:
+                        oldest_session = next(iter(self._manual_control_sequences))
+                        self._manual_control_sequences.pop(oldest_session, None)
                 self._publish_manual(
                     float(payload.get('linear', 0.0)),
                     float(payload.get('angular', 0.0)),
@@ -1970,7 +2085,10 @@ class RobotWebBridge(Node):
             )
             return
         if transition_succeeded:
-            self._reset_slam_for_mapping()
+            # The Humble session manager implements activation by launching a
+            # new process, so an inactive -> active transition is already a
+            # clean pose graph. Do not immediately restart that process again.
+            self._accept_fresh_slam_session_for_mapping()
             return
 
         # Lifecycle transitions are not queued. A concurrent activation can
@@ -1998,7 +2116,7 @@ class RobotWebBridge(Node):
             )
             return
         if state_id == State.PRIMARY_STATE_ACTIVE:
-            self._reset_slam_for_mapping()
+            self._accept_fresh_slam_session_for_mapping()
             return
         self._restore_static_after_mapping_switch_error(
             f'SLAM 无法进入 active 状态，当前为 {state_label or state_id}'
@@ -2032,10 +2150,19 @@ class RobotWebBridge(Node):
         message = String()
         message.data = 'clear_slam'
         self._map_source_publisher.publish(message)
-        request = Reset.Request()
-        request.pause_new_measurements = False
+        request = Trigger.Request()
         future = self._slam_reset_client.call_async(request)
         future.add_done_callback(self._on_slam_reset_for_mapping)
+
+    def _accept_fresh_slam_session_for_mapping(self):
+        """Finish switching after activation already created a blank graph."""
+
+        self._mapping_reset_wait_deadline = None
+        self._clear_live_voxels()
+        message = String()
+        message.data = 'clear_slam'
+        self._map_source_publisher.publish(message)
+        self._finish_fresh_slam_session_for_mapping()
 
     def _clear_live_voxels(self):
         with self._lock:
@@ -2060,14 +2187,17 @@ class RobotWebBridge(Node):
         self._mapping_reset_wait_deadline = None
         try:
             response = future.result()
-            if int(response.result) != 0:
-                raise RuntimeError(f'SLAM 重置返回错误码 {response.result}')
+            if not bool(response.success):
+                raise RuntimeError(response.message or 'SLAM 会话管理器拒绝重置')
         except Exception as error:
             self._restore_static_after_mapping_switch_error(
                 f'无法清空上一张 SLAM 地图：{error}'
             )
             return
 
+        self._finish_fresh_slam_session_for_mapping()
+
+    def _finish_fresh_slam_session_for_mapping(self):
         pending = self._pending_mapping_resume
         self._pending_mapping_resume = None
         self._mapping_map = None
@@ -2188,27 +2318,43 @@ class RobotWebBridge(Node):
                 'saved_map': None,
             })
             self._status['map']['patrol_route_ready'] = False
-        if not self._slam_reset_client.service_is_ready():
+        reset_client = (
+            self._rtabmap_reset_client
+            if self._mapping_backend == 'rtabmap'
+            else self._slam_reset_client
+        )
+        reset_service = (
+            '/rtabmap/reset'
+            if self._mapping_backend == 'rtabmap'
+            else '/slam_toolbox/reset_session'
+        )
+        if not reset_client.service_is_ready():
             self._mapping_reset_in_progress = False
             with self._lock:
                 self._status['mapping'].update({
                     'state': 'ERROR',
                     'detail': 'SLAM 重置服务尚未就绪，当前地图未清空',
-                    'save_error': '无法连接 /slam_toolbox/reset',
+                    'save_error': f'无法连接 {reset_service}',
                 })
             return
 
-        request = Reset.Request()
-        request.pause_new_measurements = False
-        future = self._slam_reset_client.call_async(request)
+        request = (
+            Empty.Request()
+            if self._mapping_backend == 'rtabmap'
+            else Trigger.Request()
+        )
+        future = reset_client.call_async(request)
         future.add_done_callback(self._on_mapping_session_reset)
 
     def _on_mapping_session_reset(self, future):
         error = None
         try:
             response = future.result()
-            if int(response.result) != 0:
-                error = f'SLAM 重置返回错误码 {response.result}'
+            if (
+                self._mapping_backend != 'rtabmap'
+                and not bool(response.success)
+            ):
+                raise RuntimeError(response.message or 'SLAM 会话管理器拒绝重置')
         except Exception as exception:
             error = str(exception)
         if error:
@@ -2257,6 +2403,9 @@ class RobotWebBridge(Node):
                     'save_error': '地图名称不能为空',
                 })
             return
+        if self._mapping_backend == 'rtabmap':
+            self._save_rtabmap_mapping_map(display_name)
+            return
         frontier_stop = self._frontier_clients['stop']
         if frontier_stop.service_is_ready():
             frontier_stop.call_async(Trigger.Request())
@@ -2296,6 +2445,84 @@ class RobotWebBridge(Node):
                     safe_id,
                     display_name,
                 )
+        )
+
+    def _save_rtabmap_mapping_map(self, display_name):
+        """Save RTAB-Map's live /map using Nav2's generic map saver."""
+
+        frontier_stop = self._frontier_clients['stop']
+        if frontier_stop.service_is_ready():
+            frontier_stop.call_async(Trigger.Request())
+        self._publish_manual(0.0, 0.0)
+        timestamp = int(time.time() * 1000)
+        safe_prefix = re.sub(
+            r'[^A-Za-z0-9_-]+',
+            '-',
+            display_name,
+        ).strip('-')[:48] or 'mapping'
+        map_id = f'{safe_prefix}-{timestamp}'
+        self._map_storage_dir.mkdir(parents=True, exist_ok=True)
+        target = self._map_storage_dir / map_id
+        with self._lock:
+            map_snapshot = dict(self._mapping_map or {})
+            self._status['mapping'].update({
+                'state': 'SAVING',
+                'detail': '正在写入 RTAB-Map 二维栅格与三维体素图',
+                'enabled': False,
+                'save_error': None,
+            })
+        threading.Thread(
+            target=self._save_rtabmap_mapping_map_worker,
+            args=(map_id, display_name, target, map_snapshot),
+            daemon=True,
+        ).start()
+
+    def _save_rtabmap_mapping_map_worker(
+        self,
+        map_id,
+        display_name,
+        target,
+        map_snapshot,
+    ):
+        yaml_path = self._map_storage_dir / f'{map_id}.yaml'
+        pgm_path = self._map_storage_dir / f'{map_id}.pgm'
+        try:
+            completed = subprocess.run(
+                [
+                    'ros2',
+                    'run',
+                    'nav2_map_server',
+                    'map_saver_cli',
+                    '-f',
+                    str(target),
+                    '--ros-args',
+                    '-p',
+                    'save_map_timeout:=20.0',
+                ],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=25.0,
+            )
+            if completed.returncode != 0:
+                detail = (completed.stderr or completed.stdout).strip()
+                raise RuntimeError(detail or 'Nav2 地图保存器返回失败')
+            if not yaml_path.is_file() or not pgm_path.is_file():
+                raise RuntimeError('地图保存器返回成功，但地图文件不完整')
+        except (OSError, subprocess.TimeoutExpired, RuntimeError) as error:
+            with self._lock:
+                self._status['mapping'].update({
+                    'state': 'ERROR',
+                    'detail': f'RTAB-Map 地图保存失败：{error}',
+                    'save_error': str(error),
+                })
+            return
+        self._finalize_mapping_map_save(
+            map_id,
+            display_name,
+            yaml_path,
+            pgm_path,
+            map_snapshot,
         )
 
     def _on_mapping_map_saved(self, future, map_id, display_name):
@@ -3401,10 +3628,11 @@ class RobotWebBridge(Node):
         if mode == 'camera':
             self._set_camera_gimbal(0.0, 0.0)
 
-        # Live sensors belong to the local collision map only. The global map
-        # remains the audited static plant map, so NavFn cannot invent a detour
-        # into an unapproved area around a temporary obstacle.
-        clients = (self._local_costmap_params,)
+        # Apply the selected live sensors to both maps. The local layer performs
+        # immediate collision checking, while the global layer lets NavFn plan
+        # around a camera-only obstacle instead of repeatedly following the
+        # blocked laser-only route.
+        clients = (self._local_costmap_params, self._global_costmap_params)
         if not all(client.service_is_ready() for client in clients):
             with self._lock:
                 self._status['perception'].update({
@@ -3699,10 +3927,17 @@ class RobotWebBridge(Node):
             self._lock.notify_all()
 
     def _set_speed_limit(self, linear, angular):
-        self._max_linear = max(0.05, min(linear, 1.5))
-        self._max_angular = max(0.1, min(angular, 2.0))
+        self._max_linear = max(
+            self._speed_control_min_linear,
+            min(linear, self._speed_control_max_linear),
+        )
+        self._max_angular = max(
+            0.1,
+            min(angular, self._speed_control_max_angular),
+        )
         with self._lock:
             self._status['max_linear_speed'] = self._max_linear
+            self._status['max_angular_speed'] = self._max_angular
         self._publish_speed_limit()
 
     def _publish_speed_limit(self):
@@ -3801,7 +4036,7 @@ def main(args=None):
     except KeyboardInterrupt:
         pass
     except RuntimeError as error:
-        # During a launch-wide SIGINT, Jazzy's Python binding can wake a
+        # During a launch-wide SIGINT, the ROS 2 Python binding can wake a
         # subscription after its DDS bridge has already been torn down. This
         # exact conversion error is a shutdown race, not an application fault.
         if 'Unable to convert call argument' not in str(error):

@@ -19,7 +19,7 @@ from rclpy.qos import (
     ReliabilityPolicy,
 )
 from rclpy.time import Time
-from std_msgs.msg import String
+from std_msgs.msg import Bool, String
 from std_srvs.srv import Trigger
 from tf2_ros import Buffer, TransformException, TransformListener
 
@@ -28,6 +28,7 @@ from .frontier_geometry import (
     extract_frontier_clusters,
     select_frontier_goal,
 )
+from .navigation_motion_guard import NavigationMotionGuard
 
 
 class FrontierExplorer(Node):
@@ -39,6 +40,7 @@ class FrontierExplorer(Node):
         self.declare_parameter('goal_timeout_seconds', 90.0)
         self.declare_parameter('map_topic', '/map')
         self.declare_parameter('action_name', 'navigate_to_pose')
+        self.declare_parameter('stop_command_topic', '/cmd_vel')
         self.declare_parameter('global_frame', 'map')
         self.declare_parameter('base_frame', 'base_footprint')
         self.declare_parameter('behavior_tree', '')
@@ -56,10 +58,39 @@ class FrontierExplorer(Node):
         self.declare_parameter('blacklist_timeout_seconds', 120.0)
         self.declare_parameter('no_frontier_cycles', 5)
         self.declare_parameter('max_unreachable_cycles', 8)
+        self.declare_parameter('require_navigation_health', False)
+        self.declare_parameter('enable_motion_spin_guard', False)
+        self.declare_parameter('motion_spin_window_seconds', 2.0)
+        self.declare_parameter('motion_spin_max_translation', 0.08)
+        self.declare_parameter('motion_spin_min_yaw_degrees', 20.0)
+        self.declare_parameter('motion_spin_min_goal_progress', 0.02)
 
         self._global_frame = str(self.get_parameter('global_frame').value)
         self._base_frame = str(self.get_parameter('base_frame').value)
         self._behavior_tree = str(self.get_parameter('behavior_tree').value)
+        self._require_navigation_health = bool(
+            self.get_parameter('require_navigation_health').value
+        )
+        self._navigation_health_ready = not self._require_navigation_health
+        self._navigation_health_reason = None
+        self._navigation_health_checks = {}
+        self._global_pose_stable_seconds = 0.0
+        self._global_pose_translation_delta = 0.0
+        self._global_pose_yaw_delta_degrees = 0.0
+        self._enable_motion_spin_guard = bool(
+            self.get_parameter('enable_motion_spin_guard').value
+        )
+        self._motion_guard = NavigationMotionGuard(
+            float(self.get_parameter('motion_spin_window_seconds').value),
+            float(self.get_parameter('motion_spin_max_translation').value),
+            math.radians(float(
+                self.get_parameter('motion_spin_min_yaw_degrees').value
+            )),
+            float(
+                self.get_parameter('motion_spin_min_goal_progress').value
+            ),
+        )
+        self._motion_guard_triggered = False
         self._enabled = bool(self.get_parameter('autostart').value)
         self._startup_deadline = (
             time.monotonic()
@@ -102,6 +133,18 @@ class FrontierExplorer(Node):
             self._on_map,
             map_qos,
         )
+        self.create_subscription(
+            Bool,
+            '/navigation_health/ready',
+            self._on_navigation_health,
+            map_qos,
+        )
+        self.create_subscription(
+            String,
+            '/navigation_health/status',
+            self._on_navigation_health_status,
+            map_qos,
+        )
         self._frontiers_publisher = self.create_publisher(
             PoseArray, '/frontier_explorer/frontiers', 10
         )
@@ -111,7 +154,11 @@ class FrontierExplorer(Node):
         self._status_publisher = self.create_publisher(
             String, '/frontier_explorer/status', 10
         )
-        self._stop_publisher = self.create_publisher(Twist, '/cmd_vel', 10)
+        self._stop_publisher = self.create_publisher(
+            Twist,
+            str(self.get_parameter('stop_command_topic').value),
+            10,
+        )
         self.create_service(
             Trigger, '/frontier_explorer/start', self._on_start
         )
@@ -129,6 +176,46 @@ class FrontierExplorer(Node):
 
     def _on_map(self, message):
         self._map = message
+
+    def _on_navigation_health(self, message):
+        ready = bool(message.data)
+        self._navigation_health_ready = ready
+        if (
+            self._require_navigation_health
+            and not ready
+            and (self._goal_handle is not None or self._pending_goal)
+        ):
+            self._cancel_goal(
+                (
+                    self._navigation_health_reason
+                    or '导航健康失效，已取消前沿目标并停车'
+                ),
+                blacklist=False,
+            )
+            self._state = 'WAITING_FOR_HEALTH'
+
+    def _on_navigation_health_status(self, message):
+        try:
+            status = json.loads(message.data)
+        except (json.JSONDecodeError, TypeError):
+            return
+        reason = status.get('reason')
+        self._navigation_health_reason = (
+            str(reason) if reason else None
+        )
+        checks = status.get('checks')
+        self._navigation_health_checks = (
+            checks if isinstance(checks, dict) else {}
+        )
+        self._global_pose_stable_seconds = float(
+            status.get('global_pose_stable_seconds') or 0.0
+        )
+        self._global_pose_translation_delta = float(
+            status.get('global_pose_translation_delta') or 0.0
+        )
+        self._global_pose_yaw_delta_degrees = float(
+            status.get('global_pose_yaw_delta_degrees') or 0.0
+        )
 
     def _on_start(self, _request, response):
         self._enabled = True
@@ -186,6 +273,16 @@ class FrontierExplorer(Node):
         if not self._enabled:
             return
         if now < self._startup_deadline:
+            return
+        if (
+            self._require_navigation_health
+            and not self._navigation_health_ready
+        ):
+            self._state = 'WAITING_FOR_HEALTH'
+            self._detail = (
+                self._navigation_health_reason
+                or '等待 RTAB-Map 位姿和导航状态持续稳定'
+            )
             return
         if self._goal_handle is not None or self._pending_goal:
             if (
@@ -359,6 +456,8 @@ class FrontierExplorer(Node):
         self._goal_request_id += 1
         request_id = self._goal_request_id
         self._goal_started_at = time.monotonic()
+        self._motion_guard.reset()
+        self._motion_guard_triggered = False
         self._state = 'SENDING_GOAL'
         self._detail = (
             f'前沿 {goal.cluster_size} 格，距离 {goal.distance:.2f} m'
@@ -406,9 +505,42 @@ class FrontierExplorer(Node):
         )
 
     def _on_feedback(self, feedback_message):
-        self._distance_remaining = float(
-            feedback_message.feedback.distance_remaining
+        feedback = feedback_message.feedback
+        self._distance_remaining = float(feedback.distance_remaining)
+        if not self._enable_motion_spin_guard:
+            return
+        orientation = feedback.current_pose.pose.orientation
+        yaw = math.atan2(
+            2.0 * (
+                orientation.w * orientation.z
+                + orientation.x * orientation.y
+            ),
+            1.0 - 2.0 * (
+                orientation.y * orientation.y
+                + orientation.z * orientation.z
+            ),
         )
+        status = self._motion_guard.observe(
+            time.monotonic(),
+            float(feedback.current_pose.pose.position.x),
+            float(feedback.current_pose.pose.position.y),
+            yaw,
+            self._distance_remaining,
+        )
+        if not status.tripped:
+            return
+        self._motion_guard_triggered = True
+        self._goals_failed += 1
+        detail = (
+            f'转圈保护触发：{status.elapsed:.1f} 秒内仅移动 '
+            f'{status.translation:.2f} m，航向变化 '
+            f'{math.degrees(status.yaw_change):.1f}°，'
+            f'目标进度 {status.distance_progress:.2f} m'
+        )
+        self._cancel_goal(detail, blacklist=False)
+        self._enabled = False
+        self._state = 'BLOCKED'
+        self.get_logger().error(f'{detail}；自主探索已锁定并停车')
 
     def _on_goal_result(self, future, request_id):
         if request_id != self._goal_request_id:
@@ -491,6 +623,20 @@ class FrontierExplorer(Node):
                 if self._distance_remaining is not None
                 else None
             ),
+            'navigation_health_ready': self._navigation_health_ready,
+            'navigation_health_reason': self._navigation_health_reason,
+            'navigation_health_checks': self._navigation_health_checks,
+            'global_pose_stable_seconds': round(
+                self._global_pose_stable_seconds, 2
+            ),
+            'global_pose_translation_delta': round(
+                self._global_pose_translation_delta, 4
+            ),
+            'global_pose_yaw_delta_degrees': round(
+                self._global_pose_yaw_delta_degrees, 3
+            ),
+            'motion_spin_guard_enabled': self._enable_motion_spin_guard,
+            'motion_spin_guard_triggered': self._motion_guard_triggered,
             'goal': (
                 {
                     'x': round(goal.x, 3),

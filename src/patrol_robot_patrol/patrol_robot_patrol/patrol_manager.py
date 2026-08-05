@@ -8,6 +8,7 @@ from action_msgs.msg import GoalStatus
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Path
 from nav2_msgs.action import ComputePathToPose, NavigateToPose
+from nav2_msgs.msg import SpeedLimit
 from nav2_msgs.srv import ClearEntireCostmap
 from rcl_interfaces.srv import SetParameters
 from rclpy.action import ActionClient
@@ -21,8 +22,12 @@ from std_msgs.msg import Bool, Float32, Header, String
 from patrol_robot_patrol.failed_path_memory import FailedPathMemory
 from patrol_robot_patrol.health_recovery_progress import HealthRecoveryProgress
 from patrol_robot_patrol.navigation_failure import (
-    is_route_failure,
     navigation_error_label,
+    should_blacklist_route,
+)
+from patrol_robot_patrol.navigation_motion_guard import (
+    MotionGuardStatus,
+    NavigationMotionGuard,
 )
 from patrol_robot_patrol.route_model import PatrolRoute, Waypoint, load_route, parse_route
 from patrol_robot_patrol.task_ledger import PatrolTaskLedger
@@ -45,6 +50,7 @@ class PatrolManager(Node):
         self.declare_parameter('retry_delay_seconds', 3.0)
         self.declare_parameter('lap_restart_delay_seconds', 1.5)
         self.declare_parameter('action_name', 'navigate_to_pose')
+        self.declare_parameter('publish_nav2_speed_limit_direct', False)
         self.declare_parameter('behavior_tree', '')
         self.declare_parameter('behavior_tree_no_spin', '')
         self.declare_parameter('behavior_tree_restricted', '')
@@ -63,6 +69,11 @@ class PatrolManager(Node):
         self.declare_parameter('max_similar_path_replans', 6)
         self.declare_parameter('similar_path_replan_delay_seconds', 1.25)
         self.declare_parameter('max_route_failures', 6)
+        self.declare_parameter('enable_motion_spin_guard', False)
+        self.declare_parameter('motion_spin_window_seconds', 2.0)
+        self.declare_parameter('motion_spin_max_translation', 0.08)
+        self.declare_parameter('motion_spin_min_yaw_degrees', 20.0)
+        self.declare_parameter('motion_spin_min_goal_progress', 0.02)
 
         self._loop = self.get_parameter('loop').value
         self._loop_count = max(1, int(self.get_parameter('loop_count').value))
@@ -85,6 +96,9 @@ class PatrolManager(Node):
             float(self.get_parameter('lap_restart_delay_seconds').value),
         )
         self._behavior_tree = str(self.get_parameter('behavior_tree').value)
+        self._publish_nav2_speed_limit_direct = bool(
+            self.get_parameter('publish_nav2_speed_limit_direct').value
+        )
         self._behavior_trees = {
             'standard': self._behavior_tree,
             'no_spin': str(self.get_parameter('behavior_tree_no_spin').value),
@@ -155,6 +169,19 @@ class PatrolManager(Node):
         self._max_route_failures = max(
             1, int(self.get_parameter('max_route_failures').value)
         )
+        self._enable_motion_spin_guard = bool(
+            self.get_parameter('enable_motion_spin_guard').value
+        )
+        self._motion_guard = NavigationMotionGuard(
+            float(self.get_parameter('motion_spin_window_seconds').value),
+            float(self.get_parameter('motion_spin_max_translation').value),
+            math.radians(float(
+                self.get_parameter('motion_spin_min_yaw_degrees').value
+            )),
+            float(
+                self.get_parameter('motion_spin_min_goal_progress').value
+            ),
+        )
 
         waypoint_file = str(self.get_parameter('waypoint_file').value)
         if not waypoint_file:
@@ -220,6 +247,10 @@ class PatrolManager(Node):
             '~/speed_limit',
             selector_qos,
         )
+        self._nav2_speed_limit_publisher = (
+            self.create_publisher(SpeedLimit, '/speed_limit', selector_qos)
+            if self._publish_nav2_speed_limit_direct else None
+        )
 
         self._route_cursor = 0
         self._index = self._route.home_index
@@ -261,6 +292,8 @@ class PatrolManager(Node):
         self._last_candidate_similarity = 0.0
         self._route_failure_count = 0
         self._route_replan_pending = False
+        self._motion_guard_status: Optional[MotionGuardStatus] = None
+        self._motion_guard_triggered = False
 
         self.create_timer(0.25, self._tick)
         self.create_timer(0.5, self._publish_status)
@@ -601,6 +634,22 @@ class PatrolManager(Node):
             ),
             'navigation_health_ready': self._navigation_health_ready,
             'navigation_health_reason': self._navigation_health_reason,
+            'motion_spin_guard_enabled': self._enable_motion_spin_guard,
+            'motion_spin_guard_triggered': self._motion_guard_triggered,
+            'motion_spin_guard': ({
+                'elapsed_seconds': round(
+                    self._motion_guard_status.elapsed, 2
+                ),
+                'translation_meters': round(
+                    self._motion_guard_status.translation, 3
+                ),
+                'yaw_change_degrees': round(math.degrees(
+                    self._motion_guard_status.yaw_change
+                ), 2),
+                'goal_progress_meters': round(
+                    self._motion_guard_status.distance_progress, 3
+                ),
+            } if self._motion_guard_status is not None else None),
             'required_sensor_ready': (
                 self._required_sensor_ready(current) if current else False
             ),
@@ -887,6 +936,9 @@ class PatrolManager(Node):
         self._cancel_reason = None
         self._goal_started_at = self._now()
         self._goal_received_feedback = False
+        self._motion_guard.reset()
+        self._motion_guard_status = None
+        self._motion_guard_triggered = False
         self._state = 'SENDING_GOAL'
 
         if self._returning_home:
@@ -960,6 +1012,39 @@ class PatrolManager(Node):
             feedback.current_pose.pose.position.y,
         )
         now = self._now()
+        if self._enable_motion_spin_guard:
+            orientation = feedback.current_pose.pose.orientation
+            yaw = math.atan2(
+                2.0 * (
+                    orientation.w * orientation.z
+                    + orientation.x * orientation.y
+                ),
+                1.0 - 2.0 * (
+                    orientation.y * orientation.y
+                    + orientation.z * orientation.z
+                ),
+            )
+            self._motion_guard_status = self._motion_guard.observe(
+                now,
+                float(feedback.current_pose.pose.position.x),
+                float(feedback.current_pose.pose.position.y),
+                yaw,
+                float(feedback.distance_remaining),
+            )
+            if self._motion_guard_status.tripped:
+                self._motion_guard_triggered = True
+                self._blocked_reason = (
+                    '转圈保护触发：'
+                    f'{self._motion_guard_status.elapsed:.1f} 秒内仅移动 '
+                    f'{self._motion_guard_status.translation:.2f} m，'
+                    f'航向变化 {math.degrees(self._motion_guard_status.yaw_change):.1f}°，'
+                    f'目标进度 {self._motion_guard_status.distance_progress:.2f} m'
+                )
+                self.get_logger().error(
+                    f'{self._blocked_reason}；正在取消导航并进入 BLOCKED'
+                )
+                self._request_cancel('spin_guard')
+                return
         self._observe_health_recovery_progress(
             now,
             float(feedback.distance_remaining),
@@ -990,6 +1075,11 @@ class PatrolManager(Node):
         message = Float32()
         message.data = effective_speed
         self._speed_limit_publisher.publish(message)
+        if self._nav2_speed_limit_publisher is not None:
+            nav2_message = SpeedLimit()
+            nav2_message.percentage = False
+            nav2_message.speed_limit = effective_speed
+            self._nav2_speed_limit_publisher.publish(nav2_message)
         return effective_speed
 
     def _reset_health_recovery_streak(self) -> None:
@@ -1072,6 +1162,13 @@ class PatrolManager(Node):
         if cancel_reason == 'health':
             self._begin_health_recovery()
             return
+        if cancel_reason == 'spin_guard':
+            self._retry_count = 0
+            self._last_failure_status = GoalStatus.STATUS_CANCELED
+            self._last_failure_error_code = None
+            self._last_failure_error_message = '转圈保护主动取消导航'
+            self._state = 'BLOCKED'
+            return
         if cancel_reason == 'estop':
             self._state = 'ESTOP'
             self._retry_count = 0
@@ -1104,7 +1201,11 @@ class PatrolManager(Node):
             )
         self._last_failure_error_code = error_code
         self._last_failure_error_message = error_message or error_label
-        if cancel_reason != 'timeout' and is_route_failure(error_code):
+        if cancel_reason != 'timeout' and should_blacklist_route(
+            error_code,
+            action_aborted=status == GoalStatus.STATUS_ABORTED,
+            has_candidate_path=bool(self._active_plan),
+        ):
             self._handle_route_failure(
                 status=status,
                 error_code=error_code,
@@ -1233,6 +1334,12 @@ class PatrolManager(Node):
             self._advance_after_inspection()
         if reason == 'health':
             self._begin_health_recovery()
+        elif reason == 'spin_guard':
+            self._retry_count = 0
+            self._last_failure_status = GoalStatus.STATUS_CANCELED
+            self._last_failure_error_code = None
+            self._last_failure_error_message = '转圈保护主动取消导航'
+            self._state = 'BLOCKED'
         elif reason == 'estop':
             self._retry_count = 0
             self._reset_health_recovery_streak()

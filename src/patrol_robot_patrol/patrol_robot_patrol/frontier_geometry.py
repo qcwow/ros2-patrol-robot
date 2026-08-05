@@ -237,12 +237,22 @@ def select_frontier_goal(
         ]
         centroid_x = sum(point[0] for point in frontier_points) / len(frontier_points)
         centroid_y = sum(point[1] for point in frontier_points) / len(frontier_points)
-        # A newly observed open area often creates one frontier ring around
-        # the robot. Its mathematical centroid may equal the robot position,
-        # so use the real frontier cell nearest that centroid as the target
-        # representative instead of trying to navigate to the ring center.
+        # A newly observed area often creates one ring-shaped frontier whose
+        # centroid lies on the robot. Obstacles can also pull part of that ring
+        # very close to the base. Select a real frontier cell that is far
+        # enough for the offset goal to satisfy min_goal_distance; otherwise
+        # the centroid-nearest cell creates a goal at the robot and the entire
+        # (otherwise reachable) cluster is incorrectly rejected.
+        eligible_frontier_points = [
+            point
+            for point in frontier_points
+            if math.hypot(point[0] - robot_x, point[1] - robot_y)
+            >= goal_offset + min_goal_distance
+        ]
+        if not eligible_frontier_points:
+            continue
         frontier_x, frontier_y = min(
-            frontier_points,
+            eligible_frontier_points,
             key=lambda point: (
                 (point[0] - centroid_x) ** 2 + (point[1] - centroid_y) ** 2
             ),

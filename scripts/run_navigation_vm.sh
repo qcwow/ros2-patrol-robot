@@ -10,7 +10,7 @@ echo "如需 Gazebo/RViz 窗口，请在虚拟机桌面终端运行 vm/run_navig
 "${SSH[@]}" -t "${VM_TARGET}" \
   "export RCUTILS_COLORIZED_OUTPUT=1; \
    export LIBGL_ALWAYS_SOFTWARE=1; \
-   source /opt/ros/jazzy/setup.bash; \
+   source /opt/ros/humble/setup.bash; \
    if [[ ! -f '${VM_WORKSPACE}/install/setup.bash' ]]; then \
      echo '错误：虚拟机工作空间尚未编译。请先在 Mac 执行 ./scripts/build_vm.sh'; \
      exit 2; \

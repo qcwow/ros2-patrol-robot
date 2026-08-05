@@ -64,24 +64,55 @@ bt_navigator:
     # 20 ms 的 Nav2 默认值过紧，会把正常的规划确认误判为超时。
     default_server_timeout: 1000
     wait_for_service_timeout: 1000
-    action_server_result_timeout: 900.0
-    # Jazzy compares these blackboard error codes when NavigateToPose aborts.
-    # Keeping them explicit lets patrol_manager distinguish a rejected path
-    # from TF/plugin/timing faults instead of treating every abort identically.
-    error_code_names: [compute_path_error_code, follow_path_error_code]
-    navigators: [navigate_to_pose, navigate_through_poses]
-    navigate_to_pose:
-      plugin: nav2_bt_navigator::NavigateToPoseNavigator
-    navigate_through_poses:
-      plugin: nav2_bt_navigator::NavigateThroughPosesNavigator
+    # Humble requires Behavior Tree node libraries to be listed explicitly.
+    plugin_lib_names:
+      - nav2_compute_path_to_pose_action_bt_node
+      - nav2_compute_path_through_poses_action_bt_node
+      - nav2_smooth_path_action_bt_node
+      - nav2_follow_path_action_bt_node
+      - nav2_spin_action_bt_node
+      - nav2_wait_action_bt_node
+      - nav2_back_up_action_bt_node
+      - nav2_drive_on_heading_bt_node
+      - nav2_clear_costmap_service_bt_node
+      - nav2_is_stuck_condition_bt_node
+      - nav2_goal_reached_condition_bt_node
+      - nav2_goal_updated_condition_bt_node
+      - nav2_globally_updated_goal_condition_bt_node
+      - nav2_is_path_valid_condition_bt_node
+      - nav2_initial_pose_received_condition_bt_node
+      - nav2_reinitialize_global_localization_service_bt_node
+      - nav2_rate_controller_bt_node
+      - nav2_distance_controller_bt_node
+      - nav2_speed_controller_bt_node
+      - nav2_truncate_path_action_bt_node
+      - nav2_goal_updater_node_bt_node
+      - nav2_recovery_node_bt_node
+      - nav2_pipeline_sequence_bt_node
+      - nav2_round_robin_node_bt_node
+      - nav2_transform_available_condition_bt_node
+      - nav2_time_expired_condition_bt_node
+      - nav2_distance_traveled_condition_bt_node
+      - nav2_single_trigger_bt_node
+      - nav2_goal_updated_controller_bt_node
+      - nav2_navigate_through_poses_action_bt_node
+      - nav2_navigate_to_pose_action_bt_node
+      - nav2_remove_passed_goals_action_bt_node
+      - nav2_planner_selector_bt_node
+      - nav2_controller_selector_bt_node
+      - nav2_goal_checker_selector_bt_node
+      - nav2_controller_cancel_bt_node
+      - nav2_path_longer_on_approach_bt_node
+      - nav2_wait_cancel_bt_node
+      - nav2_spin_cancel_bt_node
+      - nav2_back_up_cancel_bt_node
+      - nav2_drive_on_heading_cancel_bt_node
 
 controller_server:
   ros__parameters:
     use_sim_time: true
-    # Jazzy 的 Gazebo 驱动和 velocity_smoother 使用 geometry_msgs/Twist。
-    # 显式固定类型，避免不同 Nav2 版本默认切换为 TwistStamped 后路线存在但底盘收不到速度。
-    enable_stamped_cmd_vel: false
-    # TurtleBot3 Jazzy also uses 10 Hz. RGB-D is no longer part of the default
+    # Humble 的控制链使用 geometry_msgs/Twist。
+    # TurtleBot3 Humble also uses 10 Hz. RGB-D is no longer part of the default
     # base-navigation costmap, so this rate remains responsive without making
     # point-cloud projection part of the controller's critical path.
     controller_frequency: 10.0
@@ -92,25 +123,19 @@ controller_server:
     # Keep publishing a safe zero command briefly, then enter BT recovery if
     # the collision prediction remains valid.
     failure_tolerance: 1.5
-    progress_checker_plugins: [progress_checker]
+    progress_checker_plugin: progress_checker
     # The patrol manager selects a profile before each NavigateToPose goal.
     # Transit nodes remain fluid while equipment and home poses use the
     # tighter profile required for repeatable inspection framing.
     goal_checker_plugins: [transit_goal_checker, precise_goal_checker]
     controller_plugins: [FollowPath]
-    use_realtime_priority: false
-
     progress_checker:
-      # Count in-place heading correction as real progress. The former simple
-      # checker observed translation only and aborted while RPP was rotating.
-      plugin: nav2_controller::PoseProgressChecker
+      plugin: nav2_controller::SimpleProgressChecker
       # The checker must be finer than the 6-8 cm inspection tolerance;
       # otherwise legitimate centimetre-scale settling is misclassified as a
       # stall just before SimpleGoalChecker accepts the pose.
       required_movement_radius: 0.03
-      required_movement_angle: 0.05
-      # 真正卡住时尽快进入清图和失败后重规划；正常原地转向会由
-      # required_movement_angle 持续刷新进度，不会被误判。
+      # 真正卡住时尽快进入清图和失败后重规划。
       movement_time_allowance: 15.0
     transit_goal_checker:
       stateful: true
@@ -130,7 +155,7 @@ controller_server:
       plugin: nav2_rotation_shim_controller::RotationShimController
       primary_controller: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
       angular_dist_threshold: 0.55
-      # Jazzy 支持独立的退出阈值。原先 0.12 rad 对带延迟的仿真里程计
+      # Humble 支持独立的退出阈值。原先 0.12 rad 对带延迟的仿真里程计
       # 过于苛刻，车辆会越过目标角后反向修正，始终无法交还给 RPP。
       angular_disengage_threshold: 0.20
       forward_sampling_distance: 0.45
@@ -141,7 +166,6 @@ controller_server:
       # 旋转加速度使用上一周期命令估算；底层 velocity_smoother 仍负责
       # 20 Hz 速度斜坡，避免低频/延迟里程计造成正负方向反复追逐。
       closed_loop: false
-      use_path_orientations: false
       # 化工设备区优先保证拐角跟踪与制动距离，不追求直线路段峰值速度。
       desired_linear_vel: 0.32
       # 前视点不得落在 0.58 m 长的车体内部；同时限制最大前视距离，
@@ -180,7 +204,6 @@ controller_server:
       # the robot, flipping the desired heading on every control cycle.
       max_robot_pose_search_dist: 1.5
       use_interpolation: true
-      interpolate_curvature_after_goal: true
 
 local_costmap:
   local_costmap:
@@ -309,7 +332,7 @@ planner_server:
     GridBased:
       # NavFn/Dijkstra 是无运动学约束的轻量 2D 全局规划器；尖角朝向
       # 由 RotationShim + RPP 处理，不需要高算力轨迹优化器。
-      plugin: nav2_navfn_planner::NavfnPlanner
+      plugin: nav2_navfn_planner/NavfnPlanner
       # Do not silently move an inspection goal to a distant free cell. One
       # map cell is enough for discretization; invalid goals must fail visibly.
       tolerance: 0.05
@@ -330,21 +353,18 @@ smoother_server:
 behavior_server:
   ros__parameters:
     use_sim_time: true
-    enable_stamped_cmd_vel: false
-    local_costmap_topic: local_costmap/costmap_raw
-    local_footprint_topic: local_costmap/published_footprint
-    global_costmap_topic: global_costmap/costmap_raw
-    global_footprint_topic: global_costmap/published_footprint
+    costmap_topic: local_costmap/costmap_raw
+    footprint_topic: local_costmap/published_footprint
     cycle_frequency: 10.0
     behavior_plugins: [spin, backup, drive_on_heading, wait]
     spin:
-      plugin: nav2_behaviors::Spin
+      plugin: nav2_behaviors/Spin
     backup:
-      plugin: nav2_behaviors::BackUp
+      plugin: nav2_behaviors/BackUp
     drive_on_heading:
-      plugin: nav2_behaviors::DriveOnHeading
+      plugin: nav2_behaviors/DriveOnHeading
     wait:
-      plugin: nav2_behaviors::Wait
+      plugin: nav2_behaviors/Wait
     local_frame: odom
     global_frame: map
     robot_base_frame: base_footprint
@@ -359,7 +379,6 @@ waypoint_follower:
     use_sim_time: true
     loop_rate: 20
     stop_on_failure: false
-    action_server_result_timeout: 900.0
     waypoint_task_executor_plugin: wait_at_waypoint
     wait_at_waypoint:
       plugin: nav2_waypoint_follower::WaitAtWaypoint
@@ -369,7 +388,6 @@ waypoint_follower:
 velocity_smoother:
   ros__parameters:
     use_sim_time: true
-    enable_stamped_cmd_vel: false
     smoothing_frequency: 20.0
     scale_velocities: false
     # Nav2 and TurtleBot3 use OPEN_LOOP by default. It prevents delayed or

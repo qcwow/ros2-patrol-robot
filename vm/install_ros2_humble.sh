@@ -2,14 +2,14 @@
 set -euo pipefail
 
 if [[ ! -r /etc/os-release ]]; then
-  echo "无法识别系统；本脚本仅支持 Ubuntu 24.04。"
+  echo "无法识别系统；本脚本仅支持 Ubuntu 22.04。"
   exit 1
 fi
 
 # shellcheck disable=SC1091
 source /etc/os-release
-if [[ "${ID}" != "ubuntu" || "${VERSION_CODENAME:-}" != "noble" ]]; then
-  echo "当前系统为 ${PRETTY_NAME:-unknown}；需要 Ubuntu 24.04 (Noble)。"
+if [[ "${ID}" != "ubuntu" || "${VERSION_CODENAME:-}" != "jammy" ]]; then
+  echo "当前系统为 ${PRETTY_NAME:-unknown}；需要 Ubuntu 22.04 (Jammy)。"
   exit 1
 fi
 
@@ -36,13 +36,29 @@ fi
 sudo apt-get update
 sudo apt-get upgrade -y
 sudo apt-get install -y \
-  ros-jazzy-desktop \
-  ros-jazzy-navigation2 \
-  ros-jazzy-nav2-bringup \
-  ros-jazzy-octomap-server \
-  ros-jazzy-ros-gz \
-  ros-jazzy-slam-toolbox \
-  ros-jazzy-teleop-twist-keyboard \
+  ros-humble-desktop \
+  ros-humble-navigation2 \
+  ros-humble-nav2-bringup \
+  ros-humble-slam-toolbox \
+  ros-humble-octomap-server \
+  ros-humble-ros-gz \
+  ros-humble-teleop-twist-keyboard \
+  ros-humble-pcl-ros \
+  ros-humble-pcl-conversions \
+  ros-humble-libg2o \
+  ros-humble-robot-localization \
+  ros-humble-xacro \
+  libgoogle-glog-dev \
+  libgflags-dev \
+  libgtest-dev \
+  libceres-dev \
+  libeigen3-dev \
+  libtbb-dev \
+  libapr1-dev \
+  build-essential \
+  cmake \
+  git \
+  rsync \
   libgl1-mesa-dri \
   mesa-utils \
   python3-colcon-common-extensions \
@@ -63,7 +79,7 @@ if grep -q 'raw.githubusercontent.com/ros/rosdistro/master' \
 fi
 if grep -q '/releases/fuerte.yaml' \
     /etc/ros/rosdep/sources.list.d/20-default.list; then
-  echo '正在移除与 ROS 2 Jazzy 无关的 Fuerte rosdep 索引'
+  echo '正在移除与 ROS 2 Humble 无关的 Fuerte rosdep 索引'
   sudo sed -i '\#/releases/fuerte.yaml#d' \
     /etc/ros/rosdep/sources.list.d/20-default.list
 fi
@@ -77,8 +93,8 @@ if ! rosdep update; then
   fi
 fi
 
-if ! grep -qF 'source /opt/ros/jazzy/setup.bash' "${HOME}/.bashrc"; then
-  printf '\nsource /opt/ros/jazzy/setup.bash\n' >> "${HOME}/.bashrc"
+if ! grep -qF 'source /opt/ros/humble/setup.bash' "${HOME}/.bashrc"; then
+  printf '\nsource /opt/ros/humble/setup.bash\n' >> "${HOME}/.bashrc"
 fi
 
-echo "ROS 2 Jazzy 环境安装完成。返回 Mac 执行 ./scripts/build_vm.sh。"
+echo "ROS 2 Humble 与 SLAM Toolbox 环境安装完成。返回 Mac 执行 ./scripts/build_vm.sh。"

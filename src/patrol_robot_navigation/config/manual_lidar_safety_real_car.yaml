@@ -1,0 +1,27 @@
+manual_lidar_safety:
+  ros__parameters:
+    use_sim_time: false
+    input_cmd_vel_topic: /cmd_vel_manual_raw
+    output_cmd_vel_topic: /cmd_vel_safety_checked
+    scan_topic: /scan_raw
+
+    # base_link_mec.stl bounds are approximately 0.276 x 0.212 m.  These
+    # extents include the body, wheel envelope and a small calibration margin.
+    front_extent: 0.16
+    rear_extent: 0.15
+    half_width: 0.13
+    lidar_offset_x: 0.0115
+    corridor_margin: 0.02
+
+    hard_clearance: 0.08
+    slowdown_clearance: 0.35
+    reaction_time: 0.35
+    deceleration: 0.35
+    rotation_clearance: 0.29
+
+    command_timeout: 0.35
+    scan_timeout: 0.50
+    max_linear_speed: 0.15
+    max_angular_speed: 0.45
+    publish_rate: 20.0
+    minimum_valid_range: 0.05

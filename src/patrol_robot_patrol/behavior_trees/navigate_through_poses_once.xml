@@ -16,36 +16,24 @@
             <!-- Each action contains one auditable inspection task. Do not
                  prune it until the robot is inside the configured goal area. -->
             <RemovePassedGoals input_goals="{goals}" output_goals="{goals}" radius="0.25"/>
-            <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="{selected_planner}" error_code_id="{compute_path_error_code}"/>
+            <ComputePathThroughPoses goals="{goals}" path="{path}" planner_id="{selected_planner}"/>
           </ReactiveSequence>
-          <Sequence>
-            <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
-            <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
-          </Sequence>
+          <ClearEntireCostmap name="ClearGlobalCostmap-Context" service_name="global_costmap/clear_entirely_global_costmap"/>
         </RecoveryNode>
         <RecoveryNode number_of_retries="1" name="FollowStablePath">
-          <FollowPath path="{path}" controller_id="{selected_controller}" error_code_id="{follow_path_error_code}"/>
-          <Sequence>
-            <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
-            <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
-          </Sequence>
+          <FollowPath path="{path}" controller_id="{selected_controller}"/>
+          <ClearEntireCostmap name="ClearLocalCostmap-Context" service_name="local_costmap/clear_entirely_local_costmap"/>
         </RecoveryNode>
       </Sequence>
-      <Sequence>
-        <Fallback>
-          <WouldAControllerRecoveryHelp error_code="{follow_path_error_code}"/>
-          <WouldAPlannerRecoveryHelp error_code="{compute_path_error_code}"/>
-        </Fallback>
-        <RoundRobin name="RecoveryActions">
-          <Sequence name="ClearingActions">
-            <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
-            <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
-          </Sequence>
-          <Spin spin_dist="1.20" error_code_id="{spin_error_code}"/>
-          <BackUp backup_dist="0.20" backup_speed="0.10" error_code_id="{backup_error_code}"/>
-          <Wait wait_duration="2.0"/>
-        </RoundRobin>
-      </Sequence>
+      <RoundRobin name="RecoveryActions">
+        <Sequence name="ClearingActions">
+          <ClearEntireCostmap name="ClearLocalCostmap-Subtree" service_name="local_costmap/clear_entirely_local_costmap"/>
+          <ClearEntireCostmap name="ClearGlobalCostmap-Subtree" service_name="global_costmap/clear_entirely_global_costmap"/>
+        </Sequence>
+        <Spin spin_dist="1.20"/>
+        <BackUp backup_dist="0.20" backup_speed="0.10"/>
+        <Wait wait_duration="2.0"/>
+      </RoundRobin>
     </RecoveryNode>
   </BehaviorTree>
 </root>

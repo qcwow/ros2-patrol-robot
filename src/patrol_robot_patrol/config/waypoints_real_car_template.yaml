@@ -1,0 +1,16 @@
+# Safe deployment template for the physical ROSOrin car.
+# Replace/add map-confirmed TRANSIT and INSPECTION poses before enabling patrol.
+frame_id: map
+route_id: rosorin_real_car_template
+waypoints:
+  - id: home
+    name: 真车基地（待标定）
+    type: HOME
+    x: 0.0
+    y: 0.0
+    yaw: 0.0
+    dwell: 0.0
+    tolerance: {position: 0.15, yaw: 0.20}
+    speed_limit: 0.10
+    recovery_policy: restricted
+    required_sensor: lidar

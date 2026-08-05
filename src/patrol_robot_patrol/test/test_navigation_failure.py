@@ -3,6 +3,7 @@ import unittest
 from patrol_robot_patrol.navigation_failure import (
     is_route_failure,
     navigation_error_label,
+    should_blacklist_route,
 )
 
 
@@ -25,6 +26,31 @@ class NavigationFailureTest(unittest.TestCase):
             '控制器找不到有效控制指令',
         )
         self.assertEqual(navigation_error_label(999), '未知错误码 999')
+
+    def test_humble_aborted_result_blacklists_verified_candidate(self):
+        self.assertTrue(
+            should_blacklist_route(
+                None,
+                action_aborted=True,
+                has_candidate_path=True,
+            )
+        )
+
+    def test_humble_failure_without_candidate_does_not_blacklist(self):
+        self.assertFalse(
+            should_blacklist_route(
+                None,
+                action_aborted=True,
+                has_candidate_path=False,
+            )
+        )
+        self.assertFalse(
+            should_blacklist_route(
+                None,
+                action_aborted=False,
+                has_candidate_path=True,
+            )
+        )
 
 
 if __name__ == '__main__':

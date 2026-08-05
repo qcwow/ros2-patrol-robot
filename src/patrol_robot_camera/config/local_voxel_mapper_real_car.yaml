@@ -1,0 +1,18 @@
+local_voxel_mapper:
+  ros__parameters:
+    use_sim_time: false
+    input_topic: /camera/points/filtered
+    output_topic: /local_grid/occupied
+    # The reference project uses t265_odom_frame. On this car the equivalent
+    # drift-continuous frame is the wheel/IMU-fused odom frame.
+    target_frame: odom
+
+    # A 4 m cube at 5 cm resolution gives a similar local view to the
+    # reference 3.84 m cube at 3 cm, with a safer load for the Orin NX.
+    voxel_size: 0.05
+    half_extent: 2.0
+    max_voxels: 80000
+    min_observations: 2
+    stale_seconds: 12.0
+    publish_rate: 5.0
+    transform_timeout: 0.08

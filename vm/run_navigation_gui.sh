@@ -27,9 +27,22 @@ export LIBGL_ALWAYS_SOFTWARE=1
 export QT_X11_NO_MITSHM=1
 export RCUTILS_COLORIZED_OUTPUT=1
 
-source /opt/ros/jazzy/setup.bash
+source /opt/ros/humble/setup.bash
 # shellcheck disable=SC1091
 source "${WORKSPACE_ROOT}/install/setup.bash"
+
+missing_apt_packages=()
+if ! command -v xacro >/dev/null 2>&1; then
+  missing_apt_packages+=(ros-humble-xacro)
+fi
+if ! ros2 pkg prefix nav2_controller >/dev/null 2>&1; then
+  missing_apt_packages+=(ros-humble-navigation2 ros-humble-nav2-bringup)
+fi
+if (( ${#missing_apt_packages[@]} > 0 )); then
+  echo "错误：Ubuntu 尚未安装完整的 Humble 运行依赖。"
+  echo "请执行：sudo apt update && sudo apt install -y ${missing_apt_packages[*]}"
+  exit 2
+fi
 
 if ! ros2 pkg prefix patrol_robot_simulator >/dev/null 2>&1; then
   echo "错误：patrol_robot_simulator 尚未安装。"

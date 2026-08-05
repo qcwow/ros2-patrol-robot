@@ -1,0 +1,27 @@
+octomap_server:
+  ros__parameters:
+    use_sim_time: false
+    frame_id: map
+    base_frame_id: base_footprint
+    resolution: 0.10
+    max_depth: 16
+
+    point_cloud_min_z: 0.03
+    point_cloud_max_z: 1.50
+    occupancy_min_z: 0.03
+    occupancy_max_z: 1.50
+
+    sensor_model.max_range: 3.0
+    sensor_model.hit: 0.70
+    sensor_model.miss: 0.40
+    sensor_model.min: 0.12
+    sensor_model.max: 0.97
+
+    filter_ground_plane: false
+    filter_speckles: true
+    compress_map: true
+    colored_map: false
+    use_height_map: false
+    publish_free_space: false
+    latch: true
+    incremental_2D_projection: false

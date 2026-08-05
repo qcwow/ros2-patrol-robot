@@ -61,7 +61,10 @@ type RobotOperation = {
   detail: string;
 };
 type Telemetry = {
-  speed: number; max_linear_speed: number; x: number; y: number; yaw: number; lidar_ok: boolean;
+  speed: number; max_linear_speed: number; max_angular_speed: number;
+  speed_control_min_linear: number; speed_control_max_linear: number;
+  speed_control_max_angular: number;
+  x: number; y: number; yaw: number; lidar_ok: boolean;
   patrol: {
     state: string; current_index: number; current_waypoint: string;
     waypoint_count: number; loop_count?: number; completed_loops?: number;
@@ -141,7 +144,10 @@ export default function Home() {
   const [toastTone, setToastTone] = useState<"normal" | "error">("normal");
   const [connected, setConnected] = useState(false);
   const [telemetry, setTelemetry] = useState<Telemetry>({
-    speed: 0, max_linear_speed: 0.6, x: -6, y: -4, yaw: 0, lidar_ok: false,
+    speed: 0, max_linear_speed: 0.6, max_angular_speed: 0.8,
+    speed_control_min_linear: 0.05, speed_control_max_linear: 1.5,
+    speed_control_max_angular: 2.0,
+    x: -6, y: -4, yaw: 0, lidar_ok: false,
     patrol: { state: "UNKNOWN", current_index: 0, current_waypoint: "等待连接", waypoint_count: 0 },
     camera: {
       enabled: false, ok: false, frames: 0, width: 0, height: 0, fps: 0,
@@ -173,6 +179,8 @@ export default function Home() {
   const [gimbalTilt, setGimbalTilt] = useState(0);
   const [perceptionBusy, setPerceptionBusy] = useState(false);
   const manualTimer = useRef<number | null>(null);
+  const manualControlSession = useRef("");
+  const manualControlSequence = useRef(0);
   const gimbalTimer = useRef<number | null>(null);
   const toastTimer = useRef<number | null>(null);
   const gimbalTarget = useRef({ pan: 0, tilt: 0 });
@@ -359,12 +367,29 @@ export default function Home() {
           setGimbalTilt(tiltTarget);
           gimbalTarget.current = { pan: panTarget, tilt: tiltTarget };
         }
+        const patrolStatus = status.patrol ?? {};
+        const patrolIndex = Number(patrolStatus.current_index);
+        const patrolWaypointCount = Number(patrolStatus.waypoint_count);
+        const speedControlMin = Math.max(0.01, Number(status.speed_control_min_linear) || 0.05);
+        const speedControlMax = Math.max(speedControlMin, Number(status.speed_control_max_linear) || 1.5);
+        const selectedSpeed = Math.max(speedControlMin, Math.min(Number(status.max_linear_speed) || 0.6, speedControlMax));
+        setSpeed(selectedSpeed);
         setTelemetry({
           speed: status.speed ?? 0,
-          max_linear_speed: Math.max(0.1, Number(status.max_linear_speed) || 0.6),
+          max_linear_speed: selectedSpeed,
+          max_angular_speed: Math.max(0.1, Number(status.max_angular_speed) || 0.8),
+          speed_control_min_linear: speedControlMin,
+          speed_control_max_linear: speedControlMax,
+          speed_control_max_angular: Math.max(0.1, Number(status.speed_control_max_angular) || 2.0),
           x: status.x ?? 0, y: status.y ?? 0, yaw: status.yaw ?? 0,
           lidar_ok: Boolean(status.lidar_ok),
-          patrol: status.patrol ?? { state: "UNKNOWN", current_index: 0, current_waypoint: "等待任务", waypoint_count: 0 },
+          patrol: {
+            ...patrolStatus,
+            state: String(patrolStatus.state ?? "UNKNOWN"),
+            current_index: Number.isFinite(patrolIndex) ? Math.max(0, Math.trunc(patrolIndex)) : 0,
+            current_waypoint: String(patrolStatus.current_waypoint ?? "等待任务"),
+            waypoint_count: Number.isFinite(patrolWaypointCount) ? Math.max(0, Math.trunc(patrolWaypointCount)) : 0,
+          },
           camera,
           perception,
           navigation: status.navigation ?? { path: [], frame_id: "map", source: "none", path_age: null },
@@ -386,6 +411,12 @@ export default function Home() {
     const directions = ["东", "东北", "北", "西北", "西", "西南", "南", "东南"];
     return { degrees, label: directions[Math.round(degrees / 45) % 8] };
   }, [telemetry.yaw]);
+  const speedStep = Math.max(0.01, Number(((telemetry.speed_control_max_linear - telemetry.speed_control_min_linear) / 10).toFixed(2)));
+  const speedPresets = [
+    telemetry.speed_control_min_linear,
+    (telemetry.speed_control_min_linear + telemetry.speed_control_max_linear) / 2,
+    telemetry.speed_control_max_linear,
+  ].map((value) => Number(value.toFixed(2)));
   const timeText = now?.toLocaleTimeString("zh-CN", {
     hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
   }) ?? "--:--:--";
@@ -404,7 +435,7 @@ export default function Home() {
       await send("/api/patrol/stop");
       setRunning(false);
     }
-    const transmit = () => void send("/api/control/manual", { linear, angular });
+    const transmit = () => void sendManual(linear, angular);
     transmit();
     manualTimer.current = window.setInterval(transmit, 100);
   }
@@ -412,7 +443,20 @@ export default function Home() {
   function stopManual() {
     clearManualTimer();
     setManualActive("已停车");
-    void send("/api/control/manual", { linear: 0, angular: 0 });
+    void sendManual(0, 0);
+  }
+
+  function sendManual(linear: number, angular: number) {
+    if (!manualControlSession.current) {
+      manualControlSession.current = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    }
+    manualControlSequence.current += 1;
+    return send("/api/control/manual", {
+      linear,
+      angular,
+      control_session: manualControlSession.current,
+      control_sequence: manualControlSequence.current,
+    });
   }
 
   function notify(message: string, tone: "normal" | "error" = "normal") {
@@ -771,6 +815,8 @@ export default function Home() {
               onEditSavedMap={editSavedMappingMap}
               operation={telemetry.operation}
               onReturnToNavigation={() => { setActiveSection("control"); setMapMode("2d"); }}
+              linearSpeed={speed}
+              angularSpeed={telemetry.max_angular_speed}
             />
           ) : (<>
           <section className="hero-panel">
@@ -905,7 +951,7 @@ export default function Home() {
               <div className="stat-grid">
                 <div><small>电池电量</small><strong>86<span>%</span></strong><progress value="86" max="100" /></div>
                 <div><small>激光雷达</small><strong>{telemetry.perception.lidar_enabled ? telemetry.lidar_ok ? "正常" : "无数据" : "未参与"}</strong><span className="signal">▂▄▆█</span></div>
-                <div><small>当前巡检点</small><strong>{telemetry.patrol.current_index + 1}<span> / {telemetry.patrol.waypoint_count || vehicleWaypoints.length}</span></strong></div>
+                <div><small>当前巡检点</small><strong>{Number.isFinite(telemetry.patrol.current_index) ? telemetry.patrol.current_index + 1 : 1}<span> / {telemetry.patrol.waypoint_count || vehicleWaypoints.length}</span></strong></div>
                 <div><small>地图坐标</small><strong>{telemetry.x.toFixed(1)}<span>, {telemetry.y.toFixed(1)} m</span></strong></div>
               </div>
               <label className="patrol-loop-control">
@@ -959,12 +1005,12 @@ export default function Home() {
             <div className="panel speed-panel">
               <div className="panel-heading"><div><span className="heading-icon">⇄</span><div><h2>行驶参数</h2><p>调节车辆运行速度</p></div></div><span className="saved">✓ 自动保存</span></div>
               <div className="speed-control">
-                <div className="speed-value"><small>最高速度限制</small><strong>{speed.toFixed(1)} <span>m/s</span></strong></div>
-                <input aria-label="最高速度限制" type="range" min="0.1" max="1.5" step="0.1" value={speed} onChange={(e) => setSpeed(Number(e.target.value))} onPointerUp={() => send("/api/config/speed", { linear: speed, angular: 0.8 })} />
-                <div className="range-labels"><span>0.1<br/><small>精细</small></span><span>0.8<br/><small>标准</small></span><span>1.5<br/><small>快速</small></span></div>
+                <div className="speed-value"><small>网页全局速度</small><strong>{speed.toFixed(2)} <span>m/s</span></strong></div>
+                <input aria-label="网页全局速度" type="range" min={telemetry.speed_control_min_linear} max={telemetry.speed_control_max_linear} step={speedStep} value={speed} onChange={(e) => setSpeed(Number(e.target.value))} onPointerUp={() => send("/api/config/speed", { linear: speed, angular: telemetry.speed_control_max_angular })} />
+                <div className="range-labels"><span>{telemetry.speed_control_min_linear.toFixed(2)}<br/><small>精细</small></span><span>{speedPresets[1].toFixed(2)}<br/><small>标准</small></span><span>{telemetry.speed_control_max_linear.toFixed(2)}<br/><small>快速</small></span></div>
               </div>
               <div className="quick-speeds">
-                {[0.3, 0.6, 1.0].map((item) => <button key={item} className={speed === item ? "active" : ""} onClick={() => { setSpeed(item); send("/api/config/speed", { linear: item, angular: 0.8 }); }}>{item === 0.3 ? "精细" : item === 0.6 ? "标准" : "快速"}<strong>{item.toFixed(1)} m/s</strong></button>)}
+                {speedPresets.map((item, index) => <button key={item} className={Math.abs(speed - item) < 0.001 ? "active" : ""} onClick={() => { setSpeed(item); send("/api/config/speed", { linear: item, angular: telemetry.speed_control_max_angular }); }}>{index === 0 ? "精细" : index === 1 ? "标准" : "快速"}<strong>{item.toFixed(2)} m/s</strong></button>)}
               </div>
             </div>
 
@@ -972,13 +1018,13 @@ export default function Home() {
               <div className="panel-heading"><div><span className="heading-icon manual-icon">✥</span><div><h2>人工控制</h2><p>按住方向键移动 · 松手立即停车</p></div></div><span className={`manual-state ${manualActive !== "未接管" ? "active" : ""}`}>{manualActive}</span></div>
               <div className="manual-layout">
                 <div className="drive-pad" onPointerLeave={stopManual}>
-                  <button className="drive-forward" aria-label="向前" onPointerDown={() => startManual(Math.min(speed, 0.6), 0, "向前") } onPointerUp={stopManual} onPointerCancel={stopManual}><b>↑</b><small>前进</small></button>
-                  <button className="drive-left" aria-label="左转" onPointerDown={() => startManual(0, 0.6, "左转") } onPointerUp={stopManual} onPointerCancel={stopManual}><b>↶</b><small>左转</small></button>
+                  <button className="drive-forward" aria-label="向前" onPointerDown={() => startManual(speed, 0, "向前") } onPointerUp={stopManual} onPointerCancel={stopManual}><b>↑</b><small>前进</small></button>
+                  <button className="drive-left" aria-label="左转" onPointerDown={() => startManual(0, telemetry.speed_control_max_angular, "左转") } onPointerUp={stopManual} onPointerCancel={stopManual}><b>↶</b><small>左转</small></button>
                   <button className="drive-stop" aria-label="停车" onClick={stopManual}>■</button>
-                  <button className="drive-right" aria-label="右转" onPointerDown={() => startManual(0, -0.6, "右转") } onPointerUp={stopManual} onPointerCancel={stopManual}><b>↷</b><small>右转</small></button>
-                  <button className="drive-back" aria-label="后退" onPointerDown={() => startManual(-Math.min(speed, 0.4), 0, "后退") } onPointerUp={stopManual} onPointerCancel={stopManual}><b>↓</b><small>后退</small></button>
+                  <button className="drive-right" aria-label="右转" onPointerDown={() => startManual(0, -telemetry.speed_control_max_angular, "右转") } onPointerUp={stopManual} onPointerCancel={stopManual}><b>↷</b><small>右转</small></button>
+                  <button className="drive-back" aria-label="后退" onPointerDown={() => startManual(-speed, 0, "后退") } onPointerUp={stopManual} onPointerCancel={stopManual}><b>↓</b><small>后退</small></button>
                 </div>
-                <div className="manual-help"><strong>安全人工接管 · 车头向{heading.label} {heading.degrees.toFixed(0)}°</strong><p>前进/后退沿车身纵向移动，左转/右转为原地旋转。开始操作会自动暂停巡检，脱困后点击“开始巡检”恢复任务。</p><span>前进上限 {Math.min(speed, 0.6).toFixed(1)} m/s · 后退上限 {Math.min(speed, 0.4).toFixed(1)} m/s</span></div>
+                <div className="manual-help"><strong>安全人工接管 · 车头向{heading.label} {heading.degrees.toFixed(0)}°</strong><p>网页速度同时约束人工驾驶和自动巡检；开始人工操作会暂停巡检，脱困后点击“开始巡检”恢复任务。</p><span>前进/后退上限 {speed.toFixed(2)} m/s · 旋转上限 {telemetry.speed_control_max_angular.toFixed(2)} rad/s</span></div>
               </div>
             </div>
 

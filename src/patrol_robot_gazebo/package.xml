@@ -2,7 +2,7 @@
 <package format="3">
   <name>patrol_robot_gazebo</name>
   <version>0.1.0</version>
-  <description>Gazebo Harmonic simulation for the patrol robot.</description>
+  <description>Gazebo Fortress simulation for the patrol robot.</description>
   <maintainer email="maintainer@example.com">Patrol Robot Maintainer</maintainer>
   <license>Apache-2.0</license>
 

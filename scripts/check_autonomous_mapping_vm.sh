@@ -7,7 +7,7 @@ source "${SCRIPT_DIR}/common.sh"
 
 echo "正在读取 Ubuntu 自主建图状态（只读，不会停止仿真）。"
 "${SSH[@]}" "${VM_TARGET}" \
-  "source /opt/ros/jazzy/setup.bash; \
+  "source /opt/ros/humble/setup.bash; \
    source '${VM_WORKSPACE}/install/setup.bash'; \
    echo; \
    echo '核心节点'; \

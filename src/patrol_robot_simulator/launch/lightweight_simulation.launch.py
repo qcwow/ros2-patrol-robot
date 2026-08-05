@@ -44,6 +44,10 @@ def generate_launch_description():
         name='lightweight_simulator',
         output='screen',
         parameters=[{
+            # The lightweight simulator is the /clock authority. It still
+            # needs the same use_sim_time override as every consumer so its
+            # wall-driven update loop publishes /clock for the ROS-time stack.
+            'use_sim_time': use_sim_time,
             'map_yaml': map_yaml,
             'initial_x': ParameterValue(initial_x, value_type=float),
             'initial_y': ParameterValue(initial_y, value_type=float),

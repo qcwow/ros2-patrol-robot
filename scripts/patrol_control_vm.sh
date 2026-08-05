@@ -15,7 +15,7 @@ case "${ACTION}" in
 esac
 
 "${SSH[@]}" "${VM_TARGET}" \
-  "source /opt/ros/jazzy/setup.bash && \
+  "source /opt/ros/humble/setup.bash && \
    source '${VM_WORKSPACE}/install/setup.bash' && \
    ros2 service call '/patrol_manager/${ACTION}' std_srvs/srv/Trigger '{}'"
 

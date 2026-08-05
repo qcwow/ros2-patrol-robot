@@ -22,6 +22,10 @@ from patrol_robot_patrol.footprint_geometry import (
     quaternion_to_yaw,
     rectangle_overlaps_lethal_cell,
 )
+from patrol_robot_patrol.navigation_motion_guard import (
+    PoseStabilityGate,
+    PoseStabilityStatus,
+)
 
 
 class NavigationHealthMonitor(Node):
@@ -50,6 +54,10 @@ class NavigationHealthMonitor(Node):
         self.declare_parameter('global_frame', 'map')
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base_footprint')
+        self.declare_parameter('require_global_pose_stability', False)
+        self.declare_parameter('global_pose_stable_seconds', 5.0)
+        self.declare_parameter('global_pose_max_translation_delta', 0.08)
+        self.declare_parameter('global_pose_max_yaw_delta_degrees', 5.0)
         self.declare_parameter('lifecycle_nodes', [
             'map_server',
             'amcl',
@@ -113,6 +121,26 @@ class NavigationHealthMonitor(Node):
         self._global_frame = str(self.get_parameter('global_frame').value)
         self._odom_frame = str(self.get_parameter('odom_frame').value)
         self._base_frame = str(self.get_parameter('base_frame').value)
+        self._require_global_pose_stability = bool(
+            self.get_parameter('require_global_pose_stability').value
+        )
+        self._global_pose_stable_seconds = max(
+            0.0,
+            float(self.get_parameter('global_pose_stable_seconds').value),
+        )
+        self._global_pose_stability = PoseStabilityGate(
+            self._global_pose_stable_seconds,
+            float(
+                self.get_parameter(
+                    'global_pose_max_translation_delta'
+                ).value
+            ),
+            math.radians(float(
+                self.get_parameter(
+                    'global_pose_max_yaw_delta_degrees'
+                ).value
+            )),
+        )
         self._lifecycle_nodes = tuple(
             str(name) for name in self.get_parameter('lifecycle_nodes').value
         )
@@ -166,6 +194,7 @@ class NavigationHealthMonitor(Node):
         self._position_variance = math.inf
         self._yaw_variance = math.inf
         self._footprint_collision_started: float | None = None
+        self._last_ready_state: bool | None = None
         self._lifecycle_states = {
             name: None for name in self._lifecycle_nodes
         }
@@ -192,7 +221,7 @@ class NavigationHealthMonitor(Node):
     def _on_amcl_pose(self, message: PoseWithCovarianceStamped) -> None:
         self._last_amcl = time.monotonic()
         covariance = message.pose.covariance
-        # Jazzy may expose fixed-size ROS arrays through NumPy scalar types.
+        # Humble may expose fixed-size ROS arrays through NumPy scalar types.
         # Convert at the message boundary so JSON status always contains
         # ordinary Python numbers and booleans.
         self._position_variance = max(
@@ -247,6 +276,33 @@ class NavigationHealthMonitor(Node):
             return True
         except TransformException:
             return False
+
+    def _global_pose_status(
+        self, now: float
+    ) -> tuple[bool, PoseStabilityStatus]:
+        try:
+            transform = self._tf_buffer.lookup_transform(
+                self._global_frame,
+                self._odom_frame,
+                Time(),
+            )
+        except TransformException:
+            self._global_pose_stability.reset()
+            return False, PoseStabilityStatus(False, 0.0, 0.0, 0.0)
+        translation = transform.transform.translation
+        rotation = transform.transform.rotation
+        status = self._global_pose_stability.observe(
+            now,
+            float(translation.x),
+            float(translation.y),
+            quaternion_to_yaw(
+                float(rotation.x),
+                float(rotation.y),
+                float(rotation.z),
+                float(rotation.w),
+            ),
+        )
+        return True, status
 
     def _footprint_is_clear(self) -> bool:
         costmap = self._global_costmap
@@ -304,10 +360,15 @@ class NavigationHealthMonitor(Node):
         scan_ok = self._fresh(self._last_scan, self._scan_timeout, now)
         odom_ok = self._fresh(self._last_odom, self._odom_timeout, now)
         camera_ok = self._fresh(self._last_camera, self._camera_timeout, now)
+        amcl_fresh = self._fresh(self._last_amcl, self._amcl_timeout, now)
         costmap_fresh = self._fresh(
             self._last_costmap, self._costmap_timeout, now
         )
-        map_tf_ok = self._has_transform(self._global_frame, self._odom_frame)
+        map_tf_ok, global_pose_status = self._global_pose_status(now)
+        global_pose_stable = bool(
+            not self._require_global_pose_stability
+            or (map_tf_ok and global_pose_status.ready)
+        )
         odom_tf_ok = self._has_transform(self._odom_frame, self._base_frame)
         inactive_nodes = [
             name for name, state in self._lifecycle_states.items()
@@ -320,6 +381,7 @@ class NavigationHealthMonitor(Node):
             not self._require_amcl
             or (
                 amcl_received
+                and amcl_fresh
                 and self._position_variance <= self._max_position_variance
                 and self._yaw_variance <= self._max_yaw_variance
             )
@@ -347,6 +409,15 @@ class NavigationHealthMonitor(Node):
             reasons.append('/odom 无持续数据')
         if not map_tf_ok:
             reasons.append(f'{self._global_frame}→{self._odom_frame} TF 缺失')
+        elif not global_pose_stable:
+            reasons.append(
+                f'{self._global_frame}→{self._odom_frame} 位姿尚未持续稳定 '
+                f'{self._global_pose_stable_seconds:.1f} 秒'
+                f'（已稳定 {global_pose_status.stable_for:.1f} 秒，'
+                f'平移变化 {global_pose_status.translation_delta:.3f} m，'
+                f'角度变化 '
+                f'{math.degrees(global_pose_status.yaw_delta):.1f}°）'
+            )
         if not odom_tf_ok:
             reasons.append(f'{self._odom_frame}→{self._base_frame} TF 缺失')
         if not localization_ok:
@@ -361,6 +432,18 @@ class NavigationHealthMonitor(Node):
             reasons.append('硬件急停未释放')
 
         ready = not reasons
+        if self._last_ready_state is None or ready != self._last_ready_state:
+            if ready:
+                self.get_logger().info(
+                    '导航健康门已恢复：全部检查通过；'
+                    f'{self._global_frame}→{self._odom_frame} 已稳定 '
+                    f'{global_pose_status.stable_for:.1f} 秒'
+                )
+            else:
+                self.get_logger().warning(
+                    '导航健康门已关闭：' + '；'.join(reasons)
+                )
+            self._last_ready_state = ready
         status_message = String()
         status_message.data = json.dumps({
             'ready': ready,
@@ -371,9 +454,11 @@ class NavigationHealthMonitor(Node):
                 'odom_ok': odom_ok,
                 'camera_ok': camera_ok,
                 'map_to_odom_tf_ok': map_tf_ok,
+                'global_pose_stable': global_pose_stable,
                 'odom_to_base_tf_ok': odom_tf_ok,
                 'localization_ok': localization_ok,
                 'amcl_pose_received': amcl_received,
+                'amcl_pose_fresh': amcl_fresh,
                 'costmap_fresh': costmap_fresh,
                 'footprint_raw_clear': raw_footprint_clear,
                 'footprint_clear': footprint_clear,
@@ -388,6 +473,15 @@ class NavigationHealthMonitor(Node):
             'yaw_variance': (
                 None if not math.isfinite(self._yaw_variance)
                 else self._yaw_variance
+            ),
+            'global_pose_stable_seconds': round(
+                global_pose_status.stable_for, 2
+            ),
+            'global_pose_translation_delta': round(
+                global_pose_status.translation_delta, 4
+            ),
+            'global_pose_yaw_delta_degrees': round(
+                math.degrees(global_pose_status.yaw_delta), 3
             ),
         }, ensure_ascii=False)
         self._status_publisher.publish(status_message)

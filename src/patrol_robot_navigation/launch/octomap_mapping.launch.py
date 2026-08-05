@@ -15,6 +15,9 @@ def generate_launch_description():
     octomap_point_cloud_topic = LaunchConfiguration(
         'octomap_point_cloud_topic'
     )
+    octomap_server_executable = LaunchConfiguration(
+        'octomap_server_executable'
+    )
     navigation_share = FindPackageShare('patrol_robot_navigation')
 
     default_params = PathJoinSubstitution([
@@ -25,7 +28,7 @@ def generate_launch_description():
 
     octomap_server = Node(
         package='octomap_server',
-        executable='color_octomap_server_node',
+        executable=octomap_server_executable,
         name='octomap_server',
         output='screen',
         parameters=[
@@ -47,6 +50,10 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'octomap_point_cloud_topic',
             default_value='/camera/points/mapping',
+        ),
+        DeclareLaunchArgument(
+            'octomap_server_executable',
+            default_value='color_octomap_server_node',
         ),
         octomap_server,
     ])

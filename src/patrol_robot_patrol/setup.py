@@ -27,6 +27,9 @@ setup(
             'frontier_explorer = patrol_robot_patrol.frontier_explorer:main',
             'navigation_health_monitor = patrol_robot_patrol.navigation_health_monitor:main',
             'navigation_regression_recorder = patrol_robot_patrol.navigation_regression_recorder:main',
+            'manual_lidar_safety = patrol_robot_patrol.manual_lidar_safety:main',
+            'base_command_watchdog = patrol_robot_patrol.base_command_watchdog:main',
+            'safe_joystick_teleop = patrol_robot_patrol.safe_joystick_teleop:main',
         ],
     },
 )

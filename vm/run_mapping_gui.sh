@@ -27,16 +27,35 @@ export LIBGL_ALWAYS_SOFTWARE=1
 export QT_X11_NO_MITSHM=1
 export RCUTILS_COLORIZED_OUTPUT=1
 
-source /opt/ros/jazzy/setup.bash
+source /opt/ros/humble/setup.bash
 # shellcheck disable=SC1091
 source "${WORKSPACE_ROOT}/install/setup.bash"
 
-if ! ros2 pkg prefix patrol_robot_simulator >/dev/null 2>&1; then
-  echo "错误：patrol_robot_simulator 尚未安装。"
-  echo "请回到 Mac 项目目录执行 ./scripts/build_vm.sh，等待6个功能包全部完成。"
+missing_apt_packages=()
+if ! command -v xacro >/dev/null 2>&1; then
+  missing_apt_packages+=(ros-humble-xacro)
+fi
+if ! ros2 pkg prefix nav2_controller >/dev/null 2>&1; then
+  missing_apt_packages+=(ros-humble-navigation2 ros-humble-nav2-bringup)
+fi
+if ! ros2 pkg prefix slam_toolbox >/dev/null 2>&1; then
+  missing_apt_packages+=(ros-humble-slam-toolbox)
+fi
+if (( ${#missing_apt_packages[@]} > 0 )); then
+  echo "错误：Ubuntu 尚未安装完整的 Humble 运行依赖。"
+  echo "请执行：sudo apt update && sudo apt install -y ${missing_apt_packages[*]}"
   exit 2
 fi
 
-echo "使用无 OpenGL 依赖的轻量二维仿真器，并打开 RViz 建图界面。"
+for required_package in patrol_robot_simulator slam_toolbox; do
+  if ! ros2 pkg prefix "${required_package}" >/dev/null 2>&1; then
+    echo "错误：${required_package} 尚未安装。"
+    echo "请回到 Mac 项目目录执行 ./scripts/build_vm.sh。"
+    exit 2
+  fi
+done
+
+echo "启动轻量巡检仿真、SLAM Toolbox、Nav2 和 RViz。"
+echo "网页前端运行在 Mac；请在 Mac 项目目录另开终端执行 ./scripts/run_web_mapping.sh。"
 exec ros2 launch patrol_robot_bringup simulation_mapping.launch.py \
   use_gazebo:=false start_rviz:=true

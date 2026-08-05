@@ -1,12 +1,7 @@
 from launch import LaunchDescription
-from launch.actions import (
-    DeclareLaunchArgument,
-    GroupAction,
-    IncludeLaunchDescription,
-)
-from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
-from launch_ros.actions import SetRemap
+from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
 
 
@@ -20,25 +15,21 @@ def generate_launch_description():
         [navigation_share, 'config', 'slam_toolbox.yaml']
     )
 
-    slam = GroupAction([
-        # Keep the SLAM and static-map publishers private. map_source_mux is
-        # the sole owner of the canonical /map topic consumed by Nav2 and RViz.
-        SetRemap(src='/map', dst=map_topic),
-        SetRemap(src='map', dst=map_topic),
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                PathJoinSubstitution([
-                    FindPackageShare('slam_toolbox'),
-                    'launch',
-                    'online_async_launch.py',
-                ])
-            ),
-            launch_arguments={
-                'use_sim_time': use_sim_time,
-                'slam_params_file': params_file,
-            }.items(),
-        ),
-    ])
+    # Humble's async SLAM node is not a lifecycle node and has no map reset
+    # service. The supervisor owns its process so static AMCL mode can stop its
+    # map->odom publisher completely and every reset starts a fresh pose graph.
+    slam = Node(
+        package='patrol_robot_web_bridge',
+        executable='slam_session_manager',
+        name='slam_session_manager',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'slam_params_file': params_file,
+            'map_topic': map_topic,
+            'startup_active': True,
+        }],
+    )
 
     return LaunchDescription([
         DeclareLaunchArgument('use_sim_time', default_value='true'),

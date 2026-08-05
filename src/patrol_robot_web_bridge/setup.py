@@ -20,6 +20,7 @@ setup(
         'console_scripts': [
             'web_bridge = patrol_robot_web_bridge.bridge_node:main',
             'map_source_mux = patrol_robot_web_bridge.map_source_mux:main',
+            'slam_session_manager = patrol_robot_web_bridge.slam_session_manager:main',
         ],
     },
 )

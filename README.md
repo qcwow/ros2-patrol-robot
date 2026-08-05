@@ -1,9 +1,10 @@
 # ROS 2 化工管廊智能巡检机器人
 
-这是一个面向 **Ubuntu 24.04 + ROS 2 Jazzy + Nav2** 的差速巡检机器人项目。
-源代码保存在 Mac，ROS 2 编译、仿真和导航运行在 Ubuntu 虚拟机中完成。项目同时
+这是一个面向 **Ubuntu 22.04 + ROS 2 Humble + Nav2** 的巡检机器人项目。
+源代码保存在 Mac，可在 Ubuntu 虚拟机中仿真，也可作为 overlay 运行在 ROSOrin
+麦轮真车上。项目同时
 提供不依赖 OpenGL 的轻量二维仿真，以及包含 RGB-D 相机、两轴云台、激光雷达、
-未知障碍物和网页控制台的 Gazebo Harmonic 3D 巡检模式。
+未知障碍物和网页控制台的 Gazebo Fortress 3D 巡检模式。
 
 当前版本已经完成多点自动巡航、网页人工控制、实时摄像画面、RGB-D 点云处理，
 以及激光雷达、纯视觉点云和二者融合三种避障感知模式。当前“纯视觉”指不使用
@@ -40,6 +41,8 @@
 - 网页控制云台水平 `-90°～90°`、向上 `25°`、向下 `35°`
 - 雷达、视觉、融合三模式切换和传感器状态显示
 - Mac 到虚拟机的一键同步、安装、编译和运行脚本
+- ROSOrin 真车 `/scan_raw`、`/controller/cmd_vel` 接口和安全建图/导航入口
+- 真车人工速度雷达门控、速度源失联停车和最终底盘命令看门狗
 
 ## 当前系统链路
 
@@ -87,7 +90,7 @@ src/
 ├── patrol_robot_gazebo/        # Gazebo 场景和 ROS/Gazebo 话题桥接
 ├── patrol_robot_simulator/     # 默认二维轻量仿真器，不依赖虚拟显卡
 ├── patrol_robot_navigation/    # 地图、SLAM、AMCL 和 Nav2 参数
-├── patrol_robot_patrol/        # 多点巡航管理器和巡航点
+├── patrol_robot_patrol/        # 多点巡航、健康门控和真车速度安全节点
 ├── patrol_robot_web_bridge/    # 浏览器控制台到 ROS 2 的安全 HTTP 网关
 ├── patrol_robot_web/           # 工厂巡检车辆控制台
 └── patrol_robot_bringup/       # 统一启动入口
@@ -95,12 +98,68 @@ scripts/                        # Mac 端操作脚本
 vm/                             # 虚拟机初始化脚本
 ```
 
+## ROSOrin 真车版本
+
+真车版本不修改或复制厂家驱动，而是复用车端已有的 `controller`、`peripherals`
+和 `slam` 包。仿真继续使用 `/scan` 与 `/cmd_vel`；真车 profile 使用：
+
+```text
+/scan_raw → 车体外廓/制动距离检查
+
+手柄 / 网页人工控制 / Nav2
+        ↓
+原始速度话题 → 雷达安全过滤 → /cmd_vel_safety_checked
+        ↓
+最终速度看门狗 → /controller/cmd_vel → 厂家底盘
+```
+
+真车上的工作区构建：
+
+```bash
+cd /你的工作区/Ros2
+./scripts/build_real_car.sh
+```
+
+安全人工建图：
+
+```bash
+./scripts/run_real_car_mapping.sh
+./scripts/check_real_car_safety.sh
+./scripts/save_real_car_map.sh factory_floor_01
+```
+
+真车启动后，在同一可信网络中的 Mac 打开另一个终端运行：
+
+```bash
+./scripts/run_web_real_car.sh 192.168.100.137
+```
+
+该脚本先检查车端 `http://192.168.100.137:8765/api/health`，然后启动你现有的网页并
+自动写入真车网关地址。网页人工方向按钮以 10 Hz 连续发送命令；松开按钮、浏览器
+断连、雷达失联或上层速度源超时都会进入零速。真车建图默认以网页为主要人工控制，
+厂家手柄节点关闭；只有显式设置 `REAL_CAR_START_JOYSTICK=true` 才启用备用手柄。
+
+当前车辆 HTTP 网关没有用户认证，只能用于隔离、可信的车间内网。不要把车端
+`8765` 端口映射到互联网或公共 Wi-Fi；实体急停仍必须随时可触达。
+
+完成建图并确认地图文件后启动 AMCL/Nav2：
+
+```bash
+./scripts/run_real_car_navigation.sh /绝对路径/真实地图.yaml
+```
+
+导航默认不启动巡检，也不会自动假设车辆位于 `(0, 0)`。必须先在 RViz 用
+`2D Pose Estimate` 确认实际初始位姿，再核对
+`src/patrol_robot_patrol/config/waypoints_real_car_template.yaml` 中的真车路线。第一次测试应架空车轮，
+随后在人员近距离监护和实体急停可用的条件下低速落地。二维雷达软件保护不能识别
+玻璃、低于扫描平面或高于扫描平面的障碍，不能替代硬件急停和安全触边装置。
+
 ## 1. 准备虚拟机
 
-虚拟机建议使用 Ubuntu 24.04 Desktop：
+虚拟机建议使用 Ubuntu 22.04 Desktop：
 
-- Apple Silicon Mac：Ubuntu 24.04 ARM64
-- Intel Mac：Ubuntu 24.04 x86-64
+- Apple Silicon Mac：Ubuntu 22.04 ARM64
+- Intel Mac：Ubuntu 22.04 x86-64
 - CPU：6～8 核
 - 内存：8～12 GB
 - 硬盘：60 GB 以上
@@ -135,6 +194,7 @@ VM_HOST=虚拟机IP
 VM_PORT=22
 VM_WORKSPACE=/home/你的Ubuntu用户名/robot_patrol_ws
 VM_DISPLAY=:0
+ROS_DISTRO=humble
 ```
 
 先确认 SSH 可以连接：
@@ -156,7 +216,7 @@ ssh-copy-id 用户名@虚拟机IP
 ./scripts/setup_vm.sh
 ```
 
-该脚本会在 Ubuntu 24.04 中安装 ROS 2 Jazzy、Nav2、Gazebo、SLAM Toolbox、
+该脚本会在 Ubuntu 22.04 中安装 ROS 2 Humble、Nav2、Gazebo、SLAM Toolbox、
 键盘控制工具和编译依赖。默认巡航不依赖 Gazebo 或 OpenGL。运行时会要求输入
 Ubuntu 的 `sudo` 密码。
 
@@ -171,7 +231,8 @@ Ubuntu 的 `sudo` 密码。
 1. Mac 内容同步到虚拟机的 `VM_WORKSPACE`。
 2. `src` 和配置文件会更新。
 3. `build/`、`install/`、`log/` 只保存在虚拟机内部。
-4. 虚拟机执行依赖安装和 `colcon build --symlink-install`。
+4. 虚拟机执行 `colcon build --symlink-install`；系统依赖统一由上一步的
+   `./scripts/setup_vm.sh` 安装。
 
 以后每次修改 C++、Python 包结构、Xacro 或构建文件后，重新执行此命令。
 
@@ -240,18 +301,18 @@ cd ~/robot_patrol_ws/src/patrol_robot_web
 npm install
 ```
 
-日常启动前端：
+日常从 Mac 一键启动前端和 Ubuntu 网关通道：
 
 ```bash
-source ~/.bashrc
-cd ~/robot_patrol_ws/src/patrol_robot_web
-npm run dev
+cd /Users/qcw/Documents/Ros2
+./scripts/run_web_mapping.sh
 ```
 
-保持这个终端运行。在控制电脑浏览器中打开网页，并通过 `robot` 参数指定小车地址：
+脚本会自动打开浏览器，并把 Ubuntu 的 `8765` 网关转发到 Mac。保持这个终端运行。
+默认网页地址为：
 
 ```text
-http://虚拟机IP:3000/?robot=http://虚拟机IP:8765
+http://localhost:3000/?robot=http%3A%2F%2F127.0.0.1%3A8765
 ```
 
 例如虚拟机地址是 `192.168.64.10`：
@@ -445,6 +506,22 @@ ros2 launch patrol_robot_camera camera_processing.launch.py \
 `false`。16 位深度图默认按毫米换算为米；若设备单位不同，需要同步修改
 `depth_scale`。安装相机后必须标定 `base_link` 到相机光学坐标系的外参，否则
 障碍点云和本地代价地图会出现重影或障碍位置偏移。
+
+真车建图入口还会启动一个随车移动的 RGB-D 局部体素窗口：
+
+```text
+/camera/points/filtered  单帧避障点云
+/local_grid/occupied     odom 坐标系中的 4 m 滚动局部体素图
+/local_grid/status       点数、数据年龄和 TF 失败计数（JSON）
+/local_grid/reset        清空局部体素图的 Empty 服务
+```
+
+它对应参考项目的 D435 + T265 ring buffer，但不使用写死的相机内参或
+T265 话题：相机内参来自 `CameraInfo`，位姿来自本车轮速与 IMU 融合后的 TF。
+RViz 使用 `src/patrol_robot_navigation/config/mapping_3d.rviz` 时会按高度为
+`/local_grid/occupied` 着色。这个局部窗口只负责实时观察和近场环境表达；可保存的
+全局三维地图仍由 RTAB-Map/OctoMap 输出。局部三维体素仅用于网页预览，真车默认关闭；
+需要诊断时可用 `start_local_grid:=true` 临时开启。
 
 虚拟机需要启用 3D 图形加速。若 Gazebo 无法打开或帧率过低，继续使用
 `./vm/run_navigation_gui.sh` 可验证相同的导航和避障算法，但显示为 RViz
@@ -767,6 +844,82 @@ python3 scripts/generate_pipeline_map.py --check
 
 ## 11. 后续适配真实机器人
 
+### ROSOrin 真车：RTAB-Map RGB-D + 二维雷达建图
+
+真车建图入口默认使用 RTAB-Map。它以厂家 `/odom` 为短时运动约束、
+`/scan_raw` 做平面 ICP 配准，并同步 Aurora930 的 RGB-D 数据生成二维 `/map` 和
+三维 `/rtabmap/cloud_map`。建图时只有 RTAB-Map 发布 `map -> odom`，不会同时启动
+SLAM Toolbox。
+
+先在 Orin 安装依赖并构建 overlay：
+
+```bash
+sudo apt update
+sudo apt install ros-humble-rtabmap-ros
+./scripts/build_real_car.sh
+```
+
+车轮架空、急停可用时启动：
+
+```bash
+./scripts/run_real_car_mapping.sh
+```
+
+默认相机接口为：
+
+```text
+/depth_cam/rgb0/image_raw
+/depth_cam/rgb0/camera_info
+/depth_cam/depth0/image_raw
+```
+
+如果厂家驱动实际接口不同，可通过 `REAL_CAR_RGB_TOPIC`、
+`REAL_CAR_CAMERA_INFO_TOPIC` 和 `REAL_CAR_DEPTH_TOPIC` 覆盖。RGB 与深度必须已经
+配准，并且图像尺寸、时间戳和光学坐标系应匹配；否则先修正相机驱动配置，不要靠
+放宽同步窗口掩盖问题。
+
+新的局部避障链为：
+
+```text
+/camera/points/filtered
+  -> RTAB-Map 地面/高度/离群点分割
+  -> /camera/obstacles
+  -> Nav2 local_costmap
+```
+
+当前初始阈值把 `base_footprint` 中 `z <= 0.06 m` 视为地面，忽略
+`z > 1.50 m` 的点，并按 CAD 尺寸过滤车体自身的
+`0.31 × 0.26 × 0.35 m` 区域。RGB-D 不再写入全局动态障碍层，避免单帧噪点在全局地图中长期
+残留；局部 RGB-D 和局部/全局二维雷达避障仍然启用。现场应根据相机安装高度和
+俯仰角观察 `/camera/ground`、`/camera/obstacles` 后再微调，不能直接降低安全距离。
+
+可选启动 RViz 三维视图：
+
+```bash
+REAL_CAR_START_RVIZ=true ./scripts/run_real_car_mapping.sh
+```
+
+重点检查：
+
+```bash
+ros2 topic hz /rtabmap/rgbd_image
+ros2 topic hz /camera/obstacles
+ros2 topic echo /map --once
+ros2 topic echo /rtabmap/cloud_map --once
+ros2 run tf2_ros tf2_echo map odom
+ros2 topic info /map --verbose
+./scripts/check_real_car_rtabmap.sh
+```
+
+若 RTAB-Map 尚未完成现场验收，可保留同一安全链回退到 SLAM Toolbox：
+
+```bash
+REAL_CAR_MAPPING_BACKEND=slam_toolbox ./scripts/run_real_car_mapping.sh
+```
+
+`REAL_CAR_RESET_RTABMAP_DATABASE=false` 可继续上一数据库；新场地或新地图默认保持
+`true`，避免把旧场景的位姿图带入本次任务。
+
 当前机器人尺寸集中在：
 
 ```text
@@ -802,8 +955,15 @@ ros2 topic echo /scan --once
 ros2 topic hz /camera/color/image_raw
 ros2 topic hz /camera/points/filtered
 ros2 topic hz /camera/points/mapping
+ros2 topic hz /local_grid/occupied
+ros2 topic echo /local_grid/status --once
 ros2 topic echo /octomap_binary --once
 ros2 action list
 ros2 node list
 ros2 run tf2_ros tf2_echo odom base_footprint
 ```
+
+真车若持续原地转向，先架空车轮并单独发送很小的正角速度，确认车体实际转向与
+`odom -> base_footprint` 航向变化同号；再确认静止时航向不会持续漂移。任一项不符
+都应停止自主建图，检查底盘角速度符号、IMU 安装方向和 EKF 配置，不能靠提高
+Nav2 角速度或更换三维建图节点掩盖。

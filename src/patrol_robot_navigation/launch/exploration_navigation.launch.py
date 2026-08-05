@@ -2,13 +2,15 @@
 
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
+from launch.conditions import IfCondition, UnlessCondition
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 from launch_ros.substitutions import FindPackageShare
 
 
 def nav2_node(package, executable, name, params_file, use_sim_time,
-              remappings=None, extra_parameters=None):
+              remappings=None, extra_parameters=None, condition=None):
     return Node(
         package=package,
         executable=executable,
@@ -19,6 +21,7 @@ def nav2_node(package, executable, name, params_file, use_sim_time,
             {'use_sim_time': use_sim_time, **(extra_parameters or {})},
         ],
         remappings=remappings or [],
+        condition=condition,
     )
 
 
@@ -26,7 +29,10 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     autostart = LaunchConfiguration('exploration_nav2_autostart')
     params_file = LaunchConfiguration('exploration_nav2_params_file')
+    desired_linear_vel = LaunchConfiguration('desired_linear_vel')
+    enable_behavior_server = LaunchConfiguration('enable_behavior_server')
     navigation_share = FindPackageShare('patrol_robot_navigation')
+    patrol_share = FindPackageShare('patrol_robot_patrol')
     default_params = PathJoinSubstitution([
         navigation_share,
         'config',
@@ -44,7 +50,10 @@ def generate_launch_description():
         {
             # Exploration favors observability and braking distance over
             # transit speed while the global map is still changing.
-            'FollowPath.desired_linear_vel': 0.24,
+            'FollowPath.desired_linear_vel': ParameterValue(
+                desired_linear_vel,
+                value_type=float,
+            ),
         },
     )
     smoother = nav2_node(
@@ -76,6 +85,7 @@ def generate_launch_description():
         params_file,
         use_sim_time,
         tf_remappings + [('cmd_vel', 'cmd_vel_nav_raw')],
+        condition=IfCondition(enable_behavior_server),
     )
     bt_navigator = nav2_node(
         'nav2_bt_navigator',
@@ -84,6 +94,21 @@ def generate_launch_description():
         params_file,
         use_sim_time,
         tf_remappings,
+        {
+            # Humble preloads both default trees during activation. Use the
+            # no-recovery physical-car tree so activation never requires
+            # Spin, BackUp or Wait action servers.
+            'default_nav_to_pose_bt_xml': PathJoinSubstitution([
+                patrol_share,
+                'behavior_trees',
+                'navigate_to_pose_stable.xml',
+            ]),
+            'default_nav_through_poses_bt_xml': PathJoinSubstitution([
+                patrol_share,
+                'behavior_trees',
+                'navigate_to_pose_stable.xml',
+            ]),
+        },
     )
     velocity_smoother = nav2_node(
         'nav2_velocity_smoother',
@@ -113,6 +138,25 @@ def generate_launch_description():
                 'bt_navigator',
             ],
         }],
+        condition=IfCondition(enable_behavior_server),
+    )
+    lifecycle_manager_without_behaviors = Node(
+        package='nav2_lifecycle_manager',
+        executable='lifecycle_manager',
+        name='lifecycle_manager_exploration_navigation',
+        output='screen',
+        parameters=[{
+            'use_sim_time': use_sim_time,
+            'autostart': autostart,
+            'node_names': [
+                'controller_server',
+                'smoother_server',
+                'planner_server',
+                'velocity_smoother',
+                'bt_navigator',
+            ],
+        }],
+        condition=UnlessCondition(enable_behavior_server),
     )
 
     return LaunchDescription([
@@ -125,6 +169,14 @@ def generate_launch_description():
             'exploration_nav2_params_file',
             default_value=default_params,
         ),
+        DeclareLaunchArgument(
+            'desired_linear_vel',
+            default_value='0.24',
+        ),
+        DeclareLaunchArgument(
+            'enable_behavior_server',
+            default_value='true',
+        ),
         controller,
         smoother,
         planner,
@@ -132,4 +184,5 @@ def generate_launch_description():
         bt_navigator,
         velocity_smoother,
         lifecycle_manager,
+        lifecycle_manager_without_behaviors,
     ])

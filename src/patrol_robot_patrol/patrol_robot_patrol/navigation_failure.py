@@ -37,3 +37,25 @@ def is_route_failure(error_code: int | None) -> bool:
     """Return true only for deterministic route/control feasibility errors."""
 
     return error_code in _ROUTE_FAILURE_CODES
+
+
+def should_blacklist_route(
+    error_code: int | None,
+    *,
+    action_aborted: bool,
+    has_candidate_path: bool,
+) -> bool:
+    """Classify both modern Nav2 results and Humble's empty action result.
+
+    Humble's NavigateToPose result has no error code. An aborted navigation
+    with a preflight-verified candidate path is therefore the strongest
+    available signal that this particular controller path should be excluded.
+    """
+
+    if is_route_failure(error_code):
+        return True
+    return (
+        error_code is None
+        and action_aborted
+        and has_candidate_path
+    )

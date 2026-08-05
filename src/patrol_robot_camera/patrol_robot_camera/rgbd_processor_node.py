@@ -33,6 +33,7 @@ class RgbdProcessor(Node):
             '/camera/points/mapping',
         )
         self.declare_parameter('mapping_publish_rate', 3.0)
+        self.declare_parameter('point_cloud_publish_rate', 0.0)
         self.declare_parameter('use_color', True)
         self.declare_parameter('depth_scale', 0.001)
         self.declare_parameter('min_depth', 0.25)
@@ -54,6 +55,9 @@ class RgbdProcessor(Node):
         self._max_points = int(self.get_parameter('max_points').value)
         self._mapping_publish_rate = float(
             self.get_parameter('mapping_publish_rate').value
+        )
+        self._point_cloud_publish_rate = float(
+            self.get_parameter('point_cloud_publish_rate').value
         )
         queue_size = int(self.get_parameter('sync_queue_size').value)
         sync_slop = float(self.get_parameter('sync_slop_seconds').value)
@@ -86,6 +90,7 @@ class RgbdProcessor(Node):
             else 0.0
         )
         self._last_mapping_publish = float('-inf')
+        self._last_point_cloud_publish = float('-inf')
         mapping_status = (
             f'{mapping_point_cloud_topic}@{self._mapping_publish_rate:g}Hz'
             if self._mapping_publisher is not None
@@ -158,6 +163,8 @@ class RgbdProcessor(Node):
             raise ValueError('max_points 必须大于等于 1')
         if self._mapping_publish_rate < 0.0:
             raise ValueError('mapping_publish_rate 不能小于 0')
+        if self._point_cloud_publish_rate < 0.0:
+            raise ValueError('point_cloud_publish_rate 不能小于 0')
         if queue_size < 2:
             raise ValueError('sync_queue_size 必须大于等于 2')
         if sync_slop < 0.0:
@@ -184,6 +191,13 @@ class RgbdProcessor(Node):
         camera_info: CameraInfo,
         color_message: Image | None,
     ) -> None:
+        started_at = time.monotonic()
+        if (
+            self._point_cloud_publish_rate > 0.0
+            and started_at - self._last_point_cloud_publish
+            < 1.0 / self._point_cloud_publish_rate
+        ):
+            return
         try:
             depth = decode_depth_image(depth_message, self._depth_scale)
             color = (
@@ -204,6 +218,7 @@ class RgbdProcessor(Node):
             cloud = self._make_cloud(depth_message, result.points, result.colors)
             self._publisher.publish(cloud)
             now = time.monotonic()
+            self._last_point_cloud_publish = now
             if (
                 self._mapping_publisher is not None
                 and now - self._last_mapping_publish

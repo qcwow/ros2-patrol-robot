@@ -7,6 +7,9 @@
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>controller</exec_depend>
   <exec_depend>nav2_amcl</exec_depend>
   <exec_depend>nav2_bringup</exec_depend>
   <exec_depend>nav2_lifecycle_manager</exec_depend>
@@ -17,6 +20,7 @@
   <exec_depend>patrol_robot_patrol</exec_depend>
   <exec_depend>patrol_robot_simulator</exec_depend>
   <exec_depend>patrol_robot_web_bridge</exec_depend>
+  <exec_depend>peripherals</exec_depend>
   <exec_depend>rviz2</exec_depend>
   <exec_depend>robot_localization</exec_depend>
   <exec_depend>slam_toolbox</exec_depend>

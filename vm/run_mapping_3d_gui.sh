@@ -24,7 +24,7 @@ fi
 export QT_X11_NO_MITSHM=1
 export RCUTILS_COLORIZED_OUTPUT=1
 
-source /opt/ros/jazzy/setup.bash
+source /opt/ros/humble/setup.bash
 # shellcheck disable=SC1091
 source "${WORKSPACE_ROOT}/install/setup.bash"
 
